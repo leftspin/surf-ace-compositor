@@ -132,6 +132,10 @@ cargo run -- ctl --socket-path /tmp/surf-ace-compositor.sock --request-json '{"t
 cargo run -- ctl --socket-path /tmp/surf-ace-compositor.sock --request-json '{"type":"switch_pane_to_external_native","pane_id":"pane-1","target":"terminal","process":{"command":"/bin/sh","args":["-lc","sleep 5"]}}'
 ```
 
+## License
+
+Apache-2.0. See `LICENSE`.
+
 ## Validate
 
 ```bash
