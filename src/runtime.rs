@@ -900,6 +900,9 @@ struct AtomicPlaneState {
     props: AtomicPlanePropertyHandles,
     scanout_format: DrmFourcc,
     zpos: Option<u64>,
+    alpha: Option<u64>,
+    pixel_blend_mode: Option<u64>,
+    supports_alpha_blending: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -921,6 +924,8 @@ struct AtomicPlanePropertyHandles {
     crtc_w: drm_property::Handle,
     crtc_h: drm_property::Handle,
     zpos: Option<AtomicPlaneZposProperty>,
+    alpha: Option<AtomicPlaneAlphaProperty>,
+    pixel_blend_mode: Option<AtomicPlanePixelBlendModeProperty>,
 }
 
 #[derive(Clone)]
@@ -928,6 +933,21 @@ struct AtomicPlaneZposProperty {
     handle: drm_property::Handle,
     min: u64,
     max: u64,
+}
+
+#[derive(Clone)]
+struct AtomicPlaneAlphaProperty {
+    handle: drm_property::Handle,
+    min: u64,
+    max: u64,
+}
+
+#[derive(Clone)]
+struct AtomicPlanePixelBlendModeProperty {
+    handle: drm_property::Handle,
+    premultiplied: Option<u64>,
+    coverage: Option<u64>,
+    none: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -986,6 +1006,7 @@ struct AtomicCommitState {
     plane_states: Vec<AtomicPlaneState>,
     primary_scanout_format: DrmFourcc,
     overlay_scanout_format: Option<DrmFourcc>,
+    overlay_alpha_blending_supported: bool,
 }
 
 const PRIMARY_SCANOUT_FORMAT_PREFERENCE: [DrmFourcc; 2] =
@@ -1018,6 +1039,11 @@ impl AtomicCommitState {
             plane_states: states,
             primary_scanout_format: atomic.primary_plane.scanout_format,
             overlay_scanout_format: atomic.overlay_plane.as_ref().map(|p| p.scanout_format),
+            overlay_alpha_blending_supported: atomic
+                .overlay_plane
+                .as_ref()
+                .map(|p| p.supports_alpha_blending)
+                .unwrap_or(false),
         })
     }
 }
@@ -1194,7 +1220,12 @@ impl HostBackendState {
             .as_ref()
             .and_then(|atomic| atomic.overlay_scanout_format)
             .map(overlay_scanout_format_supports_alpha)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            && pipeline
+                .atomic_commit_state
+                .as_ref()
+                .map(|atomic| atomic.overlay_alpha_blending_supported)
+                .unwrap_or(false);
         Some((ownership, atomic_enabled, overlay_capable))
     }
 
@@ -1245,8 +1276,14 @@ impl HostBackendState {
             .and_then(|atomic| atomic.overlay_scanout_format)
             .map(overlay_scanout_format_supports_alpha)
             .unwrap_or(false);
-        let prefer_overlay_plane_split =
-            overlay_plane_rotation_supported && overlay_plane_alpha_format_supported;
+        let overlay_plane_alpha_blending_supported = pipeline
+            .atomic_commit_state
+            .as_ref()
+            .map(|atomic| atomic.overlay_alpha_blending_supported)
+            .unwrap_or(false);
+        let prefer_overlay_plane_split = overlay_plane_rotation_supported
+            && overlay_plane_alpha_format_supported
+            && overlay_plane_alpha_blending_supported;
         if let Some(gles_renderer) = pipeline.gles_renderer.as_mut() {
             match render_host_scene_with_gles_direct(
                 gles_renderer,
@@ -1715,23 +1752,44 @@ fn build_atomic_claim_plan(
         props: primary_props,
         scanout_format: primary_plane.scanout_format,
         zpos: None,
+        alpha: None,
+        pixel_blend_mode: None,
+        supports_alpha_blending: true,
     };
+    configure_atomic_plane_composition_controls(device_path, &mut primary_state);
 
     let mut overlay_state = if let Some(overlay_plane) =
         select_atomic_plane(card, device_path, resources, crtc, PlaneSelection::Overlay)?
     {
         plane_property_handles(card, device_path, overlay_plane.handle)?.map(|props| {
-            AtomicPlaneState {
+            let mut state = AtomicPlaneState {
                 role: AtomicPlaneRole::Overlay,
                 handle: overlay_plane.handle,
                 props,
                 scanout_format: overlay_plane.scanout_format,
                 zpos: None,
-            }
+                alpha: None,
+                pixel_blend_mode: None,
+                supports_alpha_blending: true,
+            };
+            configure_atomic_plane_composition_controls(device_path, &mut state);
+            state
         })
     } else {
         None
     };
+
+    if overlay_state
+        .as_ref()
+        .map(|overlay| !overlay.supports_alpha_blending)
+        .unwrap_or(false)
+    {
+        eprintln!(
+            "host backend overlay plane on {} lacks alpha-safe blending controls; disabling overlay plane routing for this output",
+            device_path.display()
+        );
+        overlay_state = None;
+    }
 
     if let Some(overlay) = overlay_state.as_mut() {
         assign_atomic_plane_zpos(device_path, &mut primary_state, overlay);
@@ -1956,6 +2014,82 @@ fn plane_property_handles(
     } else {
         None
     };
+    let alpha = if let Some(alpha_handle) = props
+        .get("alpha")
+        .copied()
+        .or_else(|| props.get("ALPHA").copied())
+    {
+        let info =
+            card.get_property(alpha_handle)
+                .map_err(|err| RuntimeError::HostOutputInspect {
+                    path: device_path.display().to_string(),
+                    error: format!(
+                        "failed to inspect plane alpha property {}: {err}",
+                        u32::from(alpha_handle)
+                    ),
+                })?;
+        if !info.mutable() || !info.atomic() {
+            None
+        } else {
+            match info.value_type() {
+                drm_property::ValueType::UnsignedRange(min, max) => {
+                    Some(AtomicPlaneAlphaProperty {
+                        handle: alpha_handle,
+                        min,
+                        max,
+                    })
+                }
+                _ => None,
+            }
+        }
+    } else {
+        None
+    };
+    let pixel_blend_mode = if let Some(pixel_blend_mode_handle) = props
+        .get("pixel blend mode")
+        .copied()
+        .or_else(|| props.get("PIXEL_BLEND_MODE").copied())
+    {
+        let info = card.get_property(pixel_blend_mode_handle).map_err(|err| {
+            RuntimeError::HostOutputInspect {
+                path: device_path.display().to_string(),
+                error: format!(
+                    "failed to inspect plane pixel blend mode property {}: {err}",
+                    u32::from(pixel_blend_mode_handle)
+                ),
+            }
+        })?;
+        if !info.mutable() || !info.atomic() {
+            None
+        } else {
+            match info.value_type() {
+                drm_property::ValueType::Enum(values) => {
+                    let mut premultiplied = None;
+                    let mut coverage = None;
+                    let mut none = None;
+                    for enum_value in values.values().1 {
+                        let normalized =
+                            normalize_drm_enum_name(enum_value.name().to_string_lossy().as_ref());
+                        match normalized.as_str() {
+                            "premultiplied" => premultiplied = Some(enum_value.value()),
+                            "coverage" => coverage = Some(enum_value.value()),
+                            "none" => none = Some(enum_value.value()),
+                            _ => {}
+                        }
+                    }
+                    Some(AtomicPlanePixelBlendModeProperty {
+                        handle: pixel_blend_mode_handle,
+                        premultiplied,
+                        coverage,
+                        none,
+                    })
+                }
+                _ => None,
+            }
+        }
+    } else {
+        None
+    };
     Ok(Some(AtomicPlanePropertyHandles {
         crtc_id,
         fb_id,
@@ -1968,7 +2102,16 @@ fn plane_property_handles(
         crtc_w,
         crtc_h,
         zpos,
+        alpha,
+        pixel_blend_mode,
     }))
+}
+
+fn normalize_drm_enum_name(name: &str) -> String {
+    name.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
 }
 
 fn assign_atomic_plane_zpos(
@@ -2013,6 +2156,37 @@ fn select_atomic_plane_zpos_values(
         return None;
     }
     Some((primary_value, overlay_value))
+}
+
+fn configure_atomic_plane_composition_controls(device_path: &Path, plane: &mut AtomicPlaneState) {
+    if let Some(alpha) = plane.props.alpha.as_ref() {
+        plane.alpha = Some(select_plane_alpha_value(alpha.min, alpha.max));
+    }
+    if !matches!(plane.role, AtomicPlaneRole::Overlay) {
+        return;
+    }
+    let Some(pixel_blend_mode) = plane.props.pixel_blend_mode.as_ref() else {
+        return;
+    };
+    if let Some(value) = pixel_blend_mode.premultiplied.or(pixel_blend_mode.coverage) {
+        plane.pixel_blend_mode = Some(value);
+        plane.supports_alpha_blending = true;
+        return;
+    }
+    plane.supports_alpha_blending = false;
+    plane.pixel_blend_mode = pixel_blend_mode.none;
+    eprintln!(
+        "host backend overlay plane on {} lacks alpha-capable pixel blend mode enum; forcing fail-closed overlay-plane disable",
+        device_path.display()
+    );
+}
+
+fn select_plane_alpha_value(min: u64, max: u64) -> u64 {
+    if max < min {
+        return min;
+    }
+    let full = u64::from(u16::MAX);
+    full.clamp(min, max)
 }
 
 fn populate_atomic_plane_properties(
@@ -2090,6 +2264,23 @@ fn populate_atomic_plane_properties(
             plane.handle,
             zpos.handle,
             drm_property::Value::UnsignedRange(value),
+        );
+    }
+    if let (Some(alpha), Some(value)) = (plane.props.alpha.as_ref(), plane.alpha) {
+        request.add_property(
+            plane.handle,
+            alpha.handle,
+            drm_property::Value::UnsignedRange(value),
+        );
+    }
+    if let (Some(pixel_blend_mode), Some(value)) = (
+        plane.props.pixel_blend_mode.as_ref(),
+        plane.pixel_blend_mode,
+    ) {
+        request.add_property(
+            plane.handle,
+            pixel_blend_mode.handle,
+            drm_property::Value::Unknown(value),
         );
     }
 }
@@ -2209,7 +2400,13 @@ fn claim_output_on_device(
         .unwrap_or(DrmFourcc::Xrgb8888);
     let overlay_scanout_format = atomic_candidate
         .as_ref()
-        .and_then(|atomic| atomic.overlay_scanout_format)
+        .and_then(|atomic| {
+            if atomic.overlay_alpha_blending_supported {
+                atomic.overlay_scanout_format
+            } else {
+                None
+            }
+        })
         .filter(|format| overlay_scanout_format_supports_alpha(*format));
     let requires_direct_startup = matches!(
         required_startup_ownership,
