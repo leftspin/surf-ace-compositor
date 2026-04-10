@@ -1770,7 +1770,7 @@ fn build_atomic_claim_plan(
                 zpos: None,
                 alpha: None,
                 pixel_blend_mode: None,
-                supports_alpha_blending: true,
+                supports_alpha_blending: false,
             };
             configure_atomic_plane_composition_controls(device_path, &mut state);
             state
@@ -2166,6 +2166,11 @@ fn configure_atomic_plane_composition_controls(device_path: &Path, plane: &mut A
         return;
     }
     let Some(pixel_blend_mode) = plane.props.pixel_blend_mode.as_ref() else {
+        plane.supports_alpha_blending = false;
+        eprintln!(
+            "host backend overlay plane on {} is missing pixel blend mode property; forcing fail-closed overlay-plane disable",
+            device_path.display()
+        );
         return;
     };
     if let Some(value) = pixel_blend_mode.premultiplied.or(pixel_blend_mode.coverage) {
