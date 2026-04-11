@@ -90,6 +90,16 @@ Visible verification (recommended):
 ./scripts/verify-visible-host-seatd.sh --socket-path "$SURF_ACE_SOCKET"
 ```
 
+zsh main-app verification (rotated 90 degrees CCW):
+
+```bash
+./scripts/verify-zsh-main-host-seatd.sh --socket-path "$SURF_ACE_SOCKET"
+```
+
+This path launches a supported Wayland terminal as the compositor `main_app`, runs
+`zsh` inside it, and waits until runtime status shows the terminal bound in the
+fullscreen slot after the compositor rotation is set to `deg90`.
+
 Stale same-socket recovery behavior:
 
 ```text
@@ -104,6 +114,14 @@ Expected on screen (success criteria):
 The display leaves the text console, rotates 90 degrees CCW, and shows a fullscreen
 animated "Surf Ace Visible Demo". The image stays visible until Ctrl-C is pressed in
 the verify command session.
+```
+
+```text
+For the zsh proof, the display leaves the text console, rotates 90 degrees CCW,
+and shows a fullscreen Wayland terminal running zsh as the compositor main app.
+The session stays live until Ctrl-C is pressed in the verify command session.
+This requires both `zsh` and one supported Wayland terminal (`foot`, `ghostty`,
+`kitty`, `wezterm`, or `alacritty`) to be installed on the host.
 ```
 
 Send control requests:
