@@ -130,6 +130,18 @@ Send control requests:
 cargo run -- ctl --socket-path /tmp/surf-ace-compositor.sock --request-json '{"type":"get_status"}'
 ```
 
+Rotate output with the first-class operator command:
+
+```bash
+cargo run -- rotate --socket-path /tmp/surf-ace-compositor.sock --rotation deg90
+```
+
+Capture the current compositor output to a named path:
+
+```bash
+cargo run -- capture --socket-path /tmp/surf-ace-compositor.sock --output-path /tmp/surf-ace-capture.png
+```
+
 Set/clear runtime focus target skeleton:
 
 ```bash

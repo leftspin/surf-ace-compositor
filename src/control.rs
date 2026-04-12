@@ -2,6 +2,7 @@ use crate::model::{
     HostRuntimeStartTrigger, NativeTargetClass, OutputRotation, PaneId, ProcessSpec,
     ProviderPaneSnapshot, RuntimeBackend, RuntimeFocusTarget, RuntimePhase, StatusSnapshot,
 };
+use crate::screen_capture::ScreenCaptureStore;
 use crate::state::CompositorState;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, BufReader, Write};
@@ -41,6 +42,9 @@ pub enum ControlRequest {
     ClearRuntimeFocusTarget,
     StartHostRuntime,
     PollProcesses,
+    CaptureScreen {
+        output_path: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +59,8 @@ pub struct ControlResponse {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<StatusSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_path: Option<String>,
 }
 
 impl ControlResponse {
@@ -63,6 +69,7 @@ impl ControlResponse {
             ok: true,
             error: None,
             status,
+            capture_path: None,
         }
     }
 
@@ -71,18 +78,33 @@ impl ControlResponse {
             ok: false,
             error: Some(message.into()),
             status: None,
+            capture_path: None,
+        }
+    }
+
+    fn capture(path: String) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            status: None,
+            capture_path: Some(path),
         }
     }
 }
 
-pub fn serve(socket_path: &Path, shared_state: Arc<Mutex<CompositorState>>) -> io::Result<()> {
-    serve_with_runtime_control(socket_path, shared_state, None)
+pub fn serve(
+    socket_path: &Path,
+    shared_state: Arc<Mutex<CompositorState>>,
+    screen_capture: ScreenCaptureStore,
+) -> io::Result<()> {
+    serve_with_runtime_control(socket_path, shared_state, None, screen_capture)
 }
 
 pub fn serve_with_runtime_control(
     socket_path: &Path,
     shared_state: Arc<Mutex<CompositorState>>,
     runtime_control: Option<Sender<RuntimeControlCommand>>,
+    screen_capture: ScreenCaptureStore,
 ) -> io::Result<()> {
     if socket_path.exists() {
         std::fs::remove_file(socket_path)?;
@@ -97,7 +119,12 @@ pub fn serve_with_runtime_control(
                 continue;
             }
         };
-        if let Err(err) = handle_connection(stream, &shared_state, runtime_control.as_ref()) {
+        if let Err(err) = handle_connection(
+            stream,
+            &shared_state,
+            runtime_control.as_ref(),
+            &screen_capture,
+        ) {
             eprintln!("failed to handle control request: {err}");
         }
     }
@@ -131,6 +158,7 @@ fn handle_connection(
     stream: UnixStream,
     shared_state: &Arc<Mutex<CompositorState>>,
     runtime_control: Option<&Sender<RuntimeControlCommand>>,
+    screen_capture: &ScreenCaptureStore,
 ) -> io::Result<()> {
     let mut request_line = String::new();
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -142,7 +170,7 @@ fn handle_connection(
     let response = match serde_json::from_str::<ControlRequest>(&request_line) {
         Ok(request) => {
             let mut state = lock_state(shared_state);
-            handle_request(&mut state, request, runtime_control)
+            handle_request_with_capture(&mut state, request, runtime_control, screen_capture)
         }
         Err(err) => ControlResponse::err(format!("failed to parse request: {err}")),
     };
@@ -170,10 +198,21 @@ fn lock_state(
     }
 }
 
+#[cfg(test)]
 fn handle_request(
     state: &mut CompositorState,
     request: ControlRequest,
     runtime_control: Option<&Sender<RuntimeControlCommand>>,
+) -> ControlResponse {
+    let screen_capture = ScreenCaptureStore::default();
+    handle_request_with_capture(state, request, runtime_control, &screen_capture)
+}
+
+fn handle_request_with_capture(
+    state: &mut CompositorState,
+    request: ControlRequest,
+    runtime_control: Option<&Sender<RuntimeControlCommand>>,
+    screen_capture: &ScreenCaptureStore,
 ) -> ControlResponse {
     let result = match request {
         ControlRequest::GetStatus => Ok(Some(state.status_snapshot())),
@@ -256,6 +295,16 @@ fn handle_request(
             state.poll_processes();
             Ok(Some(state.status_snapshot()))
         }
+        ControlRequest::CaptureScreen { output_path } => {
+            if output_path.trim().is_empty() {
+                return ControlResponse::err("capture output path must not be empty");
+            }
+            let path = Path::new(&output_path);
+            return match screen_capture.write_png(path) {
+                Ok(()) => ControlResponse::capture(output_path),
+                Err(err) => ControlResponse::err(format!("failed to capture screen: {err}")),
+            };
+        }
     };
 
     match result {
@@ -272,6 +321,7 @@ mod tests {
         RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource,
     };
     use crate::process_manager::{ProcessController, ProcessExit};
+    use crate::screen_capture::ScreenCaptureStore;
     use crate::state::CompositorState;
     use smithay::backend::allocator::Fourcc as DrmFourcc;
     use std::collections::BTreeMap;
@@ -336,6 +386,65 @@ mod tests {
             rx.recv().ok(),
             Some(RuntimeControlCommand::StartHostRuntime)
         );
+    }
+
+    #[test]
+    fn capture_screen_returns_error_when_no_frame_is_available() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let screen_capture = ScreenCaptureStore::default();
+        let output_path = std::env::temp_dir().join("surf-ace-no-frame-capture.png");
+
+        let response = handle_request_with_capture(
+            &mut state,
+            ControlRequest::CaptureScreen {
+                output_path: output_path.display().to_string(),
+            },
+            None,
+            &screen_capture,
+        );
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_deref(),
+            Some("failed to capture screen: screen capture unavailable")
+        );
+    }
+
+    #[test]
+    fn capture_screen_writes_png_to_requested_path() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let screen_capture = ScreenCaptureStore::default();
+        screen_capture.update_from_scanout_xrgb8888(
+            &[0x10, 0x20, 0x30, 0x00],
+            4,
+            1,
+            1,
+            false,
+            OutputRotation::Deg0,
+        );
+        let output_path = std::env::temp_dir().join(format!(
+            "surf-ace-control-capture-{}.png",
+            std::process::id()
+        ));
+        let output_path_string = output_path.display().to_string();
+
+        let response = handle_request_with_capture(
+            &mut state,
+            ControlRequest::CaptureScreen {
+                output_path: output_path_string.clone(),
+            },
+            None,
+            &screen_capture,
+        );
+
+        assert!(response.ok);
+        assert_eq!(
+            response.capture_path.as_deref(),
+            Some(output_path_string.as_str())
+        );
+        let metadata = std::fs::metadata(&output_path).expect("capture png should exist");
+        assert!(metadata.len() > 0);
+        let _ = std::fs::remove_file(output_path);
     }
 
     #[test]
