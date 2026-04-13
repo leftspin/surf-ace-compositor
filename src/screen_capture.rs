@@ -1,4 +1,5 @@
 use crate::model::OutputRotation;
+use crate::output_rotation_model::{CapturePixelRotation, OutputRotationModel};
 use std::fs::File;
 use std::io::{self, BufWriter};
 use std::path::Path;
@@ -11,9 +12,21 @@ pub struct ScreenCaptureStore {
 
 #[derive(Clone)]
 struct ScreenCaptureFrame {
-    width: usize,
-    height: usize,
-    xrgb8888: Vec<u8>,
+    src_width: usize,
+    src_height: usize,
+    output_rotation: OutputRotation,
+    packed_xrgb8888: Vec<u8>,
+}
+
+impl ScreenCaptureFrame {
+    fn view_xrgb8888(&self) -> (usize, usize, Vec<u8>) {
+        rotate_scanout_to_view(
+            &self.packed_xrgb8888,
+            self.src_width,
+            self.src_height,
+            self.output_rotation,
+        )
+    }
 }
 
 impl ScreenCaptureStore {
@@ -30,16 +43,15 @@ impl ScreenCaptureStore {
             return;
         }
         let packed = pack_xrgb8888(src_pixels, src_stride, src_width, src_height, src_flipped);
-        let (width, height, xrgb8888) =
-            rotate_scanout_to_view(&packed, src_width, src_height, output_rotation);
         let mut guard = match self.inner.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
         *guard = Some(ScreenCaptureFrame {
-            width,
-            height,
-            xrgb8888,
+            src_width,
+            src_height,
+            output_rotation,
+            packed_xrgb8888: packed,
         });
     }
 
@@ -53,6 +65,7 @@ impl ScreenCaptureStore {
                 io::Error::new(io::ErrorKind::NotFound, "screen capture unavailable")
             })?
         };
+        let (width, height, xrgb8888) = frame.view_xrgb8888();
 
         if let Some(parent) = path
             .parent()
@@ -63,14 +76,13 @@ impl ScreenCaptureStore {
 
         let file = File::create(path)?;
         let writer = BufWriter::new(file);
-        let mut encoder = png::Encoder::new(writer, frame.width as u32, frame.height as u32);
+        let mut encoder = png::Encoder::new(writer, width as u32, height as u32);
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
         let mut png_writer = encoder.write_header()?;
 
-        let mut rgb =
-            Vec::with_capacity(frame.width.saturating_mul(frame.height).saturating_mul(3));
-        for pixel in frame.xrgb8888.chunks_exact(4) {
+        let mut rgb = Vec::with_capacity(width.saturating_mul(height).saturating_mul(3));
+        for pixel in xrgb8888.chunks_exact(4) {
             rgb.push(pixel[2]);
             rgb.push(pixel[1]);
             rgb.push(pixel[0]);
@@ -118,37 +130,40 @@ fn rotate_scanout_to_view(
     src_height: usize,
     output_rotation: OutputRotation,
 ) -> (usize, usize, Vec<u8>) {
-    match output_rotation {
-        OutputRotation::Deg0 => (src_width, src_height, src_pixels.to_vec()),
-        OutputRotation::Deg180 => (src_width, src_height, src_pixels.to_vec()),
-        OutputRotation::Deg90 => rotate_xrgb8888(
+    match OutputRotationModel::new(output_rotation).capture_pixel_rotation() {
+        CapturePixelRotation::Identity => (src_width, src_height, src_pixels.to_vec()),
+        CapturePixelRotation::Rotate90Clockwise => rotate_xrgb8888(
             src_pixels,
             src_width,
             src_height,
-            RotationTransform::Transpose,
+            CapturePixelRotation::Rotate90Clockwise,
         ),
-        OutputRotation::Deg270 => rotate_xrgb8888(
+        CapturePixelRotation::Rotate180 => rotate_xrgb8888(
             src_pixels,
             src_width,
             src_height,
-            RotationTransform::Transverse,
+            CapturePixelRotation::Rotate180,
+        ),
+        CapturePixelRotation::Rotate90Counterclockwise => rotate_xrgb8888(
+            src_pixels,
+            src_width,
+            src_height,
+            CapturePixelRotation::Rotate90Counterclockwise,
         ),
     }
-}
-
-enum RotationTransform {
-    Transpose,
-    Transverse,
 }
 
 fn rotate_xrgb8888(
     src_pixels: &[u8],
     src_width: usize,
     src_height: usize,
-    transform: RotationTransform,
+    transform: CapturePixelRotation,
 ) -> (usize, usize, Vec<u8>) {
     let (dst_width, dst_height) = match transform {
-        RotationTransform::Transpose | RotationTransform::Transverse => {
+        CapturePixelRotation::Identity => (src_width, src_height),
+        CapturePixelRotation::Rotate180 => (src_width, src_height),
+        CapturePixelRotation::Rotate90Clockwise
+        | CapturePixelRotation::Rotate90Counterclockwise => {
             (src_height, src_width)
         }
     };
@@ -157,9 +172,16 @@ fn rotate_xrgb8888(
     for y in 0..src_height {
         for x in 0..src_width {
             let (dst_x, dst_y) = match transform {
-                RotationTransform::Transpose => (y, x),
-                RotationTransform::Transverse => (
+                CapturePixelRotation::Identity => (x, y),
+                CapturePixelRotation::Rotate90Clockwise => {
+                    (src_height.saturating_sub(1).saturating_sub(y), x)
+                }
+                CapturePixelRotation::Rotate180 => (
+                    src_width.saturating_sub(1).saturating_sub(x),
                     src_height.saturating_sub(1).saturating_sub(y),
+                ),
+                CapturePixelRotation::Rotate90Counterclockwise => (
+                    y,
                     src_width.saturating_sub(1).saturating_sub(x),
                 ),
             };
@@ -193,21 +215,44 @@ mod tests {
         assert_eq!(
             rotated,
             vec![
-                0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, //
-                0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+                0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, //
+                0x04, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
             ]
         );
     }
 
     #[test]
-    fn deg180_capture_preserves_scanout_orientation() {
+    fn deg180_capture_rotates_scanout_180_degrees() {
         let src = vec![
             0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, //
             0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
         ];
         let (width, height, rotated) = rotate_scanout_to_view(&src, 2, 2, OutputRotation::Deg180);
         assert_eq!((width, height), (2, 2));
-        assert_eq!(rotated, src);
+        assert_eq!(
+            rotated,
+            vec![
+                0x04, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, //
+                0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+            ]
+        );
+    }
+
+    #[test]
+    fn deg270_capture_rotates_landscape_scanout_into_portrait_view() {
+        let src = vec![
+            0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, //
+            0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+        ];
+        let (width, height, rotated) = rotate_scanout_to_view(&src, 2, 2, OutputRotation::Deg270);
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(
+            rotated,
+            vec![
+                0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, //
+                0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+            ]
+        );
     }
 
     #[test]
@@ -264,12 +309,13 @@ mod tests {
             .expect("capture frame should lock")
             .clone()
             .expect("capture frame should exist");
-        assert_eq!((frame.width, frame.height), (2, 2));
+        let (width, height, xrgb8888) = frame.view_xrgb8888();
+        assert_eq!((width, height), (2, 2));
         assert_eq!(
-            frame.xrgb8888,
+            xrgb8888,
             vec![
-                0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, //
-                0x04, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+                0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, //
+                0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
             ]
         );
     }

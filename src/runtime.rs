@@ -2,6 +2,7 @@ use crate::model::{
     OutputRotation, RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeFocusTarget,
     RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource,
 };
+use crate::output_rotation_model::OutputRotationModel;
 use crate::screen_capture::ScreenCaptureStore;
 use crate::state::CompositorState;
 use input::Libinput;
@@ -3319,17 +3320,11 @@ fn render_output_size_before_transform(wayland_state: &RuntimeWaylandState) -> S
 }
 
 fn scene_texture_transform(rotation: OutputRotation) -> Transform {
-    match rotation {
-        OutputRotation::Deg0 => Transform::Normal,
-        OutputRotation::Deg180 => Transform::_180,
-        OutputRotation::Deg90 => Transform::_270,
-        OutputRotation::Deg270 => Transform::_90,
-    }
+    OutputRotationModel::new(rotation).scene_texture_transform()
 }
 
 fn screen_capture_src_flipped(mapping_flipped: bool, rotation: OutputRotation) -> bool {
-    let _ = rotation;
-    mapping_flipped
+    OutputRotationModel::new(rotation).capture_src_flipped(mapping_flipped)
 }
 
 fn capture_screen_from_render_target(
@@ -3382,8 +3377,8 @@ fn copy_renderer_pixels_to_dumb(
     if src_stride == 0 || dst_stride == 0 {
         return;
     }
-    let preserve_readback_row_order =
-        matches!(rotation, OutputRotation::Deg90 | OutputRotation::Deg270);
+    let preserve_readback_row_order = OutputRotationModel::new(rotation)
+        .present_preserves_readback_row_order();
     for y in 0..height {
         let src_y = if src_flipped && !preserve_readback_row_order {
             height.saturating_sub(1).saturating_sub(y)
@@ -3600,24 +3595,20 @@ struct HostSceneComposeStats {
 impl RuntimeWaylandState {
     fn runtime_output_size(&self) -> Size<i32, Logical> {
         let state = lock_state(&self.shared_state);
-        let mut width = state
+        let width = state
             .status_snapshot()
             .runtime
             .window_width
             .unwrap_or(1280)
             .max(1);
-        let mut height = state
+        let height = state
             .status_snapshot()
             .runtime
             .window_height
             .unwrap_or(800)
             .max(1);
-        if matches!(
-            state.output_rotation(),
-            OutputRotation::Deg90 | OutputRotation::Deg270
-        ) {
-            std::mem::swap(&mut width, &mut height);
-        }
+        let (width, height) = OutputRotationModel::new(state.output_rotation())
+            .logical_size_i32(width, height);
         (width, height).into()
     }
 
@@ -5025,12 +5016,7 @@ fn surface_id(surface: &WlSurface) -> u32 {
 }
 
 fn transform_from_rotation(rotation: OutputRotation) -> Transform {
-    match rotation {
-        OutputRotation::Deg0 => Transform::Normal,
-        OutputRotation::Deg90 => Transform::_270,
-        OutputRotation::Deg180 => Transform::_180,
-        OutputRotation::Deg270 => Transform::_90,
-    }
+    OutputRotationModel::new(rotation).output_transform()
 }
 
 fn send_frames_surface_tree(surface: &WlSurface, time: u32) {
@@ -5439,22 +5425,22 @@ mod tests {
     }
 
     #[test]
-    fn scene_texture_transform_matches_output_rotation_transform() {
+    fn scene_texture_transform_uses_verified_flip_variants() {
         assert_eq!(
             scene_texture_transform(OutputRotation::Deg90),
-            Transform::_270
+            Transform::Flipped90
         );
         assert_eq!(
             scene_texture_transform(OutputRotation::Deg270),
-            Transform::_90
+            Transform::Flipped270
         );
     }
 
     #[test]
-    fn screen_capture_flip_policy_preserves_readback_orientation_for_all_rotations() {
-        assert!(screen_capture_src_flipped(true, OutputRotation::Deg0));
-        assert!(screen_capture_src_flipped(true, OutputRotation::Deg180));
+    fn screen_capture_flip_policy_matches_verified_rotation_contract() {
+        assert!(!screen_capture_src_flipped(true, OutputRotation::Deg0));
         assert!(screen_capture_src_flipped(true, OutputRotation::Deg90));
+        assert!(!screen_capture_src_flipped(true, OutputRotation::Deg180));
         assert!(screen_capture_src_flipped(true, OutputRotation::Deg270));
         assert!(!screen_capture_src_flipped(false, OutputRotation::Deg0));
         assert!(!screen_capture_src_flipped(false, OutputRotation::Deg180));
