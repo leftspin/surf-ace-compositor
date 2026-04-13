@@ -1,0 +1,1791 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 69ec853..9d60e37 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2,6 +2,12 @@
+ # It is not intended for manual editing.
+ version = 4
+ 
++[[package]]
++name = "adler2"
++version = "2.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
++
+ [[package]]
+ name = "ahash"
+ version = "0.8.12"
+@@ -384,6 +390,15 @@ dependencies = [
+  "libc",
+ ]
+ 
++[[package]]
++name = "crc32fast"
++version = "1.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
++dependencies = [
++ "cfg-if",
++]
++
+ [[package]]
+ name = "crossbeam-utils"
+ version = "0.8.21"
+@@ -505,12 +520,31 @@ version = "2.4.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "a043dc74da1e37d6afe657061213aa6f425f855399a11d3463c6ecccc4dfda1f"
+ 
++[[package]]
++name = "fdeflate"
++version = "0.3.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
++dependencies = [
++ "simd-adler32",
++]
++
+ [[package]]
+ name = "find-msvc-tools"
+ version = "0.1.9"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+ 
++[[package]]
++name = "flate2"
++version = "1.1.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
++dependencies = [
++ "crc32fast",
++ "miniz_oxide",
++]
++
+ [[package]]
+ name = "foldhash"
+ version = "0.1.5"
+@@ -927,6 +961,16 @@ dependencies = [
+  "libc",
+ ]
+ 
++[[package]]
++name = "miniz_oxide"
++version = "0.8.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
++dependencies = [
++ "adler2",
++ "simd-adler32",
++]
++
+ [[package]]
+ name = "ndk"
+ version = "0.9.0"
+@@ -1257,6 +1301,19 @@ version = "0.2.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
+ 
++[[package]]
++name = "png"
++version = "0.17.16"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "82151a2fc869e011c153adc57cf2789ccb8d9906ce52c0b39a6b5697749d7526"
++dependencies = [
++ "bitflags 1.3.2",
++ "crc32fast",
++ "fdeflate",
++ "flate2",
++ "miniz_oxide",
++]
++
+ [[package]]
+ name = "polling"
+ version = "3.11.0"
+@@ -1532,6 +1589,12 @@ version = "1.3.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
+ 
++[[package]]
++name = "simd-adler32"
++version = "0.3.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
++
+ [[package]]
+ name = "simd_cesu8"
+ version = "1.1.1"
+@@ -1651,6 +1714,8 @@ name = "surf-ace-compositor"
+ version = "0.1.0"
+ dependencies = [
+  "clap",
++ "input",
++ "png",
+  "rustix 1.1.4",
+  "serde",
+  "serde_json",
+diff --git a/Cargo.toml b/Cargo.toml
+index 69f6d4c..8db3f4b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -5,8 +5,10 @@ edition = "2024"
+ 
+ [dependencies]
+ clap = { version = "4.5.4", features = ["derive"] }
++input = { version = "0.9.0", default-features = false, features = ["libinput_1_19"] }
+ serde = { version = "1.0.203", features = ["derive"] }
+ serde_json = "1.0.117"
+ thiserror = "1.0.61"
+-smithay = { version = "0.7.0", default-features = false, features = ["backend_winit", "backend_drm", "backend_gbm", "backend_udev", "backend_session_libseat", "wayland_frontend"] }
++png = "0.17.16"
++smithay = { version = "0.7.0", default-features = false, features = ["backend_winit", "backend_drm", "backend_gbm", "backend_udev", "backend_libinput", "backend_session_libseat", "wayland_frontend"] }
+ rustix = "1.0.7"
+diff --git a/src/control.rs b/src/control.rs
+index 2629daa..ced02b6 100644
+--- a/src/control.rs
++++ b/src/control.rs
+@@ -2,6 +2,7 @@ use crate::model::{
+     HostRuntimeStartTrigger, NativeTargetClass, OutputRotation, PaneId, ProcessSpec,
+     ProviderPaneSnapshot, RuntimeBackend, RuntimeFocusTarget, RuntimePhase, StatusSnapshot,
+ };
++use crate::screen_capture::ScreenCaptureStore;
+ use crate::state::CompositorState;
+ use serde::{Deserialize, Serialize};
+ use std::io::{self, BufRead, BufReader, Write};
+@@ -41,6 +42,9 @@ pub enum ControlRequest {
+     ClearRuntimeFocusTarget,
+     StartHostRuntime,
+     PollProcesses,
++    CaptureScreen {
++        output_path: String,
++    },
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -55,6 +59,8 @@ pub struct ControlResponse {
+     pub error: Option<String>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub status: Option<StatusSnapshot>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub capture_path: Option<String>,
+ }
+ 
+ impl ControlResponse {
+@@ -63,6 +69,7 @@ impl ControlResponse {
+             ok: true,
+             error: None,
+             status,
++            capture_path: None,
+         }
+     }
+ 
+@@ -71,18 +78,33 @@ impl ControlResponse {
+             ok: false,
+             error: Some(message.into()),
+             status: None,
++            capture_path: None,
++        }
++    }
++
++    fn capture(path: String) -> Self {
++        Self {
++            ok: true,
++            error: None,
++            status: None,
++            capture_path: Some(path),
+         }
+     }
+ }
+ 
+-pub fn serve(socket_path: &Path, shared_state: Arc<Mutex<CompositorState>>) -> io::Result<()> {
+-    serve_with_runtime_control(socket_path, shared_state, None)
++pub fn serve(
++    socket_path: &Path,
++    shared_state: Arc<Mutex<CompositorState>>,
++    screen_capture: ScreenCaptureStore,
++) -> io::Result<()> {
++    serve_with_runtime_control(socket_path, shared_state, None, screen_capture)
+ }
+ 
+ pub fn serve_with_runtime_control(
+     socket_path: &Path,
+     shared_state: Arc<Mutex<CompositorState>>,
+     runtime_control: Option<Sender<RuntimeControlCommand>>,
++    screen_capture: ScreenCaptureStore,
+ ) -> io::Result<()> {
+     if socket_path.exists() {
+         std::fs::remove_file(socket_path)?;
+@@ -97,7 +119,12 @@ pub fn serve_with_runtime_control(
+                 continue;
+             }
+         };
+-        if let Err(err) = handle_connection(stream, &shared_state, runtime_control.as_ref()) {
++        if let Err(err) = handle_connection(
++            stream,
++            &shared_state,
++            runtime_control.as_ref(),
++            &screen_capture,
++        ) {
+             eprintln!("failed to handle control request: {err}");
+         }
+     }
+@@ -131,6 +158,7 @@ fn handle_connection(
+     stream: UnixStream,
+     shared_state: &Arc<Mutex<CompositorState>>,
+     runtime_control: Option<&Sender<RuntimeControlCommand>>,
++    screen_capture: &ScreenCaptureStore,
+ ) -> io::Result<()> {
+     let mut request_line = String::new();
+     let mut reader = BufReader::new(stream.try_clone()?);
+@@ -142,7 +170,7 @@ fn handle_connection(
+     let response = match serde_json::from_str::<ControlRequest>(&request_line) {
+         Ok(request) => {
+             let mut state = lock_state(shared_state);
+-            handle_request(&mut state, request, runtime_control)
++            handle_request_with_capture(&mut state, request, runtime_control, screen_capture)
+         }
+         Err(err) => ControlResponse::err(format!("failed to parse request: {err}")),
+     };
+@@ -170,10 +198,21 @@ fn lock_state(
+     }
+ }
+ 
++#[cfg(test)]
+ fn handle_request(
+     state: &mut CompositorState,
+     request: ControlRequest,
+     runtime_control: Option<&Sender<RuntimeControlCommand>>,
++) -> ControlResponse {
++    let screen_capture = ScreenCaptureStore::default();
++    handle_request_with_capture(state, request, runtime_control, &screen_capture)
++}
++
++fn handle_request_with_capture(
++    state: &mut CompositorState,
++    request: ControlRequest,
++    runtime_control: Option<&Sender<RuntimeControlCommand>>,
++    screen_capture: &ScreenCaptureStore,
+ ) -> ControlResponse {
+     let result = match request {
+         ControlRequest::GetStatus => Ok(Some(state.status_snapshot())),
+@@ -256,6 +295,16 @@ fn handle_request(
+             state.poll_processes();
+             Ok(Some(state.status_snapshot()))
+         }
++        ControlRequest::CaptureScreen { output_path } => {
++            if output_path.trim().is_empty() {
++                return ControlResponse::err("capture output path must not be empty");
++            }
++            let path = Path::new(&output_path);
++            return match screen_capture.write_png(path) {
++                Ok(()) => ControlResponse::capture(output_path),
++                Err(err) => ControlResponse::err(format!("failed to capture screen: {err}")),
++            };
++        }
+     };
+ 
+     match result {
+@@ -272,6 +321,7 @@ mod tests {
+         RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource,
+     };
+     use crate::process_manager::{ProcessController, ProcessExit};
++    use crate::screen_capture::ScreenCaptureStore;
+     use crate::state::CompositorState;
+     use smithay::backend::allocator::Fourcc as DrmFourcc;
+     use std::collections::BTreeMap;
+@@ -338,6 +388,62 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn capture_screen_returns_error_when_no_frame_is_available() {
++        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
++        let screen_capture = ScreenCaptureStore::default();
++        let output_path = std::env::temp_dir().join("surf-ace-no-frame-capture.png");
++
++        let response = handle_request_with_capture(
++            &mut state,
++            ControlRequest::CaptureScreen {
++                output_path: output_path.display().to_string(),
++            },
++            None,
++            &screen_capture,
++        );
++
++        assert!(!response.ok);
++        assert_eq!(
++            response.error.as_deref(),
++            Some("failed to capture screen: screen capture unavailable")
++        );
++    }
++
++    #[test]
++    fn capture_screen_writes_png_to_requested_path() {
++        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
++        let screen_capture = ScreenCaptureStore::default();
++        screen_capture.update_from_scanout_xrgb8888(
++            &[0x10, 0x20, 0x30, 0x00],
++            4,
++            1,
++            1,
++            false,
++            OutputRotation::Deg0,
++        );
++        let output_path = std::env::temp_dir().join(format!(
++            "surf-ace-control-capture-{}.png",
++            std::process::id()
++        ));
++        let output_path_string = output_path.display().to_string();
++
++        let response = handle_request_with_capture(
++            &mut state,
++            ControlRequest::CaptureScreen {
++                output_path: output_path_string.clone(),
++            },
++            None,
++            &screen_capture,
++        );
++
++        assert!(response.ok);
++        assert_eq!(response.capture_path.as_deref(), Some(output_path_string.as_str()));
++        let metadata = std::fs::metadata(&output_path).expect("capture png should exist");
++        assert!(metadata.len() > 0);
++        let _ = std::fs::remove_file(output_path);
++    }
++
+     #[test]
+     fn start_host_runtime_restarts_from_host_backend_failed_state() {
+         let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+diff --git a/src/lib.rs b/src/lib.rs
+index 6bdd2ea..0b6efd1 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -3,4 +3,5 @@ pub mod model;
+ pub mod policy;
+ pub mod process_manager;
+ pub mod runtime;
++pub mod screen_capture;
+ pub mod state;
+diff --git a/src/main.rs b/src/main.rs
+index 46d40a0..3daa4c6 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -9,11 +9,15 @@ use surf_ace_compositor::control::{
+ use surf_ace_compositor::model::HostRuntimeStartTrigger;
+ use surf_ace_compositor::process_manager::LocalProcessController;
+ use surf_ace_compositor::runtime::{run_host, run_winit};
++use surf_ace_compositor::screen_capture::ScreenCaptureStore;
+ use surf_ace_compositor::state::CompositorState;
+ 
+ #[derive(Debug, Parser)]
+ #[command(name = "surf-ace-compositor")]
+ #[command(about = "Surf Ace compositor control/runtime daemon (first implementation slice).")]
++#[command(
++    after_help = "Verified tty4 workflow on RACTER:\n  surf-ace-compositor serve --runtime host --socket-path /tmp/surf-ace-zsh-tty4.sock\n  surf-ace-compositor ctl --socket-path /tmp/surf-ace-zsh-tty4.sock --request-json '{\"type\":\"set_output_rotation\",\"rotation\":\"deg90\"}'\n  surf-ace-compositor ctl --socket-path /tmp/surf-ace-zsh-tty4.sock --request-json '{\"type\":\"capture_screen\",\"output_path\":\"/tmp/surf-ace-capture.png\"}'"
++)]
+ struct Cli {
+     #[command(subcommand)]
+     command: Command,
+@@ -21,12 +25,20 @@ struct Cli {
+ 
+ #[derive(Debug, Subcommand)]
+ enum Command {
++    #[command(
++        about = "Run the compositor daemon and optional runtime backend.",
++        after_help = "Verified host example:\n  surf-ace-compositor serve --runtime host --socket-path /tmp/surf-ace-zsh-tty4.sock"
++    )]
+     Serve {
+         #[arg(long, default_value = "/tmp/surf-ace-compositor.sock")]
+         socket_path: PathBuf,
+         #[arg(long, default_value = "none", value_parser = ["none", "winit", "host"])]
+         runtime: String,
+     },
++    #[command(
++        about = "Send a raw JSON control request over the local Unix socket.",
++        after_help = "Verified control examples:\n  surf-ace-compositor ctl --socket-path /tmp/surf-ace-zsh-tty4.sock --request-json '{\"type\":\"get_status\"}'\n  surf-ace-compositor ctl --socket-path /tmp/surf-ace-zsh-tty4.sock --request-json '{\"type\":\"set_output_rotation\",\"rotation\":\"deg270\"}'\n  surf-ace-compositor ctl --socket-path /tmp/surf-ace-zsh-tty4.sock --request-json '{\"type\":\"capture_screen\",\"output_path\":\"/tmp/surf-ace-capture.png\"}'"
++    )]
+     Ctl {
+         #[arg(long, default_value = "/tmp/surf-ace-compositor.sock")]
+         socket_path: PathBuf,
+@@ -59,10 +71,11 @@ fn run_server(socket_path: PathBuf, runtime: &str) {
+         Box::new(LocalProcessController::default()),
+     );
+     let shared_state = Arc::new(Mutex::new(state));
++    let screen_capture = ScreenCaptureStore::default();
+ 
+     match runtime {
+         "none" => {
+-            if let Err(err) = serve(&socket_path, shared_state) {
++            if let Err(err) = serve(&socket_path, shared_state, screen_capture) {
+                 eprintln!("control server failed: {err}");
+                 std::process::exit(1);
+             }
+@@ -70,8 +83,9 @@ fn run_server(socket_path: PathBuf, runtime: &str) {
+         "winit" => {
+             let control_state = shared_state.clone();
+             let control_socket = socket_path.clone();
++            let control_screen_capture = screen_capture.clone();
+             thread::spawn(move || {
+-                if let Err(err) = serve(&control_socket, control_state) {
++                if let Err(err) = serve(&control_socket, control_state, control_screen_capture) {
+                     eprintln!("control server failed: {err}");
+                 }
+             });
+@@ -86,11 +100,13 @@ fn run_server(socket_path: PathBuf, runtime: &str) {
+             let control_state = shared_state.clone();
+             let control_socket = socket_path.clone();
+             let control_runtime_tx = runtime_control_tx.clone();
++            let control_screen_capture = screen_capture.clone();
+             let control_thread = thread::spawn(move || {
+                 if let Err(err) = serve_with_runtime_control(
+                     &control_socket,
+                     control_state,
+                     Some(control_runtime_tx),
++                    control_screen_capture,
+                 ) {
+                     eprintln!("control server failed: {err}");
+                 }
+@@ -116,7 +132,7 @@ fn run_server(socket_path: PathBuf, runtime: &str) {
+             while let Ok(command) = runtime_control_rx.recv() {
+                 match command {
+                     RuntimeControlCommand::StartHostRuntime => {
+-                        if let Err(err) = run_host(shared_state.clone()) {
++                        if let Err(err) = run_host(shared_state.clone(), screen_capture.clone()) {
+                             eprintln!("host runtime failed: {err}");
+                             let mut state = match shared_state.lock() {
+                                 Ok(guard) => guard,
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 51562c5..bd8a7c6 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -1,7 +1,9 @@
++use input::Libinput;
+ use crate::model::{
+     OutputRotation, RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeFocusTarget,
+     RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource,
+ };
++use crate::screen_capture::ScreenCaptureStore;
+ use crate::state::CompositorState;
+ use rustix::fs::OFlags;
+ use rustix::io::dup;
+@@ -17,6 +19,7 @@ use smithay::backend::input::{
+     AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
+     KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+ };
++use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
+ use smithay::backend::renderer::element::Kind;
+ use smithay::backend::renderer::element::surface::{
+     WaylandSurfaceRenderElement, render_elements_from_surface_tree,
+@@ -26,7 +29,7 @@ use smithay::backend::renderer::utils::{
+     draw_render_elements, import_surface_tree, on_commit_buffer_handler,
+ };
+ use smithay::backend::renderer::{
+-    Bind, Color32F, ExportMem, Frame, ImportDma, Offscreen, Renderer, TextureMapping,
++    Bind, Color32F, ExportMem, Frame, ImportDma, Offscreen, Renderer, Texture, TextureMapping,
+ };
+ use smithay::backend::session::Event as SessionSignal;
+ use smithay::backend::session::Session;
+@@ -34,6 +37,8 @@ use smithay::backend::session::libseat::LibSeatSession;
+ use smithay::backend::udev::{UdevBackend, UdevEvent, primary_gpu};
+ use smithay::backend::winit::{self, WinitEvent};
+ use smithay::delegate_compositor;
++use smithay::delegate_data_device;
++use smithay::delegate_output;
+ use smithay::delegate_dmabuf;
+ use smithay::delegate_seat;
+ use smithay::delegate_shm;
+@@ -41,6 +46,9 @@ use smithay::delegate_xdg_shell;
+ use smithay::input::keyboard::FilterResult;
+ use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
+ use smithay::input::{Seat, SeatHandler, SeatState};
++use smithay::output::{
++    Mode as OutputMode, Output, PhysicalProperties, Scale as OutputScale, Subpixel,
++};
+ use smithay::reexports::calloop::{
+     EventLoop, Interest, LoopHandle, LoopSignal, Mode as CalloopMode, PostAction,
+     RegistrationToken,
+@@ -76,6 +84,12 @@ use smithay::wayland::compositor::{
+ use smithay::wayland::dmabuf::{
+     DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf,
+ };
++use smithay::wayland::output::{OutputHandler, OutputManagerState};
++use smithay::wayland::selection::SelectionHandler;
++use smithay::wayland::selection::data_device::{
++    ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
++    set_data_device_focus,
++};
+ use smithay::wayland::shell::xdg::{
+     Configure, PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+     XdgToplevelSurfaceData,
+@@ -284,7 +298,10 @@ pub fn run_winit(shared_state: Arc<Mutex<CompositorState>>) -> Result<(), Runtim
+     Ok(())
+ }
+ 
+-pub fn run_host(shared_state: Arc<Mutex<CompositorState>>) -> Result<(), RuntimeError> {
++pub fn run_host(
++    shared_state: Arc<Mutex<CompositorState>>,
++    screen_capture: ScreenCaptureStore,
++) -> Result<(), RuntimeError> {
+     {
+         let mut state = lock_state(&shared_state);
+         state.mark_runtime_starting(RuntimeBackend::HostDrm);
+@@ -332,12 +349,23 @@ pub fn run_host(shared_state: Arc<Mutex<CompositorState>>) -> Result<(), Runtime
+     let (session, session_notifier) =
+         LibSeatSession::new().map_err(|err| RuntimeError::HostSession(err.to_string()))?;
+     let seat_name = session.seat();
++    let mut libinput_context = Libinput::new_with_udev(LibinputSessionInterface::from(
++        session.clone(),
++    ));
++    libinput_context
++        .udev_assign_seat(&seat_name)
++        .map_err(|_| RuntimeError::HostUdev(format!("failed to assign libinput seat {seat_name}")))?;
++    let libinput_backend = LibinputInputBackend::new(libinput_context);
+     let udev =
+         UdevBackend::new(&seat_name).map_err(|err| RuntimeError::HostUdev(err.to_string()))?;
+     let preferred_primary_path = primary_gpu(&seat_name).ok().flatten();
+ 
+-    let mut host_backend =
+-        HostBackendState::new(session, seat_name.clone(), preferred_primary_path.clone());
++    let mut host_backend = HostBackendState::new(
++        session,
++        seat_name.clone(),
++        preferred_primary_path.clone(),
++        screen_capture,
++    );
+     let mut initial_devices: Vec<(u64, PathBuf)> = udev
+         .device_list()
+         .map(|(device_id, path)| (device_id as u64, path.to_path_buf()))
+@@ -406,6 +434,7 @@ pub fn run_host(shared_state: Arc<Mutex<CompositorState>>) -> Result<(), Runtime
+             })?;
+     loop_handle
+         .insert_source(listening_socket, move |client_stream, _, data| {
++            data.wayland_state.sync_output_state();
+             let _ = data
+                 .display_handle
+                 .insert_client(client_stream, Arc::new(RuntimeClientState::default()));
+@@ -439,6 +468,13 @@ pub fn run_host(shared_state: Arc<Mutex<CompositorState>>) -> Result<(), Runtime
+         drm_events_fd,
+         Rc::clone(&drm_events_source_token),
+     )?;
++    loop_handle
++        .insert_source(libinput_backend, |event, _, data| {
++            data.wayland_state.forward_input_event(event);
++            let mut state = lock_state(&data.shared_state);
++            state.mark_runtime_input_event();
++        })
++        .map_err(|err| RuntimeError::RegisterSource(err.to_string()))?;
+ 
+     let loop_handle_for_timer = loop_handle.clone();
+     let drm_events_source_token_for_timer = Rc::clone(&drm_events_source_token);
+@@ -785,6 +821,7 @@ struct HostBackendState {
+     session: LibSeatSession,
+     seat_name: String,
+     preferred_primary_path: Option<PathBuf>,
++    screen_capture: ScreenCaptureStore,
+     detected_devices: HashMap<u64, PathBuf>,
+     opened_devices: HashMap<u64, OpenedHostDevice>,
+     claimed_output: Option<ClaimedHostOutput>,
+@@ -819,7 +856,6 @@ struct HostGlesRendererState {
+     _egl_display: EGLDisplay,
+     renderer: GlesRenderer,
+     target_texture: GlesTexture,
+-    size: Size<i32, BufferCoords>,
+     primary_scanout_format: DrmFourcc,
+     overlay_scanout_format: Option<DrmFourcc>,
+     direct_scanout: Option<HostDirectScanoutState>,
+@@ -1073,11 +1109,13 @@ impl HostBackendState {
+         session: LibSeatSession,
+         seat_name: String,
+         preferred_primary_path: Option<PathBuf>,
++        screen_capture: ScreenCaptureStore,
+     ) -> Self {
+         Self {
+             session,
+             seat_name,
+             preferred_primary_path,
++            screen_capture,
+             detected_devices: HashMap::new(),
+             opened_devices: HashMap::new(),
+             claimed_output: None,
+@@ -1266,6 +1304,7 @@ impl HostBackendState {
+         let mut rendered_with_gles_readback = false;
+         let mut disable_gles_renderer = false;
+         let mut overlay_framebuffer: Option<drm_framebuffer::Handle> = None;
++        let force_readback_present = std::env::var_os("SURF_ACE_HOST_RUNTIME_FORCE_READBACK").is_some();
+         let overlay_plane_rotation_supported = matches!(
+             lock_state(&wayland_state.shared_state).output_rotation(),
+             OutputRotation::Deg0
+@@ -1284,48 +1323,51 @@ impl HostBackendState {
+         let prefer_overlay_plane_split = overlay_plane_rotation_supported
+             && overlay_plane_alpha_format_supported
+             && overlay_plane_alpha_blending_supported;
+-        if let Some(gles_renderer) = pipeline.gles_renderer.as_mut() {
+-            match render_host_scene_with_gles_direct(
+-                gles_renderer,
+-                wayland_state,
+-                &opened.path,
+-                mode_w as i32,
+-                mode_h as i32,
+-                prefer_overlay_plane_split,
+-            ) {
+-                Ok(targets) => {
+-                    if let Some(framebuffer) = targets.main {
+-                        queued_framebuffer = Some(framebuffer);
+-                        queued_source = QueuedFlipSource::DirectGbm;
+-                        rendered_with_gles_direct = true;
+-                    } else if requires_direct_present {
+-                        return Err(RuntimeError::HostOutputClaim {
+-                            path: opened.path.display().to_string(),
+-                            error: "direct-present ownership was established at startup but direct framebuffer is unavailable"
+-                                .to_string(),
++        if !force_readback_present {
++            if let Some(gles_renderer) = pipeline.gles_renderer.as_mut() {
++                match render_host_scene_with_gles_direct(
++                    gles_renderer,
++                    wayland_state,
++                    &opened.path,
++                    mode_w as i32,
++                    mode_h as i32,
++                    prefer_overlay_plane_split,
++                    &self.screen_capture,
++                ) {
++                    Ok(targets) => {
++                        if let Some(framebuffer) = targets.main {
++                            queued_framebuffer = Some(framebuffer);
++                            queued_source = QueuedFlipSource::DirectGbm;
++                            rendered_with_gles_direct = true;
++                        } else if requires_direct_present {
++                            return Err(RuntimeError::HostOutputClaim {
++                                path: opened.path.display().to_string(),
++                                error: "direct-present ownership was established at startup but direct framebuffer is unavailable"
++                                    .to_string(),
++                            }
++                            .into());
+                         }
+-                        .into());
+-                    }
+-                    if overlay_framebuffer.is_none() {
+-                        overlay_framebuffer = targets.overlay;
+-                    }
+-                }
+-                Err(err) => {
+-                    if requires_direct_present {
+-                        return Err(RuntimeError::HostOutputClaim {
+-                            path: opened.path.display().to_string(),
+-                            error: format!(
+-                                "direct-present ownership is active but direct scanout render failed: {err}"
+-                            ),
++                        if overlay_framebuffer.is_none() {
++                            overlay_framebuffer = targets.overlay;
+                         }
+-                        .into());
+-                    } else {
+-                        eprintln!(
+-                            "host gles direct scanout render failed on {}: {err}; falling back to readback/software composition",
+-                            opened.path.display()
+-                        );
+-                        if let Some(gles) = pipeline.gles_renderer.as_mut() {
+-                            gles.direct_scanout = None;
++                    }
++                    Err(err) => {
++                        if requires_direct_present {
++                            return Err(RuntimeError::HostOutputClaim {
++                                path: opened.path.display().to_string(),
++                                error: format!(
++                                    "direct-present ownership is active but direct scanout render failed: {err}"
++                                ),
++                            }
++                            .into());
++                        } else {
++                            eprintln!(
++                                "host gles direct scanout render failed on {}: {err}; falling back to readback/software composition",
++                                opened.path.display()
++                            );
++                            if let Some(gles) = pipeline.gles_renderer.as_mut() {
++                                gles.direct_scanout = None;
++                            }
+                         }
+                     }
+                 }
+@@ -1406,6 +1448,15 @@ impl HostBackendState {
+                     mode_h as i32,
+                 );
+             }
++            let rotation = { lock_state(&wayland_state.shared_state).output_rotation() };
++            self.screen_capture.update_from_scanout_xrgb8888(
++                &mapping[..],
++                stride,
++                mode_w.max(1) as usize,
++                mode_h.max(1) as usize,
++                false,
++                rotation,
++            );
+         }
+ 
+         let queued_framebuffer =
+@@ -2413,10 +2464,11 @@ fn claim_output_on_device(
+             }
+         })
+         .filter(|format| overlay_scanout_format_supports_alpha(*format));
++    let force_readback_present = std::env::var_os("SURF_ACE_HOST_RUNTIME_FORCE_READBACK").is_some();
+     let requires_direct_startup = matches!(
+         required_startup_ownership,
+         Some(StartupPresentOwnership::DirectGbm)
+-    );
++    ) && !force_readback_present;
+ 
+     let gles_renderer = match build_host_gles_renderer_state(
+         &opened.fd,
+@@ -2426,53 +2478,55 @@ fn claim_output_on_device(
+         overlay_scanout_format,
+     ) {
+         Ok(mut renderer) => {
+-            match prime_direct_startup_frame(&mut renderer, &opened.path, plan.mode.size()) {
+-                Ok(Some(framebuffer)) => {
+-                    if let Some(atomic) = atomic_candidate.as_ref() {
+-                        match claim_output_with_atomic_modeset(
+-                            &card,
+-                            &opened.path,
+-                            &atomic,
+-                            framebuffer,
+-                        ) {
+-                            Ok(()) => {
+-                                used_direct_startup = true;
+-                                atomic_commit_state = atomic_candidate.take();
++            if !force_readback_present {
++                match prime_direct_startup_frame(&mut renderer, &opened.path, plan.mode.size()) {
++                    Ok(Some(framebuffer)) => {
++                        if let Some(atomic) = atomic_candidate.as_ref() {
++                            match claim_output_with_atomic_modeset(
++                                &card,
++                                &opened.path,
++                                &atomic,
++                                framebuffer,
++                            ) {
++                                Ok(()) => {
++                                    used_direct_startup = true;
++                                    atomic_commit_state = atomic_candidate.take();
++                                }
++                                Err(err) => {
++                                    eprintln!(
++                                        "host backend could not use atomic direct startup modeset on {}: {err}; trying legacy set_crtc",
++                                        opened.path.display()
++                                    );
++                                }
+                             }
+-                            Err(err) => {
++                        }
++                        if !used_direct_startup {
++                            if let Err(err) = card.set_crtc(
++                                plan.crtc,
++                                Some(framebuffer),
++                                (0, 0),
++                                &[plan.connector],
++                                Some(plan.mode),
++                            ) {
+                                 eprintln!(
+-                                    "host backend could not use atomic direct startup modeset on {}: {err}; trying legacy set_crtc",
++                                    "host backend could not use direct gbm framebuffer for startup modeset on {}: {err}",
+                                     opened.path.display()
+                                 );
++                                renderer.direct_scanout = None;
++                            } else {
++                                used_direct_startup = true;
+                             }
+                         }
+                     }
+-                    if !used_direct_startup {
+-                        if let Err(err) = card.set_crtc(
+-                            plan.crtc,
+-                            Some(framebuffer),
+-                            (0, 0),
+-                            &[plan.connector],
+-                            Some(plan.mode),
+-                        ) {
+-                            eprintln!(
+-                                "host backend could not use direct gbm framebuffer for startup modeset on {}: {err}",
+-                                opened.path.display()
+-                            );
+-                            renderer.direct_scanout = None;
+-                        } else {
+-                            used_direct_startup = true;
+-                        }
++                    Ok(None) => {}
++                    Err(err) => {
++                        eprintln!(
++                            "host backend could not prime direct gbm startup frame on {}: {err}",
++                            opened.path.display()
++                        );
++                        renderer.direct_scanout = None;
+                     }
+                 }
+-                Ok(None) => {}
+-                Err(err) => {
+-                    eprintln!(
+-                        "host backend could not prime direct gbm startup frame on {}: {err}",
+-                        opened.path.display()
+-                    );
+-                    renderer.direct_scanout = None;
+-                }
+             }
+             Some(renderer)
+         }
+@@ -2691,7 +2745,6 @@ fn build_host_gles_renderer_state(
+         _egl_display: egl_display,
+         renderer,
+         target_texture,
+-        size,
+         primary_scanout_format,
+         overlay_scanout_format,
+         direct_scanout,
+@@ -2891,21 +2944,33 @@ fn render_host_scene_with_gles_direct(
+     output_w: i32,
+     output_h: i32,
+     prefer_overlay_plane_split: bool,
++    screen_capture: &ScreenCaptureStore,
+ ) -> Result<DirectRenderTargets, RuntimeError> {
+-    let size = Size::<i32, BufferCoords>::from((output_w.max(1), output_h.max(1)));
+-    if gles_state.size != size {
++    let scanout_size = Size::<i32, BufferCoords>::from((output_w.max(1), output_h.max(1)));
++    let scene_render_size = render_output_size_before_transform(wayland_state);
++    let scene_size = Size::<i32, BufferCoords>::from((scene_render_size.w, scene_render_size.h));
++    if gles_state.target_texture.size() != scene_size {
+         gles_state.target_texture = gles_state
+             .renderer
+-            .create_buffer(DrmFourcc::Xrgb8888, size)
++            .create_buffer(DrmFourcc::Xrgb8888, scene_size)
+             .map_err(|err| RuntimeError::HostOutputClaim {
+                 path: device_path.display().to_string(),
+                 error: format!("failed to resize gles offscreen render target: {err}"),
+             })?;
++    }
++    let direct_scanout_needs_resize = gles_state
++        .direct_scanout
++        .as_ref()
++        .map(|direct_scanout| {
++            direct_scanout.buffers[direct_scanout.front_buffer].dmabuf.size() != scanout_size
++                || direct_scanout.buffers[direct_scanout.back_buffer].dmabuf.size() != scanout_size
++        })
++        .unwrap_or(true);
++    if direct_scanout_needs_resize {
+         gles_state.direct_scanout = None;
+-        gles_state.size = size;
+     }
+ 
+-    ensure_direct_scanout_state(gles_state, device_path, size)?;
++    ensure_direct_scanout_state(gles_state, device_path, scanout_size)?;
+ 
+     let (mut scanout_dmabuf, main_framebuffer) = {
+         let Some(direct_scanout) = gles_state.direct_scanout.as_mut() else {
+@@ -2923,8 +2988,6 @@ fn render_host_scene_with_gles_direct(
+ 
+     let rotation = { lock_state(&wayland_state.shared_state).output_rotation() };
+     let transform = transform_from_rotation(rotation);
+-    let render_size = Size::<i32, Physical>::from((output_w.max(1), output_h.max(1)));
+-    let damage = Rectangle::from_size(render_size);
+     let capture =
+         wayland_state.collect_render_elements(&mut gles_state.renderer, output_w, output_h);
+     let overlay_framebuffer = if prefer_overlay_plane_split {
+@@ -2938,6 +3001,108 @@ fn render_host_scene_with_gles_direct(
+     } else {
+         &capture.elements
+     };
++    if matches!(rotation, OutputRotation::Deg90 | OutputRotation::Deg270) {
++        let scene_damage = Rectangle::from_size(scene_render_size);
++        {
++            let mut scene_target = gles_state
++                .renderer
++                .bind(&mut gles_state.target_texture)
++                .map_err(|err| RuntimeError::HostOutputClaim {
++                    path: device_path.display().to_string(),
++                    error: format!("failed to bind quarter-turn scene texture: {err}"),
++                })?;
++            let mut scene_frame = gles_state
++                .renderer
++                .render(&mut scene_target, scene_render_size, Transform::Normal)
++                .map_err(|err| RuntimeError::HostOutputClaim {
++                    path: device_path.display().to_string(),
++                    error: format!("failed to begin quarter-turn scene render pass: {err}"),
++                })?;
++            scene_frame
++                .clear(Color32F::new(0.08, 0.08, 0.1, 1.0), &[scene_damage])
++                .map_err(|err| RuntimeError::HostOutputClaim {
++                    path: device_path.display().to_string(),
++                    error: format!("failed to clear quarter-turn scene texture: {err}"),
++                })?;
++            draw_render_elements(&mut scene_frame, 1.0, primary_elements, &[scene_damage]).map_err(
++                |err| RuntimeError::HostOutputClaim {
++                    path: device_path.display().to_string(),
++                    error: format!(
++                        "failed to draw scene elements into quarter-turn scene texture: {err}"
++                    ),
++                },
++            )?;
++            let _ = scene_frame
++                .finish()
++                .map_err(|err| RuntimeError::HostOutputClaim {
++                    path: device_path.display().to_string(),
++                    error: format!("failed to finish quarter-turn scene render pass: {err}"),
++                })?;
++        }
++
++        let scanout_render_size = Size::<i32, Physical>::from((scanout_size.w, scanout_size.h));
++        let scanout_damage = Rectangle::from_size(scanout_render_size);
++        let scene_src = Rectangle::from_size(gles_state.target_texture.size()).to_f64();
++        let mut render_target = gles_state
++            .renderer
++            .bind(&mut scanout_dmabuf)
++            .map_err(|err| RuntimeError::HostOutputClaim {
++                path: device_path.display().to_string(),
++                error: format!("failed to bind direct gbm scanout dmabuf: {err}"),
++            })?;
++        let mut frame = gles_state
++            .renderer
++            .render(&mut render_target, scanout_render_size, Transform::Normal)
++            .map_err(|err| RuntimeError::HostOutputClaim {
++                path: device_path.display().to_string(),
++                error: format!("failed to begin direct quarter-turn scanout render pass: {err}"),
++            })?;
++        frame
++            .clear(Color32F::new(0.08, 0.08, 0.1, 1.0), &[scanout_damage])
++            .map_err(|err| RuntimeError::HostOutputClaim {
++                path: device_path.display().to_string(),
++                error: format!("failed to clear direct quarter-turn scanout buffer: {err}"),
++            })?;
++        let scene_texture_transform = quarter_turn_scene_texture_transform(rotation);
++        frame
++            .render_texture_from_to(
++                &gles_state.target_texture,
++                scene_src,
++                Rectangle::from_size(scanout_render_size),
++                &[scanout_damage],
++                &[],
++                scene_texture_transform,
++                1.0,
++                None,
++                &[],
++            )
++            .map_err(|err| RuntimeError::HostOutputClaim {
++                path: device_path.display().to_string(),
++                error: format!("failed to composite quarter-turn scene texture into direct scanout buffer: {err}"),
++            })?;
++        let _ = frame
++            .finish()
++            .map_err(|err| RuntimeError::HostOutputClaim {
++                path: device_path.display().to_string(),
++                error: format!("failed to finish direct quarter-turn scanout render pass: {err}"),
++            })?;
++        capture_screen_from_render_target(
++            screen_capture,
++            &mut gles_state.renderer,
++            &render_target,
++            scanout_size.w.max(1) as usize,
++            scanout_size.h.max(1) as usize,
++            rotation,
++        );
++
++        return Ok(DirectRenderTargets {
++            main: Some(main_framebuffer),
++            overlay: overlay_framebuffer,
++        });
++    }
++
++    let render_size = Size::<i32, Physical>::from((scanout_size.w, scanout_size.h));
++    let damage = Rectangle::from_size(render_size);
+     let mut render_target = gles_state
+         .renderer
+         .bind(&mut scanout_dmabuf)
+@@ -2970,6 +3135,14 @@ fn render_host_scene_with_gles_direct(
+             path: device_path.display().to_string(),
+             error: format!("failed to finish direct gles render pass: {err}"),
+         })?;
++    capture_screen_from_render_target(
++        screen_capture,
++        &mut gles_state.renderer,
++        &render_target,
++        scanout_size.w.max(1) as usize,
++        scanout_size.h.max(1) as usize,
++        rotation,
++    );
+ 
+     Ok(DirectRenderTargets {
+         main: Some(main_framebuffer),
+@@ -3055,7 +3228,7 @@ fn render_host_scene_with_gles_readback(
+     output_h: i32,
+ ) -> Result<(), RuntimeError> {
+     let size = Size::<i32, BufferCoords>::from((output_w.max(1), output_h.max(1)));
+-    if gles_state.size != size {
++    if gles_state.target_texture.size() != size {
+         gles_state.target_texture = gles_state
+             .renderer
+             .create_buffer(DrmFourcc::Xrgb8888, size)
+@@ -3063,13 +3236,12 @@ fn render_host_scene_with_gles_readback(
+                 path: device_path.display().to_string(),
+                 error: format!("failed to resize gles host render target: {err}"),
+             })?;
+-        gles_state.size = size;
+     }
+ 
+     let rotation = { lock_state(&wayland_state.shared_state).output_rotation() };
+     let transform = transform_from_rotation(rotation);
+-    let render_size = Size::<i32, Physical>::from((output_w.max(1), output_h.max(1)));
+-    let damage = Rectangle::from_size(render_size);
++    let render_size = render_output_size_before_transform(wayland_state);
++    let damage = Rectangle::from_size(transform.transform_size(render_size));
+     let capture =
+         wayland_state.collect_render_elements(&mut gles_state.renderer, output_w, output_h);
+ 
+@@ -3125,6 +3297,7 @@ fn render_host_scene_with_gles_readback(
+     copy_renderer_pixels_to_dumb(
+         pixels,
+         mapping.flipped(),
++        rotation,
+         target,
+         target_stride,
+         output_w.max(1) as usize,
+@@ -3133,9 +3306,68 @@ fn render_host_scene_with_gles_readback(
+     Ok(())
+ }
+ 
++fn render_output_size_before_transform(wayland_state: &RuntimeWaylandState) -> Size<i32, Physical> {
++    let size = wayland_state.runtime_output_size();
++    Size::<i32, Physical>::from((size.w.max(1), size.h.max(1)))
++}
++
++fn quarter_turn_scene_texture_transform(rotation: OutputRotation) -> Transform {
++    match rotation {
++        OutputRotation::Deg90 => Transform::Flipped90,
++        OutputRotation::Deg270 => Transform::Flipped270,
++        OutputRotation::Deg0 => Transform::Normal,
++        OutputRotation::Deg180 => Transform::_180,
++    }
++}
++
++fn screen_capture_src_flipped(mapping_flipped: bool, rotation: OutputRotation) -> bool {
++    match rotation {
++        OutputRotation::Deg90 | OutputRotation::Deg270 => mapping_flipped,
++        OutputRotation::Deg0 | OutputRotation::Deg180 => false,
++    }
++}
++
++fn capture_screen_from_render_target(
++    screen_capture: &ScreenCaptureStore,
++    renderer: &mut GlesRenderer,
++    render_target: &smithay::backend::renderer::gles::GlesTarget<'_>,
++    width: usize,
++    height: usize,
++    rotation: OutputRotation,
++) {
++    let region = Rectangle::from_size(Size::<i32, BufferCoords>::from((
++        width.max(1) as i32,
++        height.max(1) as i32,
++    )));
++    let mapping = match renderer.copy_framebuffer(render_target, region, DrmFourcc::Xrgb8888) {
++        Ok(mapping) => mapping,
++        Err(err) => {
++            eprintln!("host screen capture readback failed: {err}");
++            return;
++        }
++    };
++    let flipped = mapping.flipped();
++    let pixels = match renderer.map_texture(&mapping) {
++        Ok(pixels) => pixels,
++        Err(err) => {
++            eprintln!("host screen capture map failed: {err}");
++            return;
++        }
++    };
++    screen_capture.update_from_scanout_xrgb8888(
++        pixels,
++        width.saturating_mul(4),
++        width,
++        height,
++        screen_capture_src_flipped(flipped, rotation),
++        rotation,
++    );
++}
++
+ fn copy_renderer_pixels_to_dumb(
+     src_pixels: &[u8],
+     src_flipped: bool,
++    rotation: OutputRotation,
+     dst_pixels: &mut [u8],
+     dst_stride: usize,
+     width: usize,
+@@ -3145,8 +3377,9 @@ fn copy_renderer_pixels_to_dumb(
+     if src_stride == 0 || dst_stride == 0 {
+         return;
+     }
++    let preserve_readback_row_order = matches!(rotation, OutputRotation::Deg90 | OutputRotation::Deg270);
+     for y in 0..height {
+-        let src_y = if src_flipped {
++        let src_y = if src_flipped && !preserve_readback_row_order {
+             height.saturating_sub(1).saturating_sub(y)
+         } else {
+             y
+@@ -3231,6 +3464,9 @@ struct RuntimeWaylandState {
+     shared_state: Arc<Mutex<CompositorState>>,
+     display_handle: DisplayHandle,
+     compositor_state: SmithayCompositorState,
++    _output_manager_state: OutputManagerState,
++    _data_device_state: DataDeviceState,
++    output: Output,
+     xdg_shell_state: XdgShellState,
+     shm_state: ShmState,
+     dmabuf_state: DmabufState,
+@@ -3354,8 +3590,43 @@ struct HostSceneComposeStats {
+ }
+ 
+ impl RuntimeWaylandState {
++    fn runtime_output_size(&self) -> Size<i32, Logical> {
++        let state = lock_state(&self.shared_state);
++        let mut width = state
++            .status_snapshot()
++            .runtime
++            .window_width
++            .unwrap_or(1280)
++            .max(1);
++        let mut height = state
++            .status_snapshot()
++            .runtime
++            .window_height
++            .unwrap_or(800)
++            .max(1);
++        if matches!(
++            state.output_rotation(),
++            OutputRotation::Deg90 | OutputRotation::Deg270
++        ) {
++            std::mem::swap(&mut width, &mut height);
++        }
++        (width, height).into()
++    }
++
+     fn new(display_handle: DisplayHandle, shared_state: Arc<Mutex<CompositorState>>) -> Self {
+         let compositor_state = SmithayCompositorState::new::<Self>(&display_handle);
++        let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
++        let data_device_state = DataDeviceState::new::<Self>(&display_handle);
++        let output = Output::new(
++            "surf-ace-output-0".to_string(),
++            PhysicalProperties {
++                size: (600, 340).into(),
++                subpixel: Subpixel::Unknown,
++                make: "Surf Ace".to_string(),
++                model: "Host Output".to_string(),
++            },
++        );
++        let _ = output.create_global::<Self>(&display_handle);
+         let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
+         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
+         let dmabuf_formats = DMABUF_PROTOCOL_FORMATS.to_vec();
+@@ -3376,6 +3647,9 @@ impl RuntimeWaylandState {
+             shared_state,
+             display_handle,
+             compositor_state,
++            _output_manager_state: output_manager_state,
++            _data_device_state: data_device_state,
++            output,
+             xdg_shell_state,
+             shm_state,
+             dmabuf_state,
+@@ -3391,10 +3665,26 @@ impl RuntimeWaylandState {
+             start_time: std::time::Instant::now(),
+             host_surface_buffers: HashMap::new(),
+         };
++        state.sync_output_state();
+         state.sync_runtime_dmabuf_protocol_status();
+         state
+     }
+ 
++    fn sync_output_state(&self) {
++        let size = self.runtime_output_size();
++        let mode = OutputMode {
++            size: (size.w, size.h).into(),
++            refresh: 60_000,
++        };
++        self.output.change_current_state(
++            Some(mode),
++            Some(Transform::Normal),
++            Some(OutputScale::Integer(1)),
++            Some((0, 0).into()),
++        );
++        self.output.set_preferred(mode);
++    }
++
+     fn sync_runtime_dmabuf_protocol_status(&self) {
+         let formats = self
+             .dmabuf_formats
+@@ -3686,21 +3976,11 @@ impl RuntimeWaylandState {
+     }
+ 
+     fn runtime_output_width(&self) -> i32 {
+-        lock_state(&self.shared_state)
+-            .status_snapshot()
+-            .runtime
+-            .window_width
+-            .unwrap_or(1280)
+-            .max(1)
++        self.runtime_output_size().w
+     }
+ 
+     fn runtime_output_height(&self) -> i32 {
+-        lock_state(&self.shared_state)
+-            .status_snapshot()
+-            .runtime
+-            .window_height
+-            .unwrap_or(800)
+-            .max(1)
++        self.runtime_output_size().h
+     }
+ 
+     fn overlay_rect(&self) -> Rectangle<i32, Logical> {
+@@ -3865,9 +4145,9 @@ impl RuntimeWaylandState {
+     }
+ 
+     fn configure_toplevel_for_role(&self, surface: &ToplevelSurface, role: RuntimeSurfaceRole) {
+-        let status = lock_state(&self.shared_state).status_snapshot();
+-        let output_w = status.runtime.window_width.unwrap_or(1280).max(1);
+-        let output_h = status.runtime.window_height.unwrap_or(800).max(1);
++        self.sync_output_state();
++        let output_w = self.runtime_output_width();
++        let output_h = self.runtime_output_height();
+ 
+         surface.with_pending_state(|pending| {
+             pending.states.set(xdg_toplevel::State::Activated);
+@@ -3886,14 +4166,17 @@ impl RuntimeWaylandState {
+     }
+ 
+     fn reconfigure_roles(&mut self, width: i32, height: i32) {
++        {
++            let mut state = lock_state(&self.shared_state);
++            state.mark_runtime_resize(width, height);
++        }
++        self.sync_output_state();
+         if let Some(main) = &self.main_toplevel {
+             self.configure_toplevel_for_role(main, RuntimeSurfaceRole::MainApp);
+         }
+         if let Some(overlay) = &self.overlay_toplevel {
+             self.configure_toplevel_for_role(overlay, RuntimeSurfaceRole::OverlayNative);
+         }
+-        let mut state = lock_state(&self.shared_state);
+-        state.mark_runtime_resize(width, height);
+     }
+ 
+     fn sync_runtime_status_with_roles(&self) {
+@@ -4504,6 +4787,7 @@ impl SeatHandler for RuntimeWaylandState {
+     }
+ 
+     fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&WlSurface>) {
++        set_data_device_focus(&self.display_handle, &self.seat, focused.and_then(Resource::client));
+         let target = focused
+             .map(surface_id)
+             .and_then(|id| self.role_for_surface_id(id))
+@@ -4523,6 +4807,20 @@ impl SeatHandler for RuntimeWaylandState {
+     }
+ }
+ 
++impl SelectionHandler for RuntimeWaylandState {
++    type SelectionUserData = ();
++}
++
++impl ClientDndGrabHandler for RuntimeWaylandState {}
++
++impl ServerDndGrabHandler for RuntimeWaylandState {}
++
++impl DataDeviceHandler for RuntimeWaylandState {
++    fn data_device_state(&self) -> &DataDeviceState {
++        &self._data_device_state
++    }
++}
++
+ #[derive(Default)]
+ struct RuntimeClientState {
+     compositor_state: CompositorClientState,
+@@ -4686,9 +4984,9 @@ fn surface_id(surface: &WlSurface) -> u32 {
+ fn transform_from_rotation(rotation: OutputRotation) -> Transform {
+     match rotation {
+         OutputRotation::Deg0 => Transform::Normal,
+-        OutputRotation::Deg90 => Transform::_90,
++        OutputRotation::Deg90 => Transform::_270,
+         OutputRotation::Deg180 => Transform::_180,
+-        OutputRotation::Deg270 => Transform::_270,
++        OutputRotation::Deg270 => Transform::_90,
+     }
+ }
+ 
+@@ -4712,8 +5010,12 @@ fn send_frames_surface_tree(surface: &WlSurface, time: u32) {
+     );
+ }
+ 
++impl OutputHandler for RuntimeWaylandState {}
++
+ delegate_xdg_shell!(RuntimeWaylandState);
+ delegate_compositor!(RuntimeWaylandState);
++delegate_data_device!(RuntimeWaylandState);
++delegate_output!(RuntimeWaylandState);
+ delegate_shm!(RuntimeWaylandState);
+ delegate_dmabuf!(RuntimeWaylandState);
+ delegate_seat!(RuntimeWaylandState);
+@@ -4722,14 +5024,16 @@ delegate_seat!(RuntimeWaylandState);
+ mod tests {
+     use super::{
+         AtomicPlaneLayout, DrmFourcc, PlaneSelection, RuntimeWaylandState,
+-        overlay_scanout_format_supports_alpha, select_atomic_plane_zpos_values,
+-        select_preferred_scanout_format, select_primary_path,
++        overlay_scanout_format_supports_alpha, quarter_turn_scene_texture_transform,
++        render_output_size_before_transform, screen_capture_src_flipped,
++        select_atomic_plane_zpos_values,
++        select_preferred_scanout_format, select_primary_path, transform_from_rotation,
+     };
+-    use crate::model::ProcessSpec;
++    use crate::model::{OutputRotation, ProcessSpec};
+     use crate::process_manager::{ProcessController, ProcessExit};
+     use crate::state::CompositorState;
+     use smithay::reexports::wayland_server::Display;
+-    use smithay::utils::{Logical, Rectangle};
++    use smithay::utils::{Logical, Physical, Rectangle, Size, Transform};
+     use std::path::{Path, PathBuf};
+     use std::sync::{Arc, Mutex};
+ 
+@@ -4898,6 +5202,172 @@ mod tests {
+         assert_eq!(layout.crtc_h, 1);
+     }
+ 
++    #[test]
++    fn runtime_output_size_swaps_for_quarter_turn_rotation() {
++        let shared_state = Arc::new(Mutex::new(CompositorState::new(
++            true,
++            Box::new(NoopProcessController),
++        )));
++        {
++            let mut state = match shared_state.lock() {
++                Ok(guard) => guard,
++                Err(poisoned) => poisoned.into_inner(),
++            };
++            state.mark_runtime_resize(3840, 2160);
++            state.set_output_rotation(OutputRotation::Deg90);
++        }
++
++        let display: Display<RuntimeWaylandState> =
++            Display::new().expect("test wayland display should initialize");
++        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state);
++
++        assert_eq!(wayland_state.runtime_output_width(), 2160);
++        assert_eq!(wayland_state.runtime_output_height(), 3840);
++    }
++
++    #[test]
++    fn runtime_output_size_keeps_upright_dimensions_without_quarter_turn_rotation() {
++        let shared_state = Arc::new(Mutex::new(CompositorState::new(
++            true,
++            Box::new(NoopProcessController),
++        )));
++        {
++            let mut state = match shared_state.lock() {
++                Ok(guard) => guard,
++                Err(poisoned) => poisoned.into_inner(),
++            };
++            state.mark_runtime_resize(3840, 2160);
++            state.set_output_rotation(OutputRotation::Deg180);
++        }
++
++        let display: Display<RuntimeWaylandState> =
++            Display::new().expect("test wayland display should initialize");
++        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state);
++
++        assert_eq!(wayland_state.runtime_output_width(), 3840);
++        assert_eq!(wayland_state.runtime_output_height(), 2160);
++    }
++
++    #[test]
++    fn quarter_turn_rotation_maps_to_counterclockwise_transform() {
++        assert_eq!(transform_from_rotation(OutputRotation::Deg90), Transform::_270);
++        assert_eq!(transform_from_rotation(OutputRotation::Deg270), Transform::_90);
++    }
++
++    #[test]
++    fn runtime_output_global_advertises_rotated_logical_size_without_client_transform() {
++        let shared_state = Arc::new(Mutex::new(CompositorState::new(
++            true,
++            Box::new(NoopProcessController),
++        )));
++        {
++            let mut state = match shared_state.lock() {
++                Ok(guard) => guard,
++                Err(poisoned) => poisoned.into_inner(),
++            };
++            state.mark_runtime_resize(3840, 2160);
++            state.set_output_rotation(OutputRotation::Deg90);
++        }
++
++        let display: Display<RuntimeWaylandState> =
++            Display::new().expect("test wayland display should initialize");
++        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state);
++
++        assert_eq!(
++            wayland_state.output.current_mode().map(|mode| mode.size),
++            Some((2160, 3840).into())
++        );
++        assert_eq!(wayland_state.output.current_transform(), Transform::Normal);
++    }
++
++    #[test]
++    fn sync_output_state_picks_up_rotation_changes_before_client_bind() {
++        let shared_state = Arc::new(Mutex::new(CompositorState::new(
++            true,
++            Box::new(NoopProcessController),
++        )));
++        {
++            let mut state = match shared_state.lock() {
++                Ok(guard) => guard,
++                Err(poisoned) => poisoned.into_inner(),
++            };
++            state.mark_runtime_resize(3840, 2160);
++            state.set_output_rotation(OutputRotation::Deg0);
++        }
++
++        let display: Display<RuntimeWaylandState> =
++            Display::new().expect("test wayland display should initialize");
++        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state.clone());
++        assert_eq!(
++            wayland_state.output.current_mode().map(|mode| mode.size),
++            Some((3840, 2160).into())
++        );
++
++        {
++            let mut state = match shared_state.lock() {
++                Ok(guard) => guard,
++                Err(poisoned) => poisoned.into_inner(),
++            };
++            state.set_output_rotation(OutputRotation::Deg90);
++        }
++        wayland_state.sync_output_state();
++
++        assert_eq!(
++            wayland_state.output.current_mode().map(|mode| mode.size),
++            Some((2160, 3840).into())
++        );
++        assert_eq!(wayland_state.output.current_transform(), Transform::Normal);
++    }
++
++    #[test]
++    fn quarter_turn_render_output_size_uses_portrait_logical_dimensions_before_transform() {
++        let shared_state = Arc::new(Mutex::new(CompositorState::new(
++            true,
++            Box::new(NoopProcessController),
++        )));
++        {
++            let mut state = match shared_state.lock() {
++                Ok(guard) => guard,
++                Err(poisoned) => poisoned.into_inner(),
++            };
++            state.mark_runtime_resize(3840, 2160);
++            state.set_output_rotation(OutputRotation::Deg90);
++        }
++
++        let display: Display<RuntimeWaylandState> =
++            Display::new().expect("test wayland display should initialize");
++        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state);
++        let render_size = render_output_size_before_transform(&wayland_state);
++
++        assert_eq!(render_size, Size::<i32, Physical>::from((2160, 3840)));
++        assert_eq!(
++            transform_from_rotation(OutputRotation::Deg90).transform_size(render_size),
++            Size::<i32, Physical>::from((3840, 2160))
++        );
++    }
++
++    #[test]
++    fn quarter_turn_scene_texture_transform_uses_flipped_variants() {
++        assert_eq!(
++            quarter_turn_scene_texture_transform(OutputRotation::Deg90),
++            Transform::Flipped90
++        );
++        assert_eq!(
++            quarter_turn_scene_texture_transform(OutputRotation::Deg270),
++            Transform::Flipped270
++        );
++    }
++
++    #[test]
++    fn screen_capture_ignores_mapping_flip_for_upright_scanouts() {
++        assert!(!screen_capture_src_flipped(true, OutputRotation::Deg0));
++        assert!(!screen_capture_src_flipped(true, OutputRotation::Deg180));
++        assert!(screen_capture_src_flipped(true, OutputRotation::Deg90));
++        assert!(screen_capture_src_flipped(true, OutputRotation::Deg270));
++        assert!(!screen_capture_src_flipped(false, OutputRotation::Deg0));
++        assert!(!screen_capture_src_flipped(false, OutputRotation::Deg180));
++    }
++
+     #[test]
+     fn atomic_plane_zpos_selection_prefers_deterministic_primary_below_overlay_values() {
+         let selected = select_atomic_plane_zpos_values(0, 5, 0, 5)
+diff --git a/src/screen_capture.rs b/src/screen_capture.rs
+new file mode 100644
+index 0000000..1449b91
+--- /dev/null
++++ b/src/screen_capture.rs
+@@ -0,0 +1,266 @@
++use crate::model::OutputRotation;
++use std::fs::File;
++use std::io::{self, BufWriter};
++use std::path::Path;
++use std::sync::{Arc, Mutex};
++
++#[derive(Clone, Default)]
++pub struct ScreenCaptureStore {
++    inner: Arc<Mutex<Option<ScreenCaptureFrame>>>,
++}
++
++#[derive(Clone)]
++struct ScreenCaptureFrame {
++    width: usize,
++    height: usize,
++    xrgb8888: Vec<u8>,
++}
++
++impl ScreenCaptureStore {
++    pub fn update_from_scanout_xrgb8888(
++        &self,
++        src_pixels: &[u8],
++        src_stride: usize,
++        src_width: usize,
++        src_height: usize,
++        src_flipped: bool,
++        output_rotation: OutputRotation,
++    ) {
++        if src_width == 0 || src_height == 0 {
++            return;
++        }
++        let packed = pack_xrgb8888(
++            src_pixels,
++            src_stride,
++            src_width,
++            src_height,
++            src_flipped,
++        );
++        let (width, height, xrgb8888) =
++            rotate_scanout_to_view(&packed, src_width, src_height, output_rotation);
++        let mut guard = match self.inner.lock() {
++            Ok(guard) => guard,
++            Err(poisoned) => poisoned.into_inner(),
++        };
++        *guard = Some(ScreenCaptureFrame {
++            width,
++            height,
++            xrgb8888,
++        });
++    }
++
++    pub fn write_png(&self, path: &Path) -> io::Result<()> {
++        let frame = {
++            let guard = match self.inner.lock() {
++                Ok(guard) => guard,
++                Err(poisoned) => poisoned.into_inner(),
++            };
++            guard
++                .clone()
++                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "screen capture unavailable"))?
++        };
++
++        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
++            std::fs::create_dir_all(parent)?;
++        }
++
++        let file = File::create(path)?;
++        let writer = BufWriter::new(file);
++        let mut encoder = png::Encoder::new(writer, frame.width as u32, frame.height as u32);
++        encoder.set_color(png::ColorType::Rgb);
++        encoder.set_depth(png::BitDepth::Eight);
++        let mut png_writer = encoder.write_header()?;
++
++        let mut rgb = Vec::with_capacity(frame.width.saturating_mul(frame.height).saturating_mul(3));
++        for pixel in frame.xrgb8888.chunks_exact(4) {
++            rgb.push(pixel[2]);
++            rgb.push(pixel[1]);
++            rgb.push(pixel[0]);
++        }
++        png_writer.write_image_data(&rgb)?;
++        Ok(())
++    }
++}
++
++fn pack_xrgb8888(
++    src_pixels: &[u8],
++    src_stride: usize,
++    src_width: usize,
++    src_height: usize,
++    src_flipped: bool,
++) -> Vec<u8> {
++    let row_len = src_width.saturating_mul(4);
++    let mut packed = vec![0u8; src_height.saturating_mul(row_len)];
++    if row_len == 0 || src_stride == 0 {
++        return packed;
++    }
++
++    for y in 0..src_height {
++        let src_y = if src_flipped {
++            src_height.saturating_sub(1).saturating_sub(y)
++        } else {
++            y
++        };
++        let src_start = src_y.saturating_mul(src_stride);
++        let src_end = src_start.saturating_add(row_len).min(src_pixels.len());
++        let dst_start = y.saturating_mul(row_len);
++        let dst_end = dst_start.saturating_add(src_end.saturating_sub(src_start));
++        if src_end <= src_start || dst_end > packed.len() {
++            continue;
++        }
++        packed[dst_start..dst_end].copy_from_slice(&src_pixels[src_start..src_end]);
++    }
++
++    packed
++}
++
++fn rotate_scanout_to_view(
++    src_pixels: &[u8],
++    src_width: usize,
++    src_height: usize,
++    output_rotation: OutputRotation,
++) -> (usize, usize, Vec<u8>) {
++    match output_rotation {
++        OutputRotation::Deg0 => (src_width, src_height, src_pixels.to_vec()),
++        OutputRotation::Deg180 => rotate_xrgb8888(src_pixels, src_width, src_height, RotationTransform::Rotate180),
++        OutputRotation::Deg90 => rotate_xrgb8888(src_pixels, src_width, src_height, RotationTransform::Rotate90Clockwise),
++        OutputRotation::Deg270 => {
++            rotate_xrgb8888(src_pixels, src_width, src_height, RotationTransform::Rotate90Counterclockwise)
++        }
++    }
++}
++
++enum RotationTransform {
++    Rotate90Clockwise,
++    Rotate180,
++    Rotate90Counterclockwise,
++}
++
++fn rotate_xrgb8888(
++    src_pixels: &[u8],
++    src_width: usize,
++    src_height: usize,
++    transform: RotationTransform,
++) -> (usize, usize, Vec<u8>) {
++    let (dst_width, dst_height) = match transform {
++        RotationTransform::Rotate180 => (src_width, src_height),
++        RotationTransform::Rotate90Clockwise | RotationTransform::Rotate90Counterclockwise => {
++            (src_height, src_width)
++        }
++    };
++    let mut dst = vec![0u8; dst_width.saturating_mul(dst_height).saturating_mul(4)];
++
++    for y in 0..src_height {
++        for x in 0..src_width {
++            let (dst_x, dst_y) = match transform {
++                RotationTransform::Rotate90Clockwise => {
++                    (src_height.saturating_sub(1).saturating_sub(y), x)
++                }
++                RotationTransform::Rotate180 => (
++                    src_width.saturating_sub(1).saturating_sub(x),
++                    src_height.saturating_sub(1).saturating_sub(y),
++                ),
++                RotationTransform::Rotate90Counterclockwise => {
++                    (y, src_width.saturating_sub(1).saturating_sub(x))
++                }
++            };
++            let src_index = (y.saturating_mul(src_width).saturating_add(x)).saturating_mul(4);
++            let dst_index =
++                (dst_y.saturating_mul(dst_width).saturating_add(dst_x)).saturating_mul(4);
++            if src_index.saturating_add(4) > src_pixels.len()
++                || dst_index.saturating_add(4) > dst.len()
++            {
++                continue;
++            }
++            dst[dst_index..dst_index + 4].copy_from_slice(&src_pixels[src_index..src_index + 4]);
++        }
++    }
++
++    (dst_width, dst_height, dst)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn deg90_capture_rotates_landscape_scanout_into_portrait_view() {
++        let src = vec![
++            0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, //
++            0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
++        ];
++        let (width, height, rotated) = rotate_scanout_to_view(&src, 2, 2, OutputRotation::Deg90);
++        assert_eq!((width, height), (2, 2));
++        assert_eq!(
++            rotated,
++            vec![
++                0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, //
++                0x04, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
++            ]
++        );
++    }
++
++    #[test]
++    fn store_writes_png_from_latest_frame() {
++        let store = ScreenCaptureStore::default();
++        let src = vec![0x10, 0x20, 0x30, 0x00];
++        store.update_from_scanout_xrgb8888(&src, 4, 1, 1, false, OutputRotation::Deg0);
++        let path = std::env::temp_dir().join(format!(
++            "surf-ace-screen-capture-test-{}.png",
++            std::process::id()
++        ));
++        store.write_png(&path).expect("png should be written");
++        let metadata = std::fs::metadata(&path).expect("png metadata should exist");
++        assert!(metadata.len() > 0);
++        let _ = std::fs::remove_file(path);
++    }
++
++    #[test]
++    fn store_writes_png_to_relative_path() {
++        let store = ScreenCaptureStore::default();
++        let src = vec![0x10, 0x20, 0x30, 0x00];
++        store.update_from_scanout_xrgb8888(&src, 4, 1, 1, false, OutputRotation::Deg0);
++
++        let temp_root = std::env::temp_dir().join(format!(
++            "surf-ace-screen-capture-relative-{}",
++            std::process::id()
++        ));
++        std::fs::create_dir_all(&temp_root).expect("temp root should exist");
++        let prior_dir = std::env::current_dir().expect("current dir should exist");
++        std::env::set_current_dir(&temp_root).expect("current dir should switch");
++
++        let path = Path::new("relative-capture.png");
++        store.write_png(path).expect("png should be written");
++        let metadata = std::fs::metadata(path).expect("relative png should exist");
++        assert!(metadata.len() > 0);
++
++        std::env::set_current_dir(prior_dir).expect("current dir should restore");
++        let _ = std::fs::remove_file(temp_root.join(path));
++        let _ = std::fs::remove_dir(temp_root);
++    }
++
++    #[test]
++    fn deg90_capture_honors_flipped_mapping_before_rotation() {
++        let store = ScreenCaptureStore::default();
++        let src = vec![
++            0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, //
++            0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
++        ];
++        store.update_from_scanout_xrgb8888(&src, 8, 2, 2, true, OutputRotation::Deg90);
++
++        let frame = store
++            .inner
++            .lock()
++            .expect("capture frame should lock")
++            .clone()
++            .expect("capture frame should exist");
++        assert_eq!((frame.width, frame.height), (2, 2));
++        assert_eq!(
++            frame.xrgb8888,
++            vec![
++                0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, //
++                0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
++            ]
++        );
++    }
++}

@@ -1,0 +1,7 @@
+repo_path=/home/clu/src/surf-ace-compositor
+show_toplevel=/home/clu/src/surf-ace-compositor
+head_sha=b70b91517947c071e3724317c96d6e0950fe0387
+branch_name=main
+symbolic_ref=main
+origin_url=git@github.com:leftspin/surf-ace-compositor.git
+head_subject=Add zsh main-app host verification script

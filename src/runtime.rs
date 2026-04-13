@@ -213,6 +213,7 @@ pub fn run_winit(shared_state: Arc<Mutex<CompositorState>>) -> Result<(), Runtim
                 state.mark_runtime_input_event();
             }
             WinitEvent::Redraw => {
+                data.wayland_state.sync_output_rotation_reconfigure_if_needed();
                 data.wayland_state.prune_dead_surfaces();
                 let size = backend.window_size();
                 let damage = Rectangle::from_size(size);
@@ -500,7 +501,7 @@ pub fn run_host(
             }
             match data
                 .host_backend
-                .queue_claimed_presentation_tick(&data.wayland_state)
+                .queue_claimed_presentation_tick(&mut data.wayland_state)
             {
                 Ok(_) => {}
                 Err(failure) => {
@@ -1268,8 +1269,9 @@ impl HostBackendState {
 
     fn queue_claimed_presentation_tick(
         &mut self,
-        wayland_state: &RuntimeWaylandState,
+        wayland_state: &mut RuntimeWaylandState,
     ) -> Result<bool, HostPresentFailure> {
+        wayland_state.sync_output_rotation_reconfigure_if_needed();
         let claimed = match self.claimed_output {
             Some(claimed) => claimed,
             None => return Ok(false),
@@ -3068,7 +3070,7 @@ fn render_host_scene_with_gles_direct(
                 path: device_path.display().to_string(),
                 error: format!("failed to clear direct quarter-turn scanout buffer: {err}"),
             })?;
-        let scene_texture_transform = quarter_turn_scene_texture_transform(rotation);
+        let scene_texture_transform = scene_texture_transform(rotation);
         frame
             .render_texture_from_to(
                 &gles_state.target_texture,
@@ -3316,20 +3318,18 @@ fn render_output_size_before_transform(wayland_state: &RuntimeWaylandState) -> S
     Size::<i32, Physical>::from((size.w.max(1), size.h.max(1)))
 }
 
-fn quarter_turn_scene_texture_transform(rotation: OutputRotation) -> Transform {
+fn scene_texture_transform(rotation: OutputRotation) -> Transform {
     match rotation {
-        OutputRotation::Deg90 => Transform::Flipped90,
-        OutputRotation::Deg270 => Transform::Flipped270,
         OutputRotation::Deg0 => Transform::Normal,
         OutputRotation::Deg180 => Transform::_180,
+        OutputRotation::Deg90 => Transform::_270,
+        OutputRotation::Deg270 => Transform::_90,
     }
 }
 
 fn screen_capture_src_flipped(mapping_flipped: bool, rotation: OutputRotation) -> bool {
-    match rotation {
-        OutputRotation::Deg90 | OutputRotation::Deg270 => mapping_flipped,
-        OutputRotation::Deg0 | OutputRotation::Deg180 => false,
-    }
+    let _ = rotation;
+    mapping_flipped
 }
 
 fn capture_screen_from_render_target(
@@ -3487,6 +3487,8 @@ struct RuntimeWaylandState {
     pointer_location: Point<f64, Logical>,
     start_time: std::time::Instant,
     host_surface_buffers: HashMap<u32, SurfaceBufferSnapshot>,
+    backend_output_size: Size<i32, Physical>,
+    applied_output_rotation: OutputRotation,
 }
 
 const DMABUF_PROTOCOL_FORMATS: [Format; 4] = [
@@ -3620,6 +3622,25 @@ impl RuntimeWaylandState {
     }
 
     fn new(display_handle: DisplayHandle, shared_state: Arc<Mutex<CompositorState>>) -> Self {
+        let (backend_output_size, applied_output_rotation) = {
+            let state = lock_state(&shared_state);
+            let width = state
+                .status_snapshot()
+                .runtime
+                .window_width
+                .unwrap_or(1280)
+                .max(1);
+            let height = state
+                .status_snapshot()
+                .runtime
+                .window_height
+                .unwrap_or(800)
+                .max(1);
+            (
+                Size::<i32, Physical>::from((width, height)),
+                state.output_rotation(),
+            )
+        };
         let compositor_state = SmithayCompositorState::new::<Self>(&display_handle);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
@@ -3670,6 +3691,8 @@ impl RuntimeWaylandState {
             pointer_location: (0.0, 0.0).into(),
             start_time: std::time::Instant::now(),
             host_surface_buffers: HashMap::new(),
+            backend_output_size,
+            applied_output_rotation,
         };
         state.sync_output_state();
         state.sync_runtime_dmabuf_protocol_status();
@@ -4172,6 +4195,7 @@ impl RuntimeWaylandState {
     }
 
     fn reconfigure_roles(&mut self, width: i32, height: i32) {
+        self.backend_output_size = Size::<i32, Physical>::from((width.max(1), height.max(1)));
         {
             let mut state = lock_state(&self.shared_state);
             state.mark_runtime_resize(width, height);
@@ -4183,6 +4207,15 @@ impl RuntimeWaylandState {
         if let Some(overlay) = &self.overlay_toplevel {
             self.configure_toplevel_for_role(overlay, RuntimeSurfaceRole::OverlayNative);
         }
+    }
+
+    fn sync_output_rotation_reconfigure_if_needed(&mut self) {
+        let rotation = { lock_state(&self.shared_state).output_rotation() };
+        if rotation == self.applied_output_rotation {
+            return;
+        }
+        self.applied_output_rotation = rotation;
+        self.reconfigure_roles(self.backend_output_size.w, self.backend_output_size.h);
     }
 
     fn sync_runtime_status_with_roles(&self) {
@@ -5033,11 +5066,10 @@ delegate_seat!(RuntimeWaylandState);
 #[cfg(test)]
 mod tests {
     use super::{
-        AtomicPlaneLayout, DrmFourcc, PlaneSelection, RuntimeWaylandState,
-        overlay_scanout_format_supports_alpha, quarter_turn_scene_texture_transform,
-        render_output_size_before_transform, screen_capture_src_flipped,
-        select_atomic_plane_zpos_values, select_preferred_scanout_format, select_primary_path,
-        transform_from_rotation,
+        AtomicPlaneLayout, DrmFourcc, PlaneSelection, RuntimeWaylandState, scene_texture_transform,
+        overlay_scanout_format_supports_alpha, render_output_size_before_transform,
+        screen_capture_src_flipped, select_atomic_plane_zpos_values,
+        select_preferred_scanout_format, select_primary_path, transform_from_rotation,
     };
     use crate::model::{OutputRotation, ProcessSpec};
     use crate::process_manager::{ProcessController, ProcessExit};
@@ -5336,6 +5368,50 @@ mod tests {
     }
 
     #[test]
+    fn sync_output_rotation_reconfigure_if_needed_preserves_physical_mode_size() {
+        let shared_state = Arc::new(Mutex::new(CompositorState::new(
+            true,
+            Box::new(NoopProcessController),
+        )));
+        {
+            let mut state = match shared_state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.mark_runtime_resize(3840, 2160);
+            state.set_output_rotation(OutputRotation::Deg90);
+        }
+
+        let display: Display<RuntimeWaylandState> =
+            Display::new().expect("test wayland display should initialize");
+        let mut wayland_state = RuntimeWaylandState::new(display.handle(), shared_state.clone());
+        assert_eq!(
+            wayland_state.output.current_mode().map(|mode| mode.size),
+            Some((2160, 3840).into())
+        );
+
+        {
+            let mut state = match shared_state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.set_output_rotation(OutputRotation::Deg0);
+        }
+        wayland_state.sync_output_rotation_reconfigure_if_needed();
+
+        assert_eq!(
+            wayland_state.output.current_mode().map(|mode| mode.size),
+            Some((3840, 2160).into())
+        );
+        assert_eq!(
+            wayland_state.backend_output_size,
+            Size::<i32, Physical>::from((3840, 2160))
+        );
+        assert_eq!(wayland_state.runtime_output_width(), 3840);
+        assert_eq!(wayland_state.runtime_output_height(), 2160);
+    }
+
+    #[test]
     fn quarter_turn_render_output_size_uses_portrait_logical_dimensions_before_transform() {
         let shared_state = Arc::new(Mutex::new(CompositorState::new(
             true,
@@ -5363,25 +5439,27 @@ mod tests {
     }
 
     #[test]
-    fn quarter_turn_scene_texture_transform_uses_flipped_variants() {
+    fn scene_texture_transform_matches_output_rotation_transform() {
         assert_eq!(
-            quarter_turn_scene_texture_transform(OutputRotation::Deg90),
-            Transform::Flipped90
+            scene_texture_transform(OutputRotation::Deg90),
+            Transform::_270
         );
         assert_eq!(
-            quarter_turn_scene_texture_transform(OutputRotation::Deg270),
-            Transform::Flipped270
+            scene_texture_transform(OutputRotation::Deg270),
+            Transform::_90
         );
     }
 
     #[test]
-    fn screen_capture_ignores_mapping_flip_for_upright_scanouts() {
-        assert!(!screen_capture_src_flipped(true, OutputRotation::Deg0));
-        assert!(!screen_capture_src_flipped(true, OutputRotation::Deg180));
+    fn screen_capture_flip_policy_preserves_readback_orientation_for_all_rotations() {
+        assert!(screen_capture_src_flipped(true, OutputRotation::Deg0));
+        assert!(screen_capture_src_flipped(true, OutputRotation::Deg180));
         assert!(screen_capture_src_flipped(true, OutputRotation::Deg90));
         assert!(screen_capture_src_flipped(true, OutputRotation::Deg270));
         assert!(!screen_capture_src_flipped(false, OutputRotation::Deg0));
         assert!(!screen_capture_src_flipped(false, OutputRotation::Deg180));
+        assert!(!screen_capture_src_flipped(false, OutputRotation::Deg90));
+        assert!(!screen_capture_src_flipped(false, OutputRotation::Deg270));
     }
 
     #[test]

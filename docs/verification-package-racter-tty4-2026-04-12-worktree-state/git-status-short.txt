@@ -1,0 +1,30 @@
+ M Cargo.lock
+ M Cargo.toml
+ M src/control.rs
+ M src/lib.rs
+ M src/main.rs
+ M src/runtime.rs
+?? docs/verification-package-racter-tty4-2026-04-12-artifact-inventory.md
+?? docs/verification-package-racter-tty4-2026-04-12-capture-evidence.md
+?? docs/verification-package-racter-tty4-2026-04-12-captures/deg0.png
+?? docs/verification-package-racter-tty4-2026-04-12-captures/deg180.png
+?? docs/verification-package-racter-tty4-2026-04-12-captures/deg270.png
+?? docs/verification-package-racter-tty4-2026-04-12-captures/deg90.png
+?? docs/verification-package-racter-tty4-2026-04-12-help-evidence.md
+?? docs/verification-package-racter-tty4-2026-04-12-help/ctl-help.txt
+?? docs/verification-package-racter-tty4-2026-04-12-help/serve-help.txt
+?? docs/verification-package-racter-tty4-2026-04-12-help/top-level-help.txt
+?? docs/verification-package-racter-tty4-2026-04-12-repo-identity-evidence.md
+?? docs/verification-package-racter-tty4-2026-04-12-repo-identity/repo-identity.txt
+?? docs/verification-package-racter-tty4-2026-04-12-status-evidence.md
+?? docs/verification-package-racter-tty4-2026-04-12-statuses/deg0-status.json
+?? docs/verification-package-racter-tty4-2026-04-12-statuses/deg180-status.json
+?? docs/verification-package-racter-tty4-2026-04-12-statuses/deg270-status.json
+?? docs/verification-package-racter-tty4-2026-04-12-statuses/deg90-status.json
+?? docs/verification-package-racter-tty4-2026-04-12-test-evidence.md
+?? docs/verification-package-racter-tty4-2026-04-12-test/cargo-test.txt
+?? docs/verification-package-racter-tty4-2026-04-12-worktree-state-evidence.md
+?? docs/verification-package-racter-tty4-2026-04-12-worktree-state/git-status-short.txt
+?? docs/verification-package-racter-tty4-2026-04-12.md
+?? docs/verification-package-racter-tty4-2026-04-12.patch
+?? src/screen_capture.rs

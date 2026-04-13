@@ -1,0 +1,16 @@
+Surf Ace compositor control/runtime daemon (first implementation slice).
+
+Usage: surf-ace-compositor <COMMAND>
+
+Commands:
+  serve  Run the compositor daemon and optional runtime backend.
+  ctl    Send a raw JSON control request over the local Unix socket.
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+Verified tty4 workflow on RACTER:
+  surf-ace-compositor serve --runtime host --socket-path /tmp/surf-ace-zsh-tty4.sock
+  surf-ace-compositor ctl --socket-path /tmp/surf-ace-zsh-tty4.sock --request-json '{"type":"set_output_rotation","rotation":"deg90"}'
+  surf-ace-compositor ctl --socket-path /tmp/surf-ace-zsh-tty4.sock --request-json '{"type":"capture_screen","output_path":"/tmp/surf-ace-capture.png"}'

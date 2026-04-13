@@ -1,0 +1,11 @@
+Run the compositor daemon and optional runtime backend.
+
+Usage: surf-ace-compositor serve [OPTIONS]
+
+Options:
+      --socket-path <SOCKET_PATH>  [default: /tmp/surf-ace-compositor.sock]
+      --runtime <RUNTIME>          [default: none] [possible values: none, winit, host]
+  -h, --help                       Print help
+
+Verified host example:
+  surf-ace-compositor serve --runtime host --socket-path /tmp/surf-ace-zsh-tty4.sock

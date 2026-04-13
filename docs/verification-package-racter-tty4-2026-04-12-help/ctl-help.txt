@@ -1,0 +1,13 @@
+Send a raw JSON control request over the local Unix socket.
+
+Usage: surf-ace-compositor ctl [OPTIONS] --request-json <REQUEST_JSON>
+
+Options:
+      --socket-path <SOCKET_PATH>    [default: /tmp/surf-ace-compositor.sock]
+      --request-json <REQUEST_JSON>  Raw control request JSON. Example: '{"type":"get_status"}'
+  -h, --help                         Print help
+
+Verified control examples:
+  surf-ace-compositor ctl --socket-path /tmp/surf-ace-zsh-tty4.sock --request-json '{"type":"get_status"}'
+  surf-ace-compositor ctl --socket-path /tmp/surf-ace-zsh-tty4.sock --request-json '{"type":"set_output_rotation","rotation":"deg270"}'
+  surf-ace-compositor ctl --socket-path /tmp/surf-ace-zsh-tty4.sock --request-json '{"type":"capture_screen","output_path":"/tmp/surf-ace-capture.png"}'

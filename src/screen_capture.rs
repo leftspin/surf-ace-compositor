@@ -120,31 +120,25 @@ fn rotate_scanout_to_view(
 ) -> (usize, usize, Vec<u8>) {
     match output_rotation {
         OutputRotation::Deg0 => (src_width, src_height, src_pixels.to_vec()),
-        OutputRotation::Deg180 => rotate_xrgb8888(
-            src_pixels,
-            src_width,
-            src_height,
-            RotationTransform::Rotate180,
-        ),
+        OutputRotation::Deg180 => (src_width, src_height, src_pixels.to_vec()),
         OutputRotation::Deg90 => rotate_xrgb8888(
             src_pixels,
             src_width,
             src_height,
-            RotationTransform::Rotate90Clockwise,
+            RotationTransform::Transpose,
         ),
         OutputRotation::Deg270 => rotate_xrgb8888(
             src_pixels,
             src_width,
             src_height,
-            RotationTransform::Rotate90Counterclockwise,
+            RotationTransform::Transverse,
         ),
     }
 }
 
 enum RotationTransform {
-    Rotate90Clockwise,
-    Rotate180,
-    Rotate90Counterclockwise,
+    Transpose,
+    Transverse,
 }
 
 fn rotate_xrgb8888(
@@ -154,8 +148,7 @@ fn rotate_xrgb8888(
     transform: RotationTransform,
 ) -> (usize, usize, Vec<u8>) {
     let (dst_width, dst_height) = match transform {
-        RotationTransform::Rotate180 => (src_width, src_height),
-        RotationTransform::Rotate90Clockwise | RotationTransform::Rotate90Counterclockwise => {
+        RotationTransform::Transpose | RotationTransform::Transverse => {
             (src_height, src_width)
         }
     };
@@ -164,16 +157,11 @@ fn rotate_xrgb8888(
     for y in 0..src_height {
         for x in 0..src_width {
             let (dst_x, dst_y) = match transform {
-                RotationTransform::Rotate90Clockwise => {
-                    (src_height.saturating_sub(1).saturating_sub(y), x)
-                }
-                RotationTransform::Rotate180 => (
-                    src_width.saturating_sub(1).saturating_sub(x),
+                RotationTransform::Transpose => (y, x),
+                RotationTransform::Transverse => (
                     src_height.saturating_sub(1).saturating_sub(y),
+                    src_width.saturating_sub(1).saturating_sub(x),
                 ),
-                RotationTransform::Rotate90Counterclockwise => {
-                    (y, src_width.saturating_sub(1).saturating_sub(x))
-                }
             };
             let src_index = (y.saturating_mul(src_width).saturating_add(x)).saturating_mul(4);
             let dst_index =
@@ -205,10 +193,21 @@ mod tests {
         assert_eq!(
             rotated,
             vec![
-                0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, //
-                0x04, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+                0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, //
+                0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
             ]
         );
+    }
+
+    #[test]
+    fn deg180_capture_preserves_scanout_orientation() {
+        let src = vec![
+            0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, //
+            0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+        ];
+        let (width, height, rotated) = rotate_scanout_to_view(&src, 2, 2, OutputRotation::Deg180);
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(rotated, src);
     }
 
     #[test]
@@ -269,8 +268,8 @@ mod tests {
         assert_eq!(
             frame.xrgb8888,
             vec![
-                0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, //
-                0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+                0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, //
+                0x04, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
             ]
         );
     }

@@ -1,0 +1,86 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/deps/surf_ace_compositor-84f5f96a6ba5fba7)
+
+running 60 tests
+test control::tests::start_host_runtime_control_is_rejected_outside_host_mode_without_queue_or_mutation ... ok
+test control::tests::capture_screen_returns_error_when_no_frame_is_available ... ok
+test control::tests::get_status_preserves_host_present_runtime_truth_fields_for_live_bringup ... ok
+test control::tests::start_host_runtime_does_not_mark_starting_when_control_channel_unavailable ... ok
+test control::tests::start_host_runtime_is_rejected_when_already_active ... ok
+test control::tests::start_host_runtime_does_not_mark_starting_when_control_send_fails ... ok
+test control::tests::start_host_runtime_is_rejected_when_host_runtime_running_without_mutation ... ok
+test control::tests::start_host_runtime_is_rejected_when_host_runtime_starting_without_mutation ... ok
+test control::tests::capture_screen_writes_png_to_requested_path ... ok
+test control::tests::start_host_runtime_is_rejected_when_non_host_runtime_failed_without_mutation ... ok
+test control::tests::start_host_runtime_is_rejected_when_non_host_runtime_stopped_without_mutation ... ok
+test control::tests::start_host_runtime_is_rejected_when_preflight_ready ... ok
+test control::tests::start_host_runtime_is_rejected_when_runtime_none_is_stopped_without_mutation ... ok
+test control::tests::start_host_runtime_is_rejected_while_non_host_runtime_is_active ... ok
+test control::tests::start_host_runtime_queues_command_and_marks_starting ... ok
+test control::tests::start_host_runtime_queues_command_from_inactive_host_mode ... ok
+test control::tests::start_host_runtime_restarts_from_host_backend_failed_state ... ok
+test control::tests::start_host_runtime_restarts_when_host_runtime_is_stopped ... ok
+test control::tests::start_host_runtime_restarts_when_runtime_none_is_failed ... ok
+test runtime::tests::atomic_plane_zpos_selection_prefers_deterministic_primary_below_overlay_values ... ok
+test runtime::tests::atomic_plane_zpos_selection_rejects_non_orderable_ranges ... ok
+test runtime::tests::overlay_plane_layout_maps_overlay_rect_to_atomic_coordinates ... ok
+test runtime::tests::overlay_plane_layout_rejects_zero_sized_overlay_rect ... ok
+test runtime::tests::overlay_scanout_alpha_support_requires_argb_format ... ok
+test runtime::tests::overlay_scanout_format_prefers_argb_for_alpha_truth ... ok
+test runtime::tests::overlay_scanout_format_falls_back_to_xrgb_when_argb_missing ... ok
+test runtime::tests::primary_scanout_format_falls_back_to_argb_when_xrgb_missing ... ok
+test runtime::tests::primary_scanout_format_prefers_xrgb_then_argb ... ok
+test runtime::tests::quarter_turn_rotation_maps_to_counterclockwise_transform ... ok
+test runtime::tests::quarter_turn_scene_texture_transform_uses_flipped_variants ... ok
+test runtime::tests::screen_capture_ignores_mapping_flip_for_upright_scanouts ... ok
+test runtime::tests::select_primary_path_prefers_configured_path_when_present ... ok
+test runtime::tests::select_primary_path_falls_back_to_lexicographic_order ... ok
+test screen_capture::tests::deg90_capture_rotates_landscape_scanout_into_portrait_view ... ok
+test screen_capture::tests::deg90_capture_honors_flipped_mapping_before_rotation ... ok
+test state::tests::external_native_mode_is_explicit_not_html ... ok
+test screen_capture::tests::store_writes_png_to_relative_path ... ok
+test state::tests::dynamic_switch_is_live_and_reversible ... ok
+test screen_capture::tests::store_writes_png_from_latest_frame ... ok
+test state::tests::host_start_request_tracking_is_monotonic_and_explicit ... ok
+test state::tests::missing_pane_does_not_reserve_overlay_slot ... ok
+test state::tests::failed_spawn_records_external_native_failed_state ... ok
+test state::tests::host_preflight_ready_is_not_running_or_output_owned ... ok
+test state::tests::prototype_policy_allows_only_one_active_overlay_pane ... ok
+test state::tests::poll_process_exit_marks_overlay_exited_and_clears_binding_expectation ... ok
+test state::tests::provider_snapshot_is_geometry_authority ... ok
+test state::tests::runtime_dmabuf_protocol_status_is_explicit_and_fail_closed ... ok
+test state::tests::removing_pane_terminates_external_process ... ok
+test state::tests::runtime_host_present_queue_status_is_explicit_and_fail_closed ... ok
+test state::tests::runtime_overlay_binding_expected_tracks_active_overlay_pane_state ... ok
+test state::tests::runtime_overlay_bridge_transitions_follow_surface_lifecycle_with_pid_attestation ... ok
+test state::tests::runtime_status_transitions_are_explicit ... ok
+test runtime::tests::runtime_overlay_policy_clamps_left_edge_on_small_outputs ... ok
+test runtime::tests::sync_output_state_picks_up_rotation_changes_before_client_bind ... ok
+test runtime::tests::runtime_overlay_policy_rect_maps_directly_to_atomic_overlay_layout ... ok
+test runtime::tests::runtime_output_size_swaps_for_quarter_turn_rotation ... ok
+test runtime::tests::runtime_output_size_keeps_upright_dimensions_without_quarter_turn_rotation ... ok
+test runtime::tests::runtime_overlay_policy_tiny_output_stays_non_empty_and_in_bounds ... ok
+test runtime::tests::runtime_output_global_advertises_rotated_logical_size_without_client_transform ... ok
+test runtime::tests::quarter_turn_render_output_size_uses_portrait_logical_dimensions_before_transform ... ok
+
+test result: ok. 60 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/main.rs (target/debug/deps/surf_ace_compositor-8f19c66493bfc7a0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/host_failure_survivability.rs (target/debug/deps/host_failure_survivability-c74c050e08c84f81)
+
+running 1 test
+test host_failure_keeps_control_socket_reachable_and_reports_failed_phase ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+   Doc-tests surf_ace_compositor
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
