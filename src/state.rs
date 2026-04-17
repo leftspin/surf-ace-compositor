@@ -2,8 +2,8 @@ use crate::model::{
     ExternalNativeEventContract, ExternalNativeLifecycleState, HostRuntimeStartTrigger,
     NativeTargetClass, OutputRotation, PaneId, PaneRenderMode, PaneStatus, ProcessSpec,
     ProviderPaneSnapshot, RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeFocusTarget,
-    RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource, RuntimePhase, RuntimeStatus,
-    StatusSnapshot,
+    RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource, RuntimeHostSelectionState,
+    RuntimePhase, RuntimeSelectionMode, RuntimeStatus, StatusSnapshot,
 };
 use crate::policy::{PrototypeOverlayPolicy, PrototypePolicyError};
 use crate::process_manager::ProcessController;
@@ -83,6 +83,10 @@ impl CompositorState {
         self.runtime.host_opened_drm_device_count = 0;
         self.runtime.host_output_ownership = false;
         self.runtime.host_primary_drm_path = None;
+        self.runtime.host_active_connector_name = None;
+        self.runtime.host_active_connector_id = None;
+        self.runtime.host_last_selection_attempt = None;
+        self.runtime.host_last_selection_result = None;
         self.runtime.host_present_ownership = RuntimeHostPresentOwnership::None;
         self.runtime.host_atomic_commit_enabled = false;
         self.runtime.host_overlay_plane_capable = false;
@@ -108,6 +112,8 @@ impl CompositorState {
         self.runtime.wayland_socket = wayland_socket;
         self.runtime.last_error = None;
         self.runtime.host_output_ownership = false;
+        self.runtime.host_active_connector_name = None;
+        self.runtime.host_active_connector_id = None;
         self.runtime.host_present_ownership = RuntimeHostPresentOwnership::None;
         self.runtime.host_atomic_commit_enabled = false;
         self.runtime.host_overlay_plane_capable = false;
@@ -134,6 +140,47 @@ impl CompositorState {
         self.runtime.window_height = Some(window_height);
         self.runtime.last_error = None;
         self.runtime.host_output_ownership = matches!(backend, RuntimeBackend::HostDrm);
+    }
+
+    pub fn set_runtime_selection_status(
+        &mut self,
+        mode: RuntimeSelectionMode,
+        operator_action_needed: bool,
+        operator_action_reason: Option<String>,
+        last_selection_attempt: Option<String>,
+        last_selection_result: Option<String>,
+    ) {
+        self.runtime.runtime_selection_mode = mode;
+        self.runtime.runtime_operator_action_needed = operator_action_needed;
+        self.runtime.runtime_operator_action_reason = operator_action_reason;
+        self.runtime.runtime_last_selection_attempt = last_selection_attempt;
+        self.runtime.runtime_last_selection_result = last_selection_result;
+    }
+
+    pub fn set_runtime_host_selection_overrides(
+        &mut self,
+        forced_drm_path: Option<String>,
+        forced_output_name: Option<String>,
+        device_selection_state: RuntimeHostSelectionState,
+        output_selection_state: RuntimeHostSelectionState,
+    ) {
+        self.runtime.host_forced_drm_path = forced_drm_path;
+        self.runtime.host_forced_output_name = forced_output_name;
+        self.runtime.host_device_selection_state = device_selection_state;
+        self.runtime.host_output_selection_state = output_selection_state;
+    }
+
+    pub fn set_runtime_host_route_selection_status(
+        &mut self,
+        active_connector_name: Option<String>,
+        active_connector_id: Option<u32>,
+        last_selection_attempt: Option<String>,
+        last_selection_result: Option<String>,
+    ) {
+        self.runtime.host_active_connector_name = active_connector_name;
+        self.runtime.host_active_connector_id = active_connector_id;
+        self.runtime.host_last_selection_attempt = last_selection_attempt;
+        self.runtime.host_last_selection_result = last_selection_result;
     }
 
     pub fn set_runtime_host_backend_snapshot(
@@ -225,6 +272,8 @@ impl CompositorState {
         self.runtime.phase = RuntimePhase::Failed;
         self.runtime.last_error = Some(error.into());
         self.runtime.host_output_ownership = false;
+        self.runtime.host_active_connector_name = None;
+        self.runtime.host_active_connector_id = None;
         self.runtime.host_present_ownership = RuntimeHostPresentOwnership::None;
         self.runtime.host_atomic_commit_enabled = false;
         self.runtime.host_overlay_plane_capable = false;
@@ -240,6 +289,8 @@ impl CompositorState {
     pub fn mark_runtime_stopped(&mut self) {
         self.runtime.phase = RuntimePhase::Stopped;
         self.runtime.host_output_ownership = false;
+        self.runtime.host_active_connector_name = None;
+        self.runtime.host_active_connector_id = None;
         self.runtime.host_present_ownership = RuntimeHostPresentOwnership::None;
         self.runtime.host_atomic_commit_enabled = false;
         self.runtime.host_overlay_plane_capable = false;

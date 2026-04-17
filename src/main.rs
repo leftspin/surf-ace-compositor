@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -8,9 +8,15 @@ use surf_ace_compositor::control::{
 };
 use surf_ace_compositor::model::{HostRuntimeStartTrigger, OutputRotation};
 use surf_ace_compositor::process_manager::LocalProcessController;
-use surf_ace_compositor::runtime::{run_host, run_winit};
+use surf_ace_compositor::runtime::{
+    HostRuntimeOptions, RuntimeSelectionReport, run_host, run_winit,
+};
 use surf_ace_compositor::screen_capture::ScreenCaptureStore;
 use surf_ace_compositor::state::CompositorState;
+
+const RUNTIME_ENV: &str = "SURF_ACE_COMPOSITOR_RUNTIME";
+const HOST_DRM_DEVICE_ENV: &str = "SURF_ACE_COMPOSITOR_HOST_DRM_DEVICE";
+const HOST_OUTPUT_ENV: &str = "SURF_ACE_COMPOSITOR_HOST_OUTPUT";
 
 #[derive(Debug, Parser)]
 #[command(name = "surf-ace-compositor")]
@@ -32,8 +38,17 @@ enum Command {
     Serve {
         #[arg(long, default_value = "/tmp/surf-ace-compositor.sock")]
         socket_path: PathBuf,
-        #[arg(long, default_value = "none", value_parser = ["none", "winit", "host"])]
+        #[arg(
+            long,
+            env = RUNTIME_ENV,
+            default_value = "auto",
+            value_parser = ["auto", "none", "winit", "host"]
+        )]
         runtime: String,
+        #[arg(long, env = HOST_DRM_DEVICE_ENV)]
+        host_drm_device: Option<PathBuf>,
+        #[arg(long, env = HOST_OUTPUT_ENV)]
+        host_output: Option<String>,
     },
     #[command(
         about = "Send a raw JSON control request over the local Unix socket.",
@@ -70,13 +85,31 @@ enum Command {
     },
 }
 
+#[derive(Debug, Clone)]
+struct RuntimeLaunchPlan {
+    selected_runtime: String,
+    host_mode_active: bool,
+    selection_report: RuntimeSelectionReport,
+    selection_attempt: String,
+    selection_result: String,
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve {
             socket_path,
             runtime,
-        } => run_server(socket_path, &runtime),
+            host_drm_device,
+            host_output,
+        } => run_server(
+            socket_path,
+            &runtime,
+            HostRuntimeOptions {
+                forced_drm_path: host_drm_device,
+                forced_output_name: host_output,
+            },
+        ),
         Command::Ctl {
             socket_path,
             request_json,
@@ -92,16 +125,17 @@ fn main() {
     }
 }
 
-fn run_server(socket_path: PathBuf, runtime: &str) {
-    let host_mode_active = matches!(runtime, "host");
+fn run_server(socket_path: PathBuf, runtime: &str, host_options: HostRuntimeOptions) {
+    let launch_plan = resolve_runtime_launch_plan(runtime, detect_host_runtime_capable());
     let state = CompositorState::new(
-        host_mode_active,
+        launch_plan.host_mode_active,
         Box::new(LocalProcessController::default()),
     );
     let shared_state = Arc::new(Mutex::new(state));
+    apply_runtime_selection_status(&shared_state, &launch_plan);
     let screen_capture = ScreenCaptureStore::default();
 
-    match runtime {
+    match launch_plan.selected_runtime.as_str() {
         "none" => {
             if let Err(err) = serve(&socket_path, shared_state, screen_capture) {
                 eprintln!("control server failed: {err}");
@@ -124,6 +158,7 @@ fn run_server(socket_path: PathBuf, runtime: &str) {
             }
         }
         "host" => {
+            let auto_selected_host = runtime == "auto";
             let (runtime_control_tx, runtime_control_rx) = mpsc::channel::<RuntimeControlCommand>();
             let control_state = shared_state.clone();
             let control_socket = socket_path.clone();
@@ -160,13 +195,33 @@ fn run_server(socket_path: PathBuf, runtime: &str) {
             while let Ok(command) = runtime_control_rx.recv() {
                 match command {
                     RuntimeControlCommand::StartHostRuntime => {
-                        if let Err(err) = run_host(shared_state.clone(), screen_capture.clone()) {
+                        if let Err(err) = run_host(
+                            shared_state.clone(),
+                            screen_capture.clone(),
+                            host_options.clone(),
+                        ) {
                             eprintln!("host runtime failed: {err}");
                             let mut state = match shared_state.lock() {
                                 Ok(guard) => guard,
                                 Err(poisoned) => poisoned.into_inner(),
                             };
                             state.mark_runtime_failed(format!("host runtime failed: {err}"));
+                            if auto_selected_host {
+                                state.set_runtime_selection_status(
+                                    surf_ace_compositor::model::RuntimeSelectionMode::FallbackAfterFailure,
+                                    true,
+                                    Some(format!(
+                                        "automatic host runtime failed, fallback to winit: {err}"
+                                    )),
+                                    Some("auto runtime selection attempted backend=host".to_string()),
+                                    Some("fallback backend=winit".to_string()),
+                                );
+                                drop(state);
+                                if let Err(winit_err) = run_winit(shared_state.clone()) {
+                                    eprintln!("winit fallback runtime failed: {winit_err}");
+                                    std::process::exit(1);
+                                }
+                            }
                         }
                     }
                 }
@@ -178,10 +233,60 @@ fn run_server(socket_path: PathBuf, runtime: &str) {
             }
         }
         _ => {
-            eprintln!("unsupported runtime mode: {runtime}");
+            eprintln!("unsupported runtime mode: {}", launch_plan.selected_runtime);
             std::process::exit(2);
         }
     };
+}
+
+fn apply_runtime_selection_status(
+    shared_state: &Arc<Mutex<CompositorState>>,
+    launch_plan: &RuntimeLaunchPlan,
+) {
+    let mut state = match shared_state.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    state.set_runtime_selection_status(
+        launch_plan.selection_report.mode,
+        launch_plan.selection_report.operator_action_needed,
+        launch_plan.selection_report.operator_action_reason.clone(),
+        Some(launch_plan.selection_attempt.clone()),
+        Some(launch_plan.selection_result.clone()),
+    );
+}
+
+fn resolve_runtime_launch_plan(runtime: &str, host_runtime_capable: bool) -> RuntimeLaunchPlan {
+    match runtime {
+        "auto" if host_runtime_capable => RuntimeLaunchPlan {
+            selected_runtime: "host".to_string(),
+            host_mode_active: true,
+            selection_report: RuntimeSelectionReport::automatic(),
+            selection_attempt: "auto runtime selection attempted backend=host".to_string(),
+            selection_result: "selected backend=host".to_string(),
+        },
+        "auto" => RuntimeLaunchPlan {
+            selected_runtime: "winit".to_string(),
+            host_mode_active: false,
+            selection_report: RuntimeSelectionReport::automatic(),
+            selection_attempt: "auto runtime selection attempted backend=host".to_string(),
+            selection_result: "selected backend=winit".to_string(),
+        },
+        forced => RuntimeLaunchPlan {
+            selected_runtime: forced.to_string(),
+            host_mode_active: forced == "host",
+            selection_report: RuntimeSelectionReport::forced(),
+            selection_attempt: format!("forced runtime selection requested backend={forced}"),
+            selection_result: format!("selected backend={forced}"),
+        },
+    }
+}
+
+fn detect_host_runtime_capable() -> bool {
+    cfg!(target_os = "linux")
+        && Path::new("/dev/dri").exists()
+        && std::env::var_os("DISPLAY").is_none()
+        && std::env::var_os("WAYLAND_DISPLAY").is_none()
 }
 
 fn run_ctl(socket_path: PathBuf, request_json: &str) {
@@ -240,5 +345,44 @@ fn parse_output_rotation(value: &str) -> Result<OutputRotation, String> {
         "deg180" => Ok(OutputRotation::Deg180),
         "deg270" => Ok(OutputRotation::Deg270),
         _ => Err(format!("unsupported rotation: {value}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_runtime_launch_plan;
+    use surf_ace_compositor::model::RuntimeSelectionMode;
+
+    #[test]
+    fn auto_runtime_prefers_host_when_host_capable() {
+        let plan = resolve_runtime_launch_plan("auto", true);
+        assert_eq!(plan.selected_runtime, "host");
+        assert!(plan.host_mode_active);
+        assert_eq!(plan.selection_report.mode, RuntimeSelectionMode::Automatic);
+        assert_eq!(plan.selection_result, "selected backend=host");
+    }
+
+    #[test]
+    fn auto_runtime_falls_back_to_winit_when_host_not_capable() {
+        let plan = resolve_runtime_launch_plan("auto", false);
+        assert_eq!(plan.selected_runtime, "winit");
+        assert!(!plan.host_mode_active);
+        assert_eq!(plan.selection_report.mode, RuntimeSelectionMode::Automatic);
+        assert_eq!(
+            plan.selection_attempt,
+            "auto runtime selection attempted backend=host"
+        );
+    }
+
+    #[test]
+    fn forced_runtime_reports_forced_selection() {
+        let plan = resolve_runtime_launch_plan("host", false);
+        assert_eq!(plan.selected_runtime, "host");
+        assert!(plan.host_mode_active);
+        assert_eq!(plan.selection_report.mode, RuntimeSelectionMode::Forced);
+        assert_eq!(
+            plan.selection_attempt,
+            "forced runtime selection requested backend=host"
+        );
     }
 }

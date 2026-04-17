@@ -163,9 +163,7 @@ fn rotate_xrgb8888(
         CapturePixelRotation::Identity => (src_width, src_height),
         CapturePixelRotation::Rotate180 => (src_width, src_height),
         CapturePixelRotation::Rotate90Clockwise
-        | CapturePixelRotation::Rotate90Counterclockwise => {
-            (src_height, src_width)
-        }
+        | CapturePixelRotation::Rotate90Counterclockwise => (src_height, src_width),
     };
     let mut dst = vec![0u8; dst_width.saturating_mul(dst_height).saturating_mul(4)];
 
@@ -180,10 +178,9 @@ fn rotate_xrgb8888(
                     src_width.saturating_sub(1).saturating_sub(x),
                     src_height.saturating_sub(1).saturating_sub(y),
                 ),
-                CapturePixelRotation::Rotate90Counterclockwise => (
-                    y,
-                    src_width.saturating_sub(1).saturating_sub(x),
-                ),
+                CapturePixelRotation::Rotate90Counterclockwise => {
+                    (y, src_width.saturating_sub(1).saturating_sub(x))
+                }
             };
             let src_index = (y.saturating_mul(src_width).saturating_add(x)).saturating_mul(4);
             let dst_index =

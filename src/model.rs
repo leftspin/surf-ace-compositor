@@ -151,6 +151,24 @@ pub enum HostRuntimeStartTrigger {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum RuntimeSelectionMode {
+    #[default]
+    Automatic,
+    Forced,
+    FallbackAfterFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeHostSelectionState {
+    #[default]
+    Automatic,
+    Forced,
+    ForcedFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RuntimeHostPresentOwnership {
     #[default]
     None,
@@ -177,6 +195,14 @@ pub struct RuntimeDmabufFormatStatus {
 pub struct RuntimeStatus {
     pub backend: RuntimeBackend,
     pub phase: RuntimePhase,
+    pub runtime_selection_mode: RuntimeSelectionMode,
+    pub runtime_operator_action_needed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_operator_action_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_last_selection_attempt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_last_selection_result: Option<String>,
     pub main_app_match_hint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wayland_socket: Option<String>,
@@ -196,6 +222,20 @@ pub struct RuntimeStatus {
     pub host_last_start_trigger: Option<HostRuntimeStartTrigger>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_primary_drm_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_forced_drm_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_forced_output_name: Option<String>,
+    pub host_device_selection_state: RuntimeHostSelectionState,
+    pub host_output_selection_state: RuntimeHostSelectionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_active_connector_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_active_connector_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_last_selection_attempt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_last_selection_result: Option<String>,
     pub host_present_ownership: RuntimeHostPresentOwnership,
     pub host_atomic_commit_enabled: bool,
     pub host_overlay_plane_capable: bool,
@@ -227,6 +267,11 @@ impl Default for RuntimeStatus {
         Self {
             backend: RuntimeBackend::None,
             phase: RuntimePhase::Inactive,
+            runtime_selection_mode: RuntimeSelectionMode::Automatic,
+            runtime_operator_action_needed: false,
+            runtime_operator_action_reason: None,
+            runtime_last_selection_attempt: None,
+            runtime_last_selection_result: None,
             main_app_match_hint: "surf-ace".to_string(),
             wayland_socket: None,
             window_width: None,
@@ -240,6 +285,14 @@ impl Default for RuntimeStatus {
             host_start_attempt_count: 0,
             host_last_start_trigger: None,
             host_primary_drm_path: None,
+            host_forced_drm_path: None,
+            host_forced_output_name: None,
+            host_device_selection_state: RuntimeHostSelectionState::Automatic,
+            host_output_selection_state: RuntimeHostSelectionState::Automatic,
+            host_active_connector_name: None,
+            host_active_connector_id: None,
+            host_last_selection_attempt: None,
+            host_last_selection_result: None,
             host_present_ownership: RuntimeHostPresentOwnership::None,
             host_atomic_commit_enabled: false,
             host_overlay_plane_capable: false,

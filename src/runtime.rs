@@ -1,6 +1,7 @@
 use crate::model::{
     OutputRotation, RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeFocusTarget,
-    RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource,
+    RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource, RuntimeHostSelectionState,
+    RuntimeSelectionMode,
 };
 use crate::output_rotation_model::OutputRotationModel;
 use crate::screen_capture::ScreenCaptureStore;
@@ -27,7 +28,8 @@ use smithay::backend::renderer::element::surface::{
 };
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{
-    draw_render_elements, import_surface_tree, on_commit_buffer_handler,
+    RendererSurfaceStateUserData, draw_render_elements, import_surface_tree,
+    on_commit_buffer_handler,
 };
 use smithay::backend::renderer::{
     Bind, Color32F, ExportMem, Frame, ImportDma, Offscreen, Renderer, Texture, TextureMapping,
@@ -74,8 +76,8 @@ use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
 use smithay::utils::{
-    Buffer as BufferCoords, DeviceFd, Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Serial,
-    Size, Transform,
+    Buffer as BufferCoords, DeviceFd, Logical, Physical, Point, Rectangle, SERIAL_COUNTER,
+    Scale as SurfaceScale, Serial, Size, Transform,
 };
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
@@ -83,7 +85,7 @@ use smithay::wayland::compositor::{
     SubsurfaceCachedState, SurfaceAttributes, TraversalAction, with_surface_tree_downward,
 };
 use smithay::wayland::dmabuf::{
-    DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf,
+    DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf,
 };
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::selection::SelectionHandler;
@@ -92,8 +94,8 @@ use smithay::wayland::selection::data_device::{
     set_data_device_focus,
 };
 use smithay::wayland::shell::xdg::{
-    Configure, PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
-    XdgToplevelSurfaceData,
+    Configure, PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface, XdgShellHandler,
+    XdgShellState, XdgToplevelSurfaceData,
 };
 use smithay::wayland::shm::{BufferAccessError, ShmHandler, ShmState, with_buffer_contents};
 use smithay::wayland::socket::ListeningSocketSource;
@@ -106,6 +108,45 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
+
+#[derive(Debug, Clone, Default)]
+pub struct HostRuntimeOptions {
+    pub forced_drm_path: Option<PathBuf>,
+    pub forced_output_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeSelectionReport {
+    pub mode: RuntimeSelectionMode,
+    pub operator_action_needed: bool,
+    pub operator_action_reason: Option<String>,
+}
+
+impl RuntimeSelectionReport {
+    pub fn automatic() -> Self {
+        Self {
+            mode: RuntimeSelectionMode::Automatic,
+            operator_action_needed: false,
+            operator_action_reason: None,
+        }
+    }
+
+    pub fn forced() -> Self {
+        Self {
+            mode: RuntimeSelectionMode::Forced,
+            operator_action_needed: false,
+            operator_action_reason: None,
+        }
+    }
+
+    pub fn fallback(reason: impl Into<String>) -> Self {
+        Self {
+            mode: RuntimeSelectionMode::FallbackAfterFailure,
+            operator_action_needed: true,
+            operator_action_reason: Some(reason.into()),
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -214,7 +255,8 @@ pub fn run_winit(shared_state: Arc<Mutex<CompositorState>>) -> Result<(), Runtim
                 state.mark_runtime_input_event();
             }
             WinitEvent::Redraw => {
-                data.wayland_state.sync_output_rotation_reconfigure_if_needed();
+                data.wayland_state
+                    .sync_output_rotation_reconfigure_if_needed();
                 data.wayland_state.prune_dead_surfaces();
                 let size = backend.window_size();
                 let damage = Rectangle::from_size(size);
@@ -303,6 +345,7 @@ pub fn run_winit(shared_state: Arc<Mutex<CompositorState>>) -> Result<(), Runtim
 pub fn run_host(
     shared_state: Arc<Mutex<CompositorState>>,
     screen_capture: ScreenCaptureStore,
+    options: HostRuntimeOptions,
 ) -> Result<(), RuntimeError> {
     {
         let mut state = lock_state(&shared_state);
@@ -359,12 +402,17 @@ pub fn run_host(
     let libinput_backend = LibinputInputBackend::new(libinput_context);
     let udev =
         UdevBackend::new(&seat_name).map_err(|err| RuntimeError::HostUdev(err.to_string()))?;
-    let preferred_primary_path = primary_gpu(&seat_name).ok().flatten();
+    let preferred_primary_path = options
+        .forced_drm_path
+        .clone()
+        .or_else(|| primary_gpu(&seat_name).ok().flatten());
 
     let mut host_backend = HostBackendState::new(
         session,
         seat_name.clone(),
         preferred_primary_path.clone(),
+        options.forced_drm_path.clone(),
+        options.forced_output_name.clone(),
         screen_capture,
     );
     let mut initial_devices: Vec<(u64, PathBuf)> = udev
@@ -391,6 +439,7 @@ pub fn run_host(
             host_backend.primary_opened_path(),
         );
     }
+    sync_runtime_host_selection_status(&shared_state, &host_backend);
 
     if host_backend.detected_count() == 0 {
         return Err(RuntimeError::HostNoDrmDevices(seat_name));
@@ -411,10 +460,19 @@ pub fn run_host(
             host_backend.primary_opened_path(),
         );
     }
+    sync_runtime_host_selection_status(&shared_state, &host_backend);
 
-    let claimed_output = host_backend.claim_output_ownership(None)?;
+    let claimed_output = match host_backend.claim_output_ownership(None) {
+        Ok(claimed_output) => claimed_output,
+        Err(err) => {
+            sync_runtime_host_selection_status(&shared_state, &host_backend);
+            return Err(err);
+        }
+    };
+    sync_runtime_host_selection_status(&shared_state, &host_backend);
     sync_runtime_host_present_capabilities(&shared_state, &host_backend);
-    wayland_state.sync_dmabuf_protocol_formats(host_backend.claimed_dmabuf_formats());
+    wayland_state
+        .sync_dmabuf_protocol_formats(host_backend.claimed_dmabuf_protocol_advertisement());
     let (mode_w, mode_h) = claimed_output.mode.size();
     let reclaim_required_ownership = if matches!(
         claimed_output.startup_present_ownership,
@@ -728,11 +786,39 @@ fn sync_runtime_host_present_capabilities(
     shared_state: &Arc<Mutex<CompositorState>>,
     host_backend: &HostBackendState,
 ) {
-    let (ownership, atomic_enabled, overlay_capable) = host_backend
+    let rotation = { lock_state(shared_state).output_rotation() };
+    let (mut ownership, atomic_enabled, overlay_capable) = host_backend
         .claimed_present_capabilities()
         .unwrap_or((RuntimeHostPresentOwnership::None, false, false));
+    if matches!(ownership, RuntimeHostPresentOwnership::DirectGbm)
+        && !direct_present_supported_for_rotation(rotation)
+    {
+        ownership = RuntimeHostPresentOwnership::Dumb;
+    }
     let mut state = lock_state(shared_state);
     state.set_runtime_host_present_capabilities(ownership, atomic_enabled, overlay_capable);
+}
+
+fn sync_runtime_host_selection_status(
+    shared_state: &Arc<Mutex<CompositorState>>,
+    host_backend: &HostBackendState,
+) {
+    let (device_selection_state, output_selection_state) = host_backend.selection_states();
+    let (active_connector_name, active_connector_id) = host_backend.active_connector_status();
+    let (last_selection_attempt, last_selection_result) = host_backend.selection_logs();
+    let mut state = lock_state(shared_state);
+    state.set_runtime_host_selection_overrides(
+        host_backend.forced_drm_path_str(),
+        host_backend.forced_output_name(),
+        device_selection_state,
+        output_selection_state,
+    );
+    state.set_runtime_host_route_selection_status(
+        active_connector_name,
+        active_connector_id,
+        last_selection_attempt,
+        last_selection_result,
+    );
 }
 
 fn reclaim_host_output_in_process(
@@ -741,12 +827,20 @@ fn reclaim_host_output_in_process(
     drm_events_source_token: &Rc<RefCell<Option<RegistrationToken>>>,
     reclaim_required_ownership: Option<StartupPresentOwnership>,
 ) -> Result<(), RuntimeError> {
-    let claimed_output = data
+    let claimed_output = match data
         .host_backend
-        .claim_output_ownership(reclaim_required_ownership)?;
+        .claim_output_ownership(reclaim_required_ownership)
+    {
+        Ok(claimed_output) => claimed_output,
+        Err(err) => {
+            sync_runtime_host_selection_status(&data.shared_state, &data.host_backend);
+            return Err(err);
+        }
+    };
+    sync_runtime_host_selection_status(&data.shared_state, &data.host_backend);
     sync_runtime_host_present_capabilities(&data.shared_state, &data.host_backend);
     data.wayland_state
-        .sync_dmabuf_protocol_formats(data.host_backend.claimed_dmabuf_formats());
+        .sync_dmabuf_protocol_formats(data.host_backend.claimed_dmabuf_protocol_advertisement());
     if let Some(old_token) = drm_events_source_token.borrow_mut().take() {
         loop_handle.remove(old_token);
     }
@@ -822,15 +916,22 @@ struct HostBackendState {
     session: LibSeatSession,
     seat_name: String,
     preferred_primary_path: Option<PathBuf>,
+    forced_drm_path: Option<PathBuf>,
+    forced_output_name: Option<String>,
     screen_capture: ScreenCaptureStore,
     detected_devices: HashMap<u64, PathBuf>,
     opened_devices: HashMap<u64, OpenedHostDevice>,
     claimed_output: Option<ClaimedHostOutput>,
+    last_good_output_identity: Option<OutputIdentity>,
+    device_selection_state: RuntimeHostSelectionState,
+    output_selection_state: RuntimeHostSelectionState,
+    last_selection_attempt: Option<String>,
+    last_selection_result: Option<String>,
 }
 
 struct OpenedHostDevice {
     path: PathBuf,
-    _node: DrmNode,
+    node: DrmNode,
     fd: OwnedFd,
     claimed_pipeline: Option<ClaimedPresentationPipeline>,
 }
@@ -857,11 +958,14 @@ struct HostGlesRendererState {
     _egl_display: EGLDisplay,
     renderer: GlesRenderer,
     target_texture: GlesTexture,
+    scanout_texture: GlesTexture,
     primary_scanout_format: DrmFourcc,
     overlay_scanout_format: Option<DrmFourcc>,
     direct_scanout: Option<HostDirectScanoutState>,
     overlay_scanout: Option<HostOverlayScanoutState>,
 }
+
+const GLES_INTERMEDIATE_RENDER_FORMAT: DrmFourcc = DrmFourcc::Xrgb8888;
 
 struct HostDirectScanoutState {
     buffers: [HostDirectScanoutBuffer; 2],
@@ -903,18 +1007,35 @@ enum StartupPresentOwnership {
     Dumb,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ClaimedHostOutput {
     device_id: u64,
     mode: DrmMode,
     startup_present_ownership: StartupPresentOwnership,
+    identity: OutputIdentity,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutputIdentity {
+    device_path: PathBuf,
+    connector_name: String,
+    connector_id: u32,
+}
+
+#[derive(Clone)]
 struct OutputClaimPlan {
     connector: drm_connector::Handle,
+    connector_name: String,
     crtc: drm_crtc::Handle,
     mode: DrmMode,
     atomic: Option<AtomicClaimPlan>,
+}
+
+#[derive(Clone)]
+struct OutputClaimCandidate {
+    device_id: u64,
+    device_path: PathBuf,
+    plan: OutputClaimPlan,
 }
 
 #[derive(Clone)]
@@ -1110,16 +1231,35 @@ impl HostBackendState {
         session: LibSeatSession,
         seat_name: String,
         preferred_primary_path: Option<PathBuf>,
+        forced_drm_path: Option<PathBuf>,
+        forced_output_name: Option<String>,
         screen_capture: ScreenCaptureStore,
     ) -> Self {
+        let device_selection_state = if forced_drm_path.is_some() {
+            RuntimeHostSelectionState::Forced
+        } else {
+            RuntimeHostSelectionState::Automatic
+        };
+        let output_selection_state = if forced_output_name.is_some() {
+            RuntimeHostSelectionState::Forced
+        } else {
+            RuntimeHostSelectionState::Automatic
+        };
         Self {
             session,
             seat_name,
             preferred_primary_path,
+            forced_drm_path,
+            forced_output_name,
             screen_capture,
             detected_devices: HashMap::new(),
             opened_devices: HashMap::new(),
             claimed_output: None,
+            last_good_output_identity: None,
+            device_selection_state,
+            output_selection_state,
+            last_selection_attempt: None,
+            last_selection_result: None,
         }
     }
 
@@ -1140,6 +1280,36 @@ impl HostBackendState {
 
     fn path_for(&self, device_id: u64) -> Option<&PathBuf> {
         self.detected_devices.get(&device_id)
+    }
+    fn forced_drm_path_str(&self) -> Option<String> {
+        self.forced_drm_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+    }
+
+    fn forced_output_name(&self) -> Option<String> {
+        self.forced_output_name.clone()
+    }
+
+    fn selection_states(&self) -> (RuntimeHostSelectionState, RuntimeHostSelectionState) {
+        (self.device_selection_state, self.output_selection_state)
+    }
+
+    fn active_connector_status(&self) -> (Option<String>, Option<u32>) {
+        match self.claimed_output.as_ref() {
+            Some(claimed) => (
+                Some(claimed.identity.connector_name.clone()),
+                Some(claimed.identity.connector_id),
+            ),
+            None => (None, None),
+        }
+    }
+
+    fn selection_logs(&self) -> (Option<String>, Option<String>) {
+        (
+            self.last_selection_attempt.clone(),
+            self.last_selection_result.clone(),
+        )
     }
 
     fn upsert_device(&mut self, device_id: u64, path: PathBuf) -> Result<(), RuntimeError> {
@@ -1166,7 +1336,7 @@ impl HostBackendState {
             device_id,
             OpenedHostDevice {
                 path: path.to_path_buf(),
-                _node: node,
+                node,
                 fd,
                 claimed_pipeline: None,
             },
@@ -1178,6 +1348,27 @@ impl HostBackendState {
         &mut self,
         required_startup_ownership: Option<StartupPresentOwnership>,
     ) -> Result<ClaimedHostOutput, RuntimeError> {
+        let recovering = self.last_good_output_identity.is_some();
+        let forced_drm_path = self.forced_drm_path.clone();
+        let forced_output_name = self.forced_output_name.clone();
+        self.device_selection_state = if forced_drm_path.is_some() {
+            RuntimeHostSelectionState::Forced
+        } else {
+            RuntimeHostSelectionState::Automatic
+        };
+        self.output_selection_state = if forced_output_name.is_some() {
+            RuntimeHostSelectionState::Forced
+        } else {
+            RuntimeHostSelectionState::Automatic
+        };
+        self.last_selection_attempt = Some(describe_output_selection_attempt(
+            forced_drm_path.as_deref(),
+            forced_output_name.as_deref(),
+            self.last_good_output_identity.as_ref(),
+            recovering,
+        ));
+        self.last_selection_result = None;
+
         let mut device_ids: Vec<u64> = self.opened_devices.keys().copied().collect();
         let mut last_error: Option<RuntimeError> = None;
         device_ids.sort_by(|left, right| {
@@ -1188,65 +1379,162 @@ impl HostBackendState {
             )
         });
 
+        let mut candidates = Vec::new();
         for device_id in device_ids {
-            let Some(opened) = self.opened_devices.get_mut(&device_id) else {
+            let Some(opened) = self.opened_devices.get(&device_id) else {
                 continue;
             };
-            let plan = match build_output_claim_plan(opened) {
-                Ok(Some(plan)) => plan,
-                Ok(None) => continue,
+            if forced_drm_path
+                .as_ref()
+                .is_some_and(|forced_path| forced_path != &opened.path)
+            {
+                continue;
+            }
+            match build_output_claim_plans(opened) {
+                Ok(plans) => {
+                    for plan in plans {
+                        candidates.push(OutputClaimCandidate {
+                            device_id,
+                            device_path: opened.path.clone(),
+                            plan,
+                        });
+                    }
+                }
                 Err(err) => {
                     eprintln!(
                         "host backend failed to inspect output claim plan on {}: {err}",
                         opened.path.display()
                     );
                     last_error = Some(err);
-                    continue;
-                }
-            };
-            match claim_output_on_device(opened, plan, required_startup_ownership) {
-                Ok(claimed) => {
-                    let claimed_output = ClaimedHostOutput {
-                        device_id,
-                        mode: claimed.mode,
-                        startup_present_ownership: claimed.startup_present_ownership,
-                    };
-                    self.claimed_output = Some(claimed_output);
-                    return Ok(claimed_output);
-                }
-                Err(err) => {
-                    eprintln!(
-                        "host backend failed to claim output ownership on {}: {err}",
-                        opened.path.display()
-                    );
-                    last_error = Some(err);
-                    continue;
                 }
             }
         }
 
-        match last_error {
-            Some(err) => Err(err),
-            None => Err(RuntimeError::HostNoConnectedOutputRoute),
+        if let Some(forced_path) = forced_drm_path.as_ref() {
+            if candidates.is_empty() {
+                self.device_selection_state = RuntimeHostSelectionState::ForcedFailed;
+                let error = RuntimeError::HostOutputClaim {
+                    path: forced_path.display().to_string(),
+                    error: "forced device override rejected: no connected output route".to_string(),
+                };
+                self.last_selection_result = Some(format!(
+                    "forced device override {} rejected: no connected output route",
+                    forced_path.display()
+                ));
+                return Err(error);
+            }
+        }
+
+        if let Some(forced_output) = forced_output_name.as_ref() {
+            candidates.retain(|candidate| candidate.plan.connector_name == *forced_output);
+            if candidates.is_empty() {
+                self.output_selection_state = RuntimeHostSelectionState::ForcedFailed;
+                let error = RuntimeError::HostOutputClaim {
+                    path: forced_drm_path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .or_else(|| self.primary_opened_path())
+                        .unwrap_or_else(|| "<unknown-device>".to_string()),
+                    error: format!(
+                        "forced output override {} rejected: connector not present",
+                        forced_output
+                    ),
+                };
+                self.last_selection_result = Some(format!(
+                    "forced output override {} rejected: connector not present",
+                    forced_output
+                ));
+                return Err(error);
+            }
+        }
+
+        let chosen = if let Some(last_good) = self.last_good_output_identity.as_ref() {
+            if let Some(index) = candidates.iter().position(|candidate| {
+                candidate.device_path == last_good.device_path
+                    && candidate.plan.connector_name == last_good.connector_name
+            }) {
+                candidates.remove(index)
+            } else if candidates.len() == 1 {
+                candidates.remove(0)
+            } else {
+                let error = RuntimeError::HostOutputClaim {
+                    path: last_good.device_path.display().to_string(),
+                    error: "previous output disappeared and no single safe replacement was found"
+                        .to_string(),
+                };
+                self.last_selection_result = Some(
+                    "recovery required: previous output disappeared and no single safe replacement was found"
+                        .to_string(),
+                );
+                return Err(error);
+            }
+        } else {
+            let Some(first) = candidates.into_iter().next() else {
+                return match last_error {
+                    Some(err) => Err(err),
+                    None => Err(RuntimeError::HostNoConnectedOutputRoute),
+                };
+            };
+            first
+        };
+
+        let Some(opened) = self.opened_devices.get_mut(&chosen.device_id) else {
+            return Err(RuntimeError::HostNoConnectedOutputRoute);
+        };
+        let previous_identity = self.last_good_output_identity.clone();
+        match claim_output_on_device(opened, chosen.plan.clone(), required_startup_ownership) {
+            Ok(claimed) => {
+                let claimed_output = ClaimedHostOutput {
+                    device_id: chosen.device_id,
+                    mode: claimed.mode,
+                    startup_present_ownership: claimed.startup_present_ownership,
+                    identity: claimed.identity.clone(),
+                };
+                self.last_good_output_identity = Some(claimed.identity.clone());
+                self.last_selection_result = Some(describe_output_selection_result(
+                    recovering,
+                    previous_identity.as_ref(),
+                    &claimed.identity,
+                    forced_drm_path.as_deref(),
+                    forced_output_name.as_deref(),
+                ));
+                self.claimed_output = Some(claimed_output.clone());
+                Ok(claimed_output)
+            }
+            Err(err) => {
+                eprintln!(
+                    "host backend failed to claim output ownership on {}: {err}",
+                    opened.path.display()
+                );
+                self.last_selection_result = Some(format!(
+                    "failed to claim output on {}:{}: {err}",
+                    opened.path.display(),
+                    chosen.plan.connector_name
+                ));
+                Err(err)
+            }
         }
     }
 
     fn claimed_device_event_fd(&self) -> Option<OwnedFd> {
-        let claimed = self.claimed_output?;
+        let claimed = self.claimed_output.as_ref()?;
         let opened = self.opened_devices.get(&claimed.device_id)?;
         dup(opened.fd.as_fd()).ok()
     }
 
-    fn claimed_dmabuf_formats(&self) -> Option<Vec<Format>> {
-        let claimed = self.claimed_output?;
+    fn claimed_dmabuf_protocol_advertisement(&self) -> Option<(DrmNode, Vec<Format>)> {
+        let claimed = self.claimed_output.as_ref()?;
         let opened = self.opened_devices.get(&claimed.device_id)?;
         let pipeline = opened.claimed_pipeline.as_ref()?;
         let gles = pipeline.gles_renderer.as_ref()?;
-        Some(gles.renderer.dmabuf_formats().iter().copied().collect())
+        Some((
+            opened.node,
+            gles.renderer.dmabuf_formats().iter().copied().collect(),
+        ))
     }
 
     fn claimed_present_capabilities(&self) -> Option<(RuntimeHostPresentOwnership, bool, bool)> {
-        let claimed = self.claimed_output?;
+        let claimed = self.claimed_output.as_ref()?;
         let opened = self.opened_devices.get(&claimed.device_id)?;
         let pipeline = opened.claimed_pipeline.as_ref()?;
         let ownership = match claimed.startup_present_ownership {
@@ -1273,9 +1561,9 @@ impl HostBackendState {
         wayland_state: &mut RuntimeWaylandState,
     ) -> Result<bool, HostPresentFailure> {
         wayland_state.sync_output_rotation_reconfigure_if_needed();
-        let claimed = match self.claimed_output {
-            Some(claimed) => claimed,
-            None => return Ok(false),
+        sync_runtime_host_present_capabilities(&wayland_state.shared_state, self);
+        let Some(claimed) = self.claimed_output.as_ref().cloned() else {
+            return Ok(false);
         };
         let Some(opened) = self.opened_devices.get_mut(&claimed.device_id) else {
             return Ok(false);
@@ -1286,10 +1574,12 @@ impl HostBackendState {
         if pipeline.flip_pending {
             return Ok(false);
         }
+        let rotation = { lock_state(&wayland_state.shared_state).output_rotation() };
+        let direct_present_supported = direct_present_supported_for_rotation(rotation);
         let requires_direct_present = matches!(
             claimed.startup_present_ownership,
             StartupPresentOwnership::DirectGbm
-        );
+        ) && direct_present_supported;
 
         let card = HostKmsCard::new(&opened.fd);
         let (mode_w, mode_h) = claimed.mode.size();
@@ -1326,7 +1616,7 @@ impl HostBackendState {
         let prefer_overlay_plane_split = overlay_plane_rotation_supported
             && overlay_plane_alpha_format_supported
             && overlay_plane_alpha_blending_supported;
-        if !force_readback_present {
+        if !force_readback_present && direct_present_supported {
             if let Some(gles_renderer) = pipeline.gles_renderer.as_mut() {
                 match render_host_scene_with_gles_direct(
                     gles_renderer,
@@ -1423,6 +1713,7 @@ impl HostBackendState {
                     gles_renderer,
                     wayland_state,
                     &opened.path,
+                    &self.screen_capture,
                     &mut mapping,
                     stride,
                     mode_w as i32,
@@ -1451,15 +1742,18 @@ impl HostBackendState {
                     mode_h as i32,
                 );
             }
-            let rotation = { lock_state(&wayland_state.shared_state).output_rotation() };
-            self.screen_capture.update_from_scanout_xrgb8888(
-                &mapping[..],
-                stride,
-                mode_w.max(1) as usize,
-                mode_h.max(1) as usize,
-                false,
-                rotation,
-            );
+            let quarter_turn_gles_capture_already_recorded =
+                rendered_with_gles_readback && OutputRotationModel::new(rotation).swaps_axes();
+            if !quarter_turn_gles_capture_already_recorded {
+                self.screen_capture.update_from_scanout_xrgb8888(
+                    &mapping[..],
+                    stride,
+                    mode_w.max(1) as usize,
+                    mode_h.max(1) as usize,
+                    false,
+                    rotation,
+                );
+            }
         }
 
         let queued_framebuffer =
@@ -1539,9 +1833,8 @@ impl HostBackendState {
     }
 
     fn process_claimed_presentation_events(&mut self) -> Result<u64, HostPresentFailure> {
-        let claimed = match self.claimed_output {
-            Some(claimed) => claimed,
-            None => return Ok(0),
+        let Some(claimed) = self.claimed_output.as_ref().cloned() else {
+            return Ok(0);
         };
         let Some(opened) = self.opened_devices.get_mut(&claimed.device_id) else {
             return Ok(0);
@@ -1640,11 +1933,20 @@ impl Drop for HostBackendState {
 struct ClaimedOutput {
     mode: DrmMode,
     startup_present_ownership: StartupPresentOwnership,
+    identity: OutputIdentity,
 }
 
-fn build_output_claim_plan(
+fn connector_name(connector_info: &drm_api::control::connector::Info) -> String {
+    format!(
+        "{}-{}",
+        connector_info.interface().as_str(),
+        connector_info.interface_id()
+    )
+}
+
+fn build_output_claim_plans(
     opened: &OpenedHostDevice,
-) -> Result<Option<OutputClaimPlan>, RuntimeError> {
+) -> Result<Vec<OutputClaimPlan>, RuntimeError> {
     let card = HostKmsCard::new(&opened.fd);
     let _ = card.set_client_capability(ClientCapability::UniversalPlanes, true);
     let atomic_client_enabled = card
@@ -1678,6 +1980,7 @@ fn build_output_claim_plan(
         )
     });
 
+    let mut plans = Vec::new();
     for connector_info in connector_infos {
         let Some(mode) = select_connector_mode(connector_info.modes()) else {
             continue;
@@ -1704,70 +2007,113 @@ fn build_output_claim_plan(
                     })?;
             let mut crtcs = resources.filter_crtcs(encoder_info.possible_crtcs());
             crtcs.sort_by_key(|crtc| u32::from(*crtc));
-            if let Some(current_crtc) = encoder_info.crtc() {
+            let selected_crtc = if let Some(current_crtc) = encoder_info.crtc() {
                 if crtcs.contains(&current_crtc) {
-                    let atomic = if atomic_client_enabled {
-                        match build_atomic_claim_plan(
-                            &card,
-                            &opened.path,
-                            &resources,
-                            connector_info.handle(),
-                            current_crtc,
-                            mode,
-                        ) {
-                            Ok(plan) => plan,
-                            Err(err) => {
-                                eprintln!(
-                                    "host backend atomic claim plan probe failed on {}: {err}; continuing with legacy claim flow",
-                                    opened.path.display()
-                                );
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    return Ok(Some(OutputClaimPlan {
-                        connector: connector_info.handle(),
-                        crtc: current_crtc,
-                        mode,
-                        atomic,
-                    }));
-                }
-            }
-            if let Some(crtc) = crtcs.first().copied() {
-                let atomic = if atomic_client_enabled {
-                    match build_atomic_claim_plan(
-                        &card,
-                        &opened.path,
-                        &resources,
-                        connector_info.handle(),
-                        crtc,
-                        mode,
-                    ) {
-                        Ok(plan) => plan,
-                        Err(err) => {
-                            eprintln!(
-                                "host backend atomic claim plan probe failed on {}: {err}; continuing with legacy claim flow",
-                                opened.path.display()
-                            );
-                            None
-                        }
-                    }
+                    Some(current_crtc)
                 } else {
-                    None
-                };
-                return Ok(Some(OutputClaimPlan {
-                    connector: connector_info.handle(),
+                    crtcs.first().copied()
+                }
+            } else {
+                crtcs.first().copied()
+            };
+            let Some(crtc) = selected_crtc else {
+                continue;
+            };
+            let atomic = if atomic_client_enabled {
+                match build_atomic_claim_plan(
+                    &card,
+                    &opened.path,
+                    &resources,
+                    connector_info.handle(),
                     crtc,
                     mode,
-                    atomic,
-                }));
-            }
+                ) {
+                    Ok(plan) => plan,
+                    Err(err) => {
+                        eprintln!(
+                            "host backend atomic claim plan probe failed on {}: {err}; continuing with legacy claim flow",
+                            opened.path.display()
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            plans.push(OutputClaimPlan {
+                connector: connector_info.handle(),
+                connector_name: connector_name(&connector_info),
+                crtc,
+                mode,
+                atomic,
+            });
+            break;
         }
     }
 
-    Ok(None)
+    Ok(plans)
+}
+
+fn describe_output_selection_attempt(
+    forced_drm_path: Option<&Path>,
+    forced_output_name: Option<&str>,
+    previous_identity: Option<&OutputIdentity>,
+    recovering: bool,
+) -> String {
+    let mut parts = Vec::new();
+    parts.push(if recovering {
+        "recovery output selection".to_string()
+    } else {
+        "startup output selection".to_string()
+    });
+    parts.push(match forced_drm_path {
+        Some(path) => format!("device=forced:{}", path.display()),
+        None => "device=automatic".to_string(),
+    });
+    parts.push(match forced_output_name {
+        Some(name) => format!("output=forced:{name}"),
+        None => "output=automatic".to_string(),
+    });
+    if let Some(previous) = previous_identity {
+        parts.push(format!(
+            "previous={}:{}",
+            previous.device_path.display(),
+            previous.connector_name
+        ));
+    }
+    parts.join(" ")
+}
+
+fn describe_output_selection_result(
+    recovering: bool,
+    previous_identity: Option<&OutputIdentity>,
+    selected_identity: &OutputIdentity,
+    forced_drm_path: Option<&Path>,
+    forced_output_name: Option<&str>,
+) -> String {
+    if recovering {
+        if let Some(previous) = previous_identity {
+            if previous.device_path != selected_identity.device_path
+                || previous.connector_name != selected_identity.connector_name
+            {
+                return format!(
+                    "active connector {} disappeared, rebound to {} using matching single-output policy",
+                    previous.connector_name, selected_identity.connector_name
+                );
+            }
+        }
+    }
+    let selection_kind = if forced_drm_path.is_some() || forced_output_name.is_some() {
+        "forced"
+    } else {
+        "auto-selected"
+    };
+    format!(
+        "{} device={} output={}",
+        selection_kind,
+        selected_identity.device_path.display(),
+        selected_identity.connector_name
+    )
 }
 
 fn build_atomic_claim_plan(
@@ -2622,6 +2968,11 @@ fn claim_output_on_device(
         } else {
             StartupPresentOwnership::Dumb
         },
+        identity: OutputIdentity {
+            device_path: opened.path.clone(),
+            connector_name: plan.connector_name,
+            connector_id: u32::from(plan.connector),
+        },
     })
 }
 
@@ -2720,10 +3071,16 @@ fn build_host_gles_renderer_state(
             error: format!("failed to create gles renderer: {err}"),
         })?;
     let target_texture = renderer
-        .create_buffer(primary_scanout_format, size)
+        .create_buffer(GLES_INTERMEDIATE_RENDER_FORMAT, size)
         .map_err(|err| RuntimeError::HostOutputClaim {
             path: device_path.display().to_string(),
             error: format!("failed to create gles offscreen render target: {err}"),
+        })?;
+    let scanout_texture = renderer
+        .create_buffer(GLES_INTERMEDIATE_RENDER_FORMAT, size)
+        .map_err(|err| RuntimeError::HostOutputClaim {
+            path: device_path.display().to_string(),
+            error: format!("failed to create gles scanout composite target: {err}"),
         })?;
     let direct_scanout = match build_host_direct_scanout_state(
         &drm_device_fd,
@@ -2748,11 +3105,23 @@ fn build_host_gles_renderer_state(
         _egl_display: egl_display,
         renderer,
         target_texture,
+        scanout_texture,
         primary_scanout_format,
         overlay_scanout_format,
         direct_scanout,
         overlay_scanout: None,
     })
+}
+
+const GBM_BUFFER_FROM_BO_PRESERVE_EXPLICIT_MODIFIER: bool = false;
+
+macro_rules! gbm_buffer_from_allocated_bo_preserving_modifier {
+    ($bo:expr) => {{
+        // Smithay's `implicit` flag discards the BO's real modifier by forcing
+        // Modifier::Invalid. These scanout allocations come from the modern
+        // modifier-aware GBM path, so keep the true modifier for addfb/dmabuf export.
+        GbmBuffer::from_bo($bo, GBM_BUFFER_FROM_BO_PRESERVE_EXPLICIT_MODIFIER)
+    }};
 }
 
 fn build_host_direct_scanout_state(
@@ -2801,7 +3170,7 @@ fn create_host_direct_scanout_buffer(
             path: device_path.display().to_string(),
             error: format!("failed to allocate gbm direct scanout buffer: {err}"),
         })?;
-    let gbm_buffer = GbmBuffer::from_bo(bo, true);
+    let gbm_buffer = gbm_buffer_from_allocated_bo_preserving_modifier!(bo);
     let framebuffer = framebuffer_from_bo(drm_device_fd, &gbm_buffer, false).map_err(|err| {
         RuntimeError::HostOutputClaim {
             path: device_path.display().to_string(),
@@ -2866,7 +3235,7 @@ fn ensure_overlay_scanout_state(
             path: device_path.display().to_string(),
             error: format!("failed to allocate overlay gbm buffer: {err}"),
         })?;
-    let gbm_buffer = GbmBuffer::from_bo(gbm_buffer, true);
+    let gbm_buffer = gbm_buffer_from_allocated_bo_preserving_modifier!(gbm_buffer);
     let framebuffer =
         framebuffer_from_bo(&gles_state._drm_device_fd, &gbm_buffer, false).map_err(|err| {
             RuntimeError::HostOutputClaim {
@@ -2952,15 +3321,13 @@ fn render_host_scene_with_gles_direct(
     let scanout_size = Size::<i32, BufferCoords>::from((output_w.max(1), output_h.max(1)));
     let scene_render_size = render_output_size_before_transform(wayland_state);
     let scene_size = Size::<i32, BufferCoords>::from((scene_render_size.w, scene_render_size.h));
-    if gles_state.target_texture.size() != scene_size {
-        gles_state.target_texture = gles_state
-            .renderer
-            .create_buffer(DrmFourcc::Xrgb8888, scene_size)
-            .map_err(|err| RuntimeError::HostOutputClaim {
-                path: device_path.display().to_string(),
-                error: format!("failed to resize gles offscreen render target: {err}"),
-            })?;
-    }
+    ensure_gles_render_target_size(
+        &mut gles_state.renderer,
+        device_path,
+        &mut gles_state.target_texture,
+        scene_size,
+        "gles offscreen render target",
+    )?;
     let direct_scanout_needs_resize = gles_state
         .direct_scanout
         .as_ref()
@@ -3011,46 +3378,15 @@ fn render_host_scene_with_gles_direct(
         &capture.elements
     };
     if matches!(rotation, OutputRotation::Deg90 | OutputRotation::Deg270) {
-        let scene_damage = Rectangle::from_size(scene_render_size);
-        {
-            let mut scene_target = gles_state
-                .renderer
-                .bind(&mut gles_state.target_texture)
-                .map_err(|err| RuntimeError::HostOutputClaim {
-                    path: device_path.display().to_string(),
-                    error: format!("failed to bind quarter-turn scene texture: {err}"),
-                })?;
-            let mut scene_frame = gles_state
-                .renderer
-                .render(&mut scene_target, scene_render_size, Transform::Normal)
-                .map_err(|err| RuntimeError::HostOutputClaim {
-                    path: device_path.display().to_string(),
-                    error: format!("failed to begin quarter-turn scene render pass: {err}"),
-                })?;
-            scene_frame
-                .clear(Color32F::new(0.08, 0.08, 0.1, 1.0), &[scene_damage])
-                .map_err(|err| RuntimeError::HostOutputClaim {
-                    path: device_path.display().to_string(),
-                    error: format!("failed to clear quarter-turn scene texture: {err}"),
-                })?;
-            draw_render_elements(&mut scene_frame, 1.0, primary_elements, &[scene_damage])
-                .map_err(|err| RuntimeError::HostOutputClaim {
-                    path: device_path.display().to_string(),
-                    error: format!(
-                        "failed to draw scene elements into quarter-turn scene texture: {err}"
-                    ),
-                })?;
-            let _ = scene_frame
-                .finish()
-                .map_err(|err| RuntimeError::HostOutputClaim {
-                    path: device_path.display().to_string(),
-                    error: format!("failed to finish quarter-turn scene render pass: {err}"),
-                })?;
-        }
+        render_elements_to_texture(
+            &mut gles_state.renderer,
+            device_path,
+            &mut gles_state.target_texture,
+            scene_render_size,
+            primary_elements,
+            "quarter-turn scene texture",
+        )?;
 
-        let scanout_render_size = Size::<i32, Physical>::from((scanout_size.w, scanout_size.h));
-        let scanout_damage = Rectangle::from_size(scanout_render_size);
-        let scene_src = Rectangle::from_size(gles_state.target_texture.size()).to_f64();
         let mut render_target = gles_state
             .renderer
             .bind(&mut scanout_dmabuf)
@@ -3058,42 +3394,14 @@ fn render_host_scene_with_gles_direct(
                 path: device_path.display().to_string(),
                 error: format!("failed to bind direct gbm scanout dmabuf: {err}"),
             })?;
-        let mut frame = gles_state
-            .renderer
-            .render(&mut render_target, scanout_render_size, Transform::Normal)
-            .map_err(|err| RuntimeError::HostOutputClaim {
-                path: device_path.display().to_string(),
-                error: format!("failed to begin direct quarter-turn scanout render pass: {err}"),
-            })?;
-        frame
-            .clear(Color32F::new(0.08, 0.08, 0.1, 1.0), &[scanout_damage])
-            .map_err(|err| RuntimeError::HostOutputClaim {
-                path: device_path.display().to_string(),
-                error: format!("failed to clear direct quarter-turn scanout buffer: {err}"),
-            })?;
-        let scene_texture_transform = scene_texture_transform(rotation);
-        frame
-            .render_texture_from_to(
-                &gles_state.target_texture,
-                scene_src,
-                Rectangle::from_size(scanout_render_size),
-                &[scanout_damage],
-                &[],
-                scene_texture_transform,
-                1.0,
-                None,
-                &[],
-            )
-            .map_err(|err| RuntimeError::HostOutputClaim {
-                path: device_path.display().to_string(),
-                error: format!("failed to composite quarter-turn scene texture into direct scanout buffer: {err}"),
-            })?;
-        let _ = frame
-            .finish()
-            .map_err(|err| RuntimeError::HostOutputClaim {
-                path: device_path.display().to_string(),
-                error: format!("failed to finish direct quarter-turn scanout render pass: {err}"),
-            })?;
+        composite_scene_texture_to_physical_scanout(
+            &mut gles_state.renderer,
+            device_path,
+            &mut render_target,
+            &gles_state.target_texture,
+            Size::<i32, Physical>::from((scanout_size.w, scanout_size.h)),
+            rotation,
+        )?;
         capture_screen_from_render_target(
             screen_capture,
             &mut gles_state.renderer,
@@ -3230,29 +3538,101 @@ fn render_host_scene_with_gles_readback(
     gles_state: &mut HostGlesRendererState,
     wayland_state: &RuntimeWaylandState,
     device_path: &Path,
+    screen_capture: &ScreenCaptureStore,
     target: &mut [u8],
     target_stride: usize,
     output_w: i32,
     output_h: i32,
 ) -> Result<(), RuntimeError> {
-    let size = Size::<i32, BufferCoords>::from((output_w.max(1), output_h.max(1)));
-    if gles_state.target_texture.size() != size {
-        gles_state.target_texture = gles_state
-            .renderer
-            .create_buffer(DrmFourcc::Xrgb8888, size)
-            .map_err(|err| RuntimeError::HostOutputClaim {
-                path: device_path.display().to_string(),
-                error: format!("failed to resize gles host render target: {err}"),
-            })?;
-    }
-
+    let scanout_size = Size::<i32, BufferCoords>::from((output_w.max(1), output_h.max(1)));
     let rotation = { lock_state(&wayland_state.shared_state).output_rotation() };
-    let transform = transform_from_rotation(rotation);
-    let render_size = render_output_size_before_transform(wayland_state);
-    let damage = Rectangle::from_size(transform.transform_size(render_size));
     let capture =
         wayland_state.collect_render_elements(&mut gles_state.renderer, output_w, output_h);
+    let render_size = render_output_size_before_transform(wayland_state);
 
+    if matches!(rotation, OutputRotation::Deg90 | OutputRotation::Deg270) {
+        let scene_size = Size::<i32, BufferCoords>::from((render_size.w, render_size.h));
+        ensure_gles_render_target_size(
+            &mut gles_state.renderer,
+            device_path,
+            &mut gles_state.target_texture,
+            scene_size,
+            "gles quarter-turn scene render target",
+        )?;
+        ensure_gles_render_target_size(
+            &mut gles_state.renderer,
+            device_path,
+            &mut gles_state.scanout_texture,
+            scanout_size,
+            "gles quarter-turn scanout composite target",
+        )?;
+        render_elements_to_texture(
+            &mut gles_state.renderer,
+            device_path,
+            &mut gles_state.target_texture,
+            render_size,
+            &capture.elements,
+            "quarter-turn scene texture",
+        )?;
+
+        let mut render_target = gles_state
+            .renderer
+            .bind(&mut gles_state.scanout_texture)
+            .map_err(|err| RuntimeError::HostOutputClaim {
+                path: device_path.display().to_string(),
+                error: format!("failed to bind quarter-turn scanout composite target: {err}"),
+            })?;
+        composite_scene_texture_to_physical_scanout(
+            &mut gles_state.renderer,
+            device_path,
+            &mut render_target,
+            &gles_state.target_texture,
+            Size::<i32, Physical>::from((scanout_size.w, scanout_size.h)),
+            rotation,
+        )?;
+        let readback_region = Rectangle::from_size(scanout_size);
+        let mapping = gles_state
+            .renderer
+            .copy_framebuffer(&render_target, readback_region, DrmFourcc::Xrgb8888)
+            .map_err(|err| RuntimeError::HostOutputClaim {
+                path: device_path.display().to_string(),
+                error: format!("failed to read back quarter-turn scanout buffer: {err}"),
+            })?;
+        let pixels = gles_state.renderer.map_texture(&mapping).map_err(|err| {
+            RuntimeError::HostOutputClaim {
+                path: device_path.display().to_string(),
+                error: format!("failed to map quarter-turn scanout pixels: {err}"),
+            }
+        })?;
+        screen_capture.update_from_scanout_xrgb8888(
+            pixels,
+            scanout_size.w.max(1) as usize * 4,
+            scanout_size.w.max(1) as usize,
+            scanout_size.h.max(1) as usize,
+            screen_capture_src_flipped(mapping.flipped(), rotation),
+            rotation,
+        );
+        copy_renderer_pixels_to_dumb(
+            pixels,
+            mapping.flipped(),
+            rotation,
+            target,
+            target_stride,
+            scanout_size.w.max(1) as usize,
+            scanout_size.h.max(1) as usize,
+        );
+        return Ok(());
+    }
+
+    ensure_gles_render_target_size(
+        &mut gles_state.renderer,
+        device_path,
+        &mut gles_state.target_texture,
+        scanout_size,
+        "gles host render target",
+    )?;
+    let transform = transform_from_rotation(rotation);
+    let damage = Rectangle::from_size(transform.transform_size(render_size));
     let mut render_target = gles_state
         .renderer
         .bind(&mut gles_state.target_texture)
@@ -3286,7 +3666,7 @@ fn render_host_scene_with_gles_readback(
             error: format!("failed to finish gles render pass: {err}"),
         })?;
 
-    let readback_region = Rectangle::from_size(size);
+    let readback_region = Rectangle::from_size(scanout_size);
     let mapping = gles_state
         .renderer
         .copy_framebuffer(&render_target, readback_region, DrmFourcc::Xrgb8888)
@@ -3294,6 +3674,7 @@ fn render_host_scene_with_gles_readback(
             path: device_path.display().to_string(),
             error: format!("failed to read back gles framebuffer: {err}"),
         })?;
+
     let pixels =
         gles_state
             .renderer
@@ -3308,15 +3689,129 @@ fn render_host_scene_with_gles_readback(
         rotation,
         target,
         target_stride,
-        output_w.max(1) as usize,
-        output_h.max(1) as usize,
+        scanout_size.w.max(1) as usize,
+        scanout_size.h.max(1) as usize,
     );
     Ok(())
 }
-
 fn render_output_size_before_transform(wayland_state: &RuntimeWaylandState) -> Size<i32, Physical> {
     let size = wayland_state.runtime_output_size();
     Size::<i32, Physical>::from((size.w.max(1), size.h.max(1)))
+}
+
+fn ensure_gles_render_target_size(
+    renderer: &mut GlesRenderer,
+    device_path: &Path,
+    target_texture: &mut GlesTexture,
+    size: Size<i32, BufferCoords>,
+    target_name: &str,
+) -> Result<(), RuntimeError> {
+    if target_texture.size() == size {
+        return Ok(());
+    }
+
+    *target_texture = renderer
+        .create_buffer(GLES_INTERMEDIATE_RENDER_FORMAT, size)
+        .map_err(|err| RuntimeError::HostOutputClaim {
+            path: device_path.display().to_string(),
+            error: format!("failed to resize {target_name}: {err}"),
+        })?;
+    Ok(())
+}
+
+fn render_elements_to_texture(
+    renderer: &mut GlesRenderer,
+    device_path: &Path,
+    target_texture: &mut GlesTexture,
+    render_size: Size<i32, Physical>,
+    elements: &[WaylandSurfaceRenderElement<GlesRenderer>],
+    target_name: &str,
+) -> Result<(), RuntimeError> {
+    let damage = Rectangle::from_size(render_size);
+    let mut render_target =
+        renderer
+            .bind(target_texture)
+            .map_err(|err| RuntimeError::HostOutputClaim {
+                path: device_path.display().to_string(),
+                error: format!("failed to bind {target_name}: {err}"),
+            })?;
+    let mut frame = renderer
+        .render(&mut render_target, render_size, Transform::Normal)
+        .map_err(|err| RuntimeError::HostOutputClaim {
+            path: device_path.display().to_string(),
+            error: format!("failed to begin {target_name} render pass: {err}"),
+        })?;
+    frame
+        .clear(Color32F::new(0.08, 0.08, 0.1, 1.0), &[damage])
+        .map_err(|err| RuntimeError::HostOutputClaim {
+            path: device_path.display().to_string(),
+            error: format!("failed to clear {target_name}: {err}"),
+        })?;
+    draw_render_elements(&mut frame, 1.0, elements, &[damage]).map_err(|err| {
+        RuntimeError::HostOutputClaim {
+            path: device_path.display().to_string(),
+            error: format!("failed to draw scene elements into {target_name}: {err}"),
+        }
+    })?;
+    let _ = frame
+        .finish()
+        .map_err(|err| RuntimeError::HostOutputClaim {
+            path: device_path.display().to_string(),
+            error: format!("failed to finish {target_name} render pass: {err}"),
+        })?;
+    Ok(())
+}
+
+fn composite_scene_texture_to_physical_scanout(
+    renderer: &mut GlesRenderer,
+    device_path: &Path,
+    render_target: &mut smithay::backend::renderer::gles::GlesTarget<'_>,
+    scene_texture: &GlesTexture,
+    scanout_size: Size<i32, Physical>,
+    rotation: OutputRotation,
+) -> Result<(), RuntimeError> {
+    let scanout_damage = Rectangle::from_size(scanout_size);
+    let scene_src = Rectangle::from_size(scene_texture.size()).to_f64();
+    // Rotation remains an output concern. Quarter-turn paths therefore render the
+    // scene once in logical coordinates, then realize the panel/capture image by
+    // copying that scene texture into a physical scanout-sized target.
+    let mut frame = renderer
+        .render(render_target, scanout_size, Transform::Normal)
+        .map_err(|err| RuntimeError::HostOutputClaim {
+            path: device_path.display().to_string(),
+            error: format!("failed to begin quarter-turn scanout render pass: {err}"),
+        })?;
+    frame
+        .clear(Color32F::new(0.08, 0.08, 0.1, 1.0), &[scanout_damage])
+        .map_err(|err| RuntimeError::HostOutputClaim {
+            path: device_path.display().to_string(),
+            error: format!("failed to clear quarter-turn scanout buffer: {err}"),
+        })?;
+    frame
+        .render_texture_from_to(
+            scene_texture,
+            scene_src,
+            Rectangle::from_size(scanout_size),
+            &[scanout_damage],
+            &[],
+            scene_texture_transform(rotation),
+            1.0,
+            None,
+            &[],
+        )
+        .map_err(|err| RuntimeError::HostOutputClaim {
+            path: device_path.display().to_string(),
+            error: format!(
+                "failed to composite quarter-turn scene texture into scanout buffer: {err}"
+            ),
+        })?;
+    let _ = frame
+        .finish()
+        .map_err(|err| RuntimeError::HostOutputClaim {
+            path: device_path.display().to_string(),
+            error: format!("failed to finish quarter-turn scanout render pass: {err}"),
+        })?;
+    Ok(())
 }
 
 fn scene_texture_transform(rotation: OutputRotation) -> Transform {
@@ -3377,8 +3872,8 @@ fn copy_renderer_pixels_to_dumb(
     if src_stride == 0 || dst_stride == 0 {
         return;
     }
-    let preserve_readback_row_order = OutputRotationModel::new(rotation)
-        .present_preserves_readback_row_order();
+    let preserve_readback_row_order =
+        OutputRotationModel::new(rotation).present_preserves_readback_row_order();
     for y in 0..height {
         let src_y = if src_flipped && !preserve_readback_row_order {
             height.saturating_sub(1).saturating_sub(y)
@@ -3472,6 +3967,7 @@ struct RuntimeWaylandState {
     shm_state: ShmState,
     dmabuf_state: DmabufState,
     dmabuf_global: Option<DmabufGlobal>,
+    dmabuf_main_device: Option<DrmNode>,
     dmabuf_formats: Vec<Format>,
     seat_state: SeatState<Self>,
     seat: Seat<Self>,
@@ -3485,25 +3981,6 @@ struct RuntimeWaylandState {
     backend_output_size: Size<i32, Physical>,
     applied_output_rotation: OutputRotation,
 }
-
-const DMABUF_PROTOCOL_FORMATS: [Format; 4] = [
-    Format {
-        code: Fourcc::Argb8888,
-        modifier: Modifier::Invalid,
-    },
-    Format {
-        code: Fourcc::Argb8888,
-        modifier: Modifier::Linear,
-    },
-    Format {
-        code: Fourcc::Xrgb8888,
-        modifier: Modifier::Invalid,
-    },
-    Format {
-        code: Fourcc::Xrgb8888,
-        modifier: Modifier::Linear,
-    },
-];
 
 #[derive(Debug, Clone, Copy)]
 enum RenderElementSource {
@@ -3592,6 +4069,119 @@ struct HostSceneComposeStats {
     composed_surfaces: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RoleSurfaceMapping {
+    origin: Point<f64, Logical>,
+    scale: SurfaceScale<f64>,
+}
+
+fn renderer_surface_tree_bbox(
+    surface: &WlSurface,
+    location: impl Into<Point<i32, Logical>>,
+) -> Rectangle<i32, Logical> {
+    let mut bbox = Rectangle::new(location.into(), (0, 0).into());
+    with_surface_tree_downward(
+        surface,
+        bbox.loc,
+        |_, states, &loc| {
+            let data = states.data_map.get::<RendererSurfaceStateUserData>();
+            let mut next_loc = loc;
+            if let Some(view) = data.and_then(|state| state.lock().ok()?.view()) {
+                next_loc += view.offset;
+                bbox = bbox.merge(Rectangle::new(next_loc, view.dst));
+                TraversalAction::DoChildren(next_loc)
+            } else {
+                TraversalAction::SkipChildren
+            }
+        },
+        |_, _, &_| {},
+        |_, _, _| true,
+    );
+    bbox
+}
+
+fn source_rect_from_bbox_and_geometry(
+    bbox: Rectangle<i32, Logical>,
+    geometry: Option<Rectangle<i32, Logical>>,
+) -> Rectangle<i32, Logical> {
+    match geometry.filter(|geo| geo.size.w > 0 && geo.size.h > 0) {
+        Some(geo) if bbox.size.w <= 0 || bbox.size.h <= 0 => geo,
+        Some(geo) if bbox.contains_rect(geo) => geo,
+        Some(_) | None => bbox,
+    }
+}
+
+fn toplevel_surface_source_rect(surface: &ToplevelSurface) -> Rectangle<i32, Logical> {
+    let bbox = renderer_surface_tree_bbox(surface.wl_surface(), (0, 0));
+    smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
+        source_rect_from_bbox_and_geometry(
+            bbox,
+            states
+                .cached_state
+                .get::<SurfaceCachedState>()
+                .current()
+                .geometry,
+        )
+    })
+}
+
+impl RoleSurfaceMapping {
+    fn new(source_bbox: Rectangle<i32, Logical>, target_rect: Rectangle<i32, Logical>) -> Self {
+        if source_bbox.size.w <= 0
+            || source_bbox.size.h <= 0
+            || target_rect.size.w <= 0
+            || target_rect.size.h <= 0
+        {
+            return Self {
+                origin: target_rect.loc.to_f64(),
+                scale: 1.0.into(),
+            };
+        }
+
+        let scale_x = target_rect.size.w as f64 / source_bbox.size.w as f64;
+        let scale_y = target_rect.size.h as f64 / source_bbox.size.h as f64;
+        Self {
+            origin: (
+                target_rect.loc.x as f64 - source_bbox.loc.x as f64 * scale_x,
+                target_rect.loc.y as f64 - source_bbox.loc.y as f64 * scale_y,
+            )
+                .into(),
+            scale: (scale_x, scale_y).into(),
+        }
+    }
+
+    fn map_point(self, source_point: Point<i32, Logical>) -> Point<i32, Logical> {
+        Point::<f64, Logical>::from((
+            self.origin.x + source_point.x as f64 * self.scale.x,
+            self.origin.y + source_point.y as f64 * self.scale.y,
+        ))
+        .to_i32_round()
+    }
+
+    fn map_rect(self, source_rect: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+        Rectangle::from_extremities(
+            self.map_point(source_rect.loc),
+            self.map_point(source_rect.loc + source_rect.size),
+        )
+    }
+
+    fn render_element_location(self) -> Point<i32, Physical> {
+        Point::from((self.origin.x.round() as i32, self.origin.y.round() as i32))
+    }
+
+    fn render_element_scale(self) -> SurfaceScale<f64> {
+        self.scale
+    }
+
+    fn map_render_element_location(
+        self,
+        source_point: Point<i32, Logical>,
+    ) -> Point<i32, Physical> {
+        let mapped = self.map_point(source_point);
+        Point::from((mapped.x, mapped.y))
+    }
+}
+
 impl RuntimeWaylandState {
     fn runtime_output_size(&self) -> Size<i32, Logical> {
         let state = lock_state(&self.shared_state);
@@ -3607,8 +4197,8 @@ impl RuntimeWaylandState {
             .window_height
             .unwrap_or(800)
             .max(1);
-        let (width, height) = OutputRotationModel::new(state.output_rotation())
-            .logical_size_i32(width, height);
+        let (width, height) =
+            OutputRotationModel::new(state.output_rotation()).logical_size_i32(width, height);
         (width, height).into()
     }
 
@@ -3647,15 +4237,7 @@ impl RuntimeWaylandState {
         let _ = output.create_global::<Self>(&display_handle);
         let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
-        let dmabuf_formats = DMABUF_PROTOCOL_FORMATS.to_vec();
-        let mut dmabuf_state = DmabufState::new();
-        let dmabuf_global = if dmabuf_formats.is_empty() {
-            None
-        } else {
-            Some(
-                dmabuf_state.create_global::<Self>(&display_handle, dmabuf_formats.iter().copied()),
-            )
-        };
+        let dmabuf_state = DmabufState::new();
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "winit");
         let _ = seat.add_keyboard(Default::default(), 200, 25);
@@ -3671,8 +4253,9 @@ impl RuntimeWaylandState {
             xdg_shell_state,
             shm_state,
             dmabuf_state,
-            dmabuf_global,
-            dmabuf_formats,
+            dmabuf_global: None,
+            dmabuf_main_device: None,
+            dmabuf_formats: Vec::new(),
             seat_state,
             seat,
             main_toplevel: None,
@@ -3718,27 +4301,98 @@ impl RuntimeWaylandState {
         state.set_runtime_dmabuf_protocol_formats(formats);
     }
 
-    fn sync_dmabuf_protocol_formats(&mut self, formats: Option<Vec<Format>>) {
-        let formats = formats.unwrap_or_default();
-        if formats == self.dmabuf_formats {
+    fn sync_dmabuf_protocol_formats(&mut self, advertisement: Option<(DrmNode, Vec<Format>)>) {
+        let Some((main_device, formats)) = advertisement else {
+            if let Some(global) = self.dmabuf_global.take() {
+                self.dmabuf_state
+                    .disable_global::<Self>(&self.display_handle, &global);
+                self.dmabuf_state
+                    .destroy_global::<Self>(&self.display_handle, global);
+            }
+            self.dmabuf_main_device = None;
+            self.dmabuf_formats.clear();
+            self.sync_runtime_dmabuf_protocol_status();
+            return;
+        };
+
+        if formats.is_empty() {
+            if let Some(global) = self.dmabuf_global.take() {
+                self.dmabuf_state
+                    .disable_global::<Self>(&self.display_handle, &global);
+                self.dmabuf_state
+                    .destroy_global::<Self>(&self.display_handle, global);
+            }
+            self.dmabuf_main_device = None;
+            self.dmabuf_formats = formats;
             self.sync_runtime_dmabuf_protocol_status();
             return;
         }
+
+        let default_feedback = match DmabufFeedbackBuilder::new(
+            main_device.dev_id(),
+            formats.iter().copied(),
+        )
+        .build()
+        {
+            Ok(default_feedback) => default_feedback,
+            Err(err) => {
+                eprintln!(
+                    "host dmabuf protocol advertisement disabled: failed to build default feedback for {}: {err}",
+                    main_device
+                        .dev_path()
+                        .unwrap_or_else(|| PathBuf::from("<unknown-drm-node>"))
+                        .display()
+                );
+                if let Some(global) = self.dmabuf_global.take() {
+                    self.dmabuf_state
+                        .disable_global::<Self>(&self.display_handle, &global);
+                    self.dmabuf_state
+                        .destroy_global::<Self>(&self.display_handle, global);
+                }
+                self.dmabuf_main_device = None;
+                self.dmabuf_formats.clear();
+                self.sync_runtime_dmabuf_protocol_status();
+                return;
+            }
+        };
+
+        if formats == self.dmabuf_formats && self.dmabuf_main_device == Some(main_device) {
+            self.sync_runtime_dmabuf_protocol_status();
+            return;
+        }
+
+        if formats == self.dmabuf_formats {
+            if let Some(global) = self.dmabuf_global.as_ref() {
+                self.dmabuf_state
+                    .set_default_feedback(global, &default_feedback);
+            } else {
+                self.dmabuf_global = Some(
+                    self.dmabuf_state
+                        .create_global_with_default_feedback::<Self>(
+                            &self.display_handle,
+                            &default_feedback,
+                        ),
+                );
+            }
+            self.dmabuf_main_device = Some(main_device);
+            self.sync_runtime_dmabuf_protocol_status();
+            return;
+        }
+
         if let Some(global) = self.dmabuf_global.take() {
             self.dmabuf_state
                 .disable_global::<Self>(&self.display_handle, &global);
             self.dmabuf_state
                 .destroy_global::<Self>(&self.display_handle, global);
         }
-        if formats.is_empty() {
-            self.dmabuf_formats = formats;
-            self.sync_runtime_dmabuf_protocol_status();
-            return;
-        }
         self.dmabuf_global = Some(
             self.dmabuf_state
-                .create_global::<Self>(&self.display_handle, formats.iter().copied()),
+                .create_global_with_default_feedback::<Self>(
+                    &self.display_handle,
+                    &default_feedback,
+                ),
         );
+        self.dmabuf_main_device = Some(main_device);
         self.dmabuf_formats = formats;
         self.sync_runtime_dmabuf_protocol_status();
     }
@@ -4118,6 +4772,24 @@ impl RuntimeWaylandState {
         )
     }
 
+    fn role_surface_mapping(
+        &self,
+        role: RuntimeSurfaceRole,
+        target_rect: Rectangle<i32, Logical>,
+    ) -> Option<RoleSurfaceMapping> {
+        let source_rect = match role {
+            RuntimeSurfaceRole::MainApp => self
+                .main_toplevel
+                .as_ref()
+                .map(toplevel_surface_source_rect),
+            RuntimeSurfaceRole::OverlayNative => self
+                .overlay_toplevel
+                .as_ref()
+                .map(toplevel_surface_source_rect),
+        }?;
+        Some(RoleSurfaceMapping::new(source_rect, target_rect))
+    }
+
     fn handle_surface_identity_update(&mut self, surface: &ToplevelSurface) {
         let updated_id = surface_id(surface.wl_surface());
         if let Some(idx) = self
@@ -4266,86 +4938,100 @@ impl RuntimeWaylandState {
         _output_height: i32,
     ) -> RenderElementCapture {
         let mut capture = RenderElementCapture::default();
+        let output_rect = Rectangle::new(
+            (0, 0).into(),
+            (self.runtime_output_width(), self.runtime_output_height()).into(),
+        );
+        let main_mapping = self.role_surface_mapping(RuntimeSurfaceRole::MainApp, output_rect);
+        let overlay_mapping =
+            self.role_surface_mapping(RuntimeSurfaceRole::OverlayNative, self.overlay_rect());
 
         if let Some(main) = &self.main_toplevel {
-            if let Err(err) = import_surface_tree(renderer, main.wl_surface()) {
-                eprintln!(
-                    "host renderer could not import main surface tree: {err:#?}",
-                    err = err
+            if let Some(mapping) = main_mapping {
+                if let Err(err) = import_surface_tree(renderer, main.wl_surface()) {
+                    eprintln!(
+                        "host renderer could not import main surface tree: {err:#?}",
+                        err = err
+                    );
+                }
+                let elements = render_elements_from_surface_tree(
+                    renderer,
+                    main.wl_surface(),
+                    mapping.render_element_location(),
+                    mapping.render_element_scale(),
+                    1.0,
+                    Kind::Unspecified,
                 );
+                capture.push(RenderElementSource::Main, elements);
             }
-            let elements = render_elements_from_surface_tree(
-                renderer,
-                main.wl_surface(),
-                (0, 0),
-                1.0,
-                1.0,
-                Kind::Unspecified,
-            );
-            capture.push(RenderElementSource::Main, elements);
         }
 
         for popup in &self.popups {
             if popup.owner_role != RuntimeSurfaceRole::MainApp {
                 continue;
             }
-            let popup_geo = self.popup_absolute_geometry(popup);
-            if let Err(err) = import_surface_tree(renderer, popup.surface.wl_surface()) {
-                eprintln!(
-                    "host renderer could not import main popup surface tree: {err:#?}",
-                    err = err
+            if let Some(mapping) = main_mapping {
+                if let Err(err) = import_surface_tree(renderer, popup.surface.wl_surface()) {
+                    eprintln!(
+                        "host renderer could not import main popup surface tree: {err:#?}",
+                        err = err
+                    );
+                }
+                let popup_geo = self.popup_geometry_local(&popup.surface);
+                let elements = render_elements_from_surface_tree(
+                    renderer,
+                    popup.surface.wl_surface(),
+                    mapping.map_render_element_location(popup_geo.loc),
+                    mapping.render_element_scale(),
+                    1.0,
+                    Kind::Unspecified,
                 );
+                capture.push(RenderElementSource::MainPopup, elements);
             }
-            let elements = render_elements_from_surface_tree(
-                renderer,
-                popup.surface.wl_surface(),
-                (popup_geo.loc.x, popup_geo.loc.y),
-                1.0,
-                1.0,
-                Kind::Unspecified,
-            );
-            capture.push(RenderElementSource::MainPopup, elements);
         }
 
         if let Some(overlay) = &self.overlay_toplevel {
-            let overlay_rect = self.overlay_rect();
-            if let Err(err) = import_surface_tree(renderer, overlay.wl_surface()) {
-                eprintln!(
-                    "host renderer could not import overlay surface tree: {err:#?}",
-                    err = err
+            if let Some(mapping) = overlay_mapping {
+                if let Err(err) = import_surface_tree(renderer, overlay.wl_surface()) {
+                    eprintln!(
+                        "host renderer could not import overlay surface tree: {err:#?}",
+                        err = err
+                    );
+                }
+                let elements = render_elements_from_surface_tree(
+                    renderer,
+                    overlay.wl_surface(),
+                    mapping.render_element_location(),
+                    mapping.render_element_scale(),
+                    1.0,
+                    Kind::Unspecified,
                 );
+                capture.push(RenderElementSource::Overlay, elements);
             }
-            let elements = render_elements_from_surface_tree(
-                renderer,
-                overlay.wl_surface(),
-                (overlay_rect.loc.x, overlay_rect.loc.y),
-                1.0,
-                1.0,
-                Kind::Unspecified,
-            );
-            capture.push(RenderElementSource::Overlay, elements);
         }
 
         for popup in &self.popups {
             if popup.owner_role != RuntimeSurfaceRole::OverlayNative {
                 continue;
             }
-            let popup_geo = self.popup_absolute_geometry(popup);
-            if let Err(err) = import_surface_tree(renderer, popup.surface.wl_surface()) {
-                eprintln!(
-                    "host renderer could not import overlay popup surface tree: {err:#?}",
-                    err = err
+            if let Some(mapping) = overlay_mapping {
+                if let Err(err) = import_surface_tree(renderer, popup.surface.wl_surface()) {
+                    eprintln!(
+                        "host renderer could not import overlay popup surface tree: {err:#?}",
+                        err = err
+                    );
+                }
+                let popup_geo = self.popup_geometry_local(&popup.surface);
+                let elements = render_elements_from_surface_tree(
+                    renderer,
+                    popup.surface.wl_surface(),
+                    mapping.map_render_element_location(popup_geo.loc),
+                    mapping.render_element_scale(),
+                    1.0,
+                    Kind::Unspecified,
                 );
+                capture.push(RenderElementSource::OverlayPopup, elements);
             }
-            let elements = render_elements_from_surface_tree(
-                renderer,
-                popup.surface.wl_surface(),
-                (popup_geo.loc.x, popup_geo.loc.y),
-                1.0,
-                1.0,
-                Kind::Unspecified,
-            );
-            capture.push(RenderElementSource::OverlayPopup, elements);
         }
 
         capture
@@ -4523,14 +5209,30 @@ impl RuntimeWaylandState {
 
     fn host_scene_surfaces(&self, output_w: i32, output_h: i32) -> Vec<HostSceneSurface> {
         let mut surfaces = Vec::new();
+        let output_rect = Rectangle::new((0, 0).into(), (output_w, output_h).into());
+        let main_mapping = self.role_surface_mapping(RuntimeSurfaceRole::MainApp, output_rect);
+        let overlay_mapping =
+            self.role_surface_mapping(RuntimeSurfaceRole::OverlayNative, self.overlay_rect());
         if let Some(main) = &self.main_toplevel {
-            let main_rect = Rectangle::new((0, 0).into(), (output_w, output_h).into());
-            self.collect_surface_tree_surfaces(main.wl_surface(), main_rect, &mut surfaces);
+            if let Some(mapping) = main_mapping {
+                self.collect_surface_tree_surfaces(
+                    main.wl_surface(),
+                    (0, 0).into(),
+                    mapping,
+                    &mut surfaces,
+                );
+            }
         }
 
         if let Some(overlay) = &self.overlay_toplevel {
-            let overlay_rect = self.overlay_rect();
-            self.collect_surface_tree_surfaces(overlay.wl_surface(), overlay_rect, &mut surfaces);
+            if let Some(mapping) = overlay_mapping {
+                self.collect_surface_tree_surfaces(
+                    overlay.wl_surface(),
+                    (0, 0).into(),
+                    mapping,
+                    &mut surfaces,
+                );
+            }
         }
 
         for popup in &self.popups {
@@ -4538,10 +5240,28 @@ impl RuntimeWaylandState {
                 .host_surface_buffers
                 .get(&surface_id(popup.surface.wl_surface()))
             {
+                let mapping = match popup.owner_role {
+                    RuntimeSurfaceRole::MainApp => main_mapping,
+                    RuntimeSurfaceRole::OverlayNative => overlay_mapping,
+                };
+                let Some(mapping) = mapping else {
+                    continue;
+                };
+                let target_size = if let Some(size) = snapshot.size.as_ref() {
+                    Some(Size::new(size.w, size.h))
+                } else if let Some(info) = snapshot.dmabuf.as_ref() {
+                    Some(Size::new(info.width, info.height))
+                } else {
+                    None
+                };
+                let Some(target_size) = target_size else {
+                    continue;
+                };
+                let popup_geo = self.popup_geometry_local(&popup.surface);
                 surfaces.push(HostSceneSurface {
                     buffer: snapshot.buffer.clone(),
                     kind: snapshot.kind,
-                    target: self.popup_absolute_geometry(popup),
+                    target: mapping.map_rect(Rectangle::new(popup_geo.loc, target_size)),
                     dmabuf: snapshot.dmabuf,
                 });
             }
@@ -4553,12 +5273,13 @@ impl RuntimeWaylandState {
     fn collect_surface_tree_surfaces(
         &self,
         surface: &WlSurface,
-        base_rect: Rectangle<i32, Logical>,
+        base_loc: Point<i32, Logical>,
+        mapping: RoleSurfaceMapping,
         surfaces: &mut Vec<HostSceneSurface>,
     ) {
         with_surface_tree_downward(
             surface,
-            base_rect.loc,
+            base_loc,
             |_surface, data, &offset| {
                 let location = data
                     .cached_state
@@ -4581,7 +5302,7 @@ impl RuntimeWaylandState {
                         surfaces.push(HostSceneSurface {
                             buffer: snapshot.buffer.clone(),
                             kind: snapshot.kind,
-                            target: Rectangle::new(offset, size),
+                            target: mapping.map_rect(Rectangle::new(offset, size)),
                             dmabuf: snapshot.dmabuf,
                         });
                     }
@@ -5019,6 +5740,10 @@ fn transform_from_rotation(rotation: OutputRotation) -> Transform {
     OutputRotationModel::new(rotation).output_transform()
 }
 
+fn direct_present_supported_for_rotation(rotation: OutputRotation) -> bool {
+    matches!(rotation, OutputRotation::Deg0 | OutputRotation::Deg180)
+}
+
 fn send_frames_surface_tree(surface: &WlSurface, time: u32) {
     with_surface_tree_downward(
         surface,
@@ -5052,10 +5777,13 @@ delegate_seat!(RuntimeWaylandState);
 #[cfg(test)]
 mod tests {
     use super::{
-        AtomicPlaneLayout, DrmFourcc, PlaneSelection, RuntimeWaylandState, scene_texture_transform,
+        AtomicPlaneLayout, DrmFourcc, GBM_BUFFER_FROM_BO_PRESERVE_EXPLICIT_MODIFIER,
+        GLES_INTERMEDIATE_RENDER_FORMAT, PlaneSelection, RoleSurfaceMapping, RuntimeWaylandState,
+        copy_renderer_pixels_to_dumb, direct_present_supported_for_rotation,
         overlay_scanout_format_supports_alpha, render_output_size_before_transform,
-        screen_capture_src_flipped, select_atomic_plane_zpos_values,
-        select_preferred_scanout_format, select_primary_path, transform_from_rotation,
+        scene_texture_transform, screen_capture_src_flipped, select_atomic_plane_zpos_values,
+        select_preferred_scanout_format, select_primary_path, source_rect_from_bbox_and_geometry,
+        transform_from_rotation,
     };
     use crate::model::{OutputRotation, ProcessSpec};
     use crate::process_manager::{ProcessController, ProcessExit};
@@ -5084,6 +5812,19 @@ mod tests {
         fn reap_exited(&mut self) -> Vec<ProcessExit> {
             Vec::new()
         }
+    }
+
+    #[test]
+    fn allocated_gbm_bo_export_policy_preserves_explicit_modifiers() {
+        assert!(
+            !GBM_BUFFER_FROM_BO_PRESERVE_EXPLICIT_MODIFIER,
+            "modifier-aware GBM export must not force implicit modifier mode"
+        );
+    }
+
+    #[test]
+    fn gles_intermediate_render_targets_stay_on_stable_xrgb8888() {
+        assert_eq!(GLES_INTERMEDIATE_RENDER_FORMAT, DrmFourcc::Xrgb8888);
     }
 
     #[test]
@@ -5289,6 +6030,20 @@ mod tests {
     }
 
     #[test]
+    fn direct_present_support_fails_closed_for_quarter_turn_rotations() {
+        assert!(direct_present_supported_for_rotation(OutputRotation::Deg0));
+        assert!(!direct_present_supported_for_rotation(
+            OutputRotation::Deg90
+        ));
+        assert!(direct_present_supported_for_rotation(
+            OutputRotation::Deg180
+        ));
+        assert!(!direct_present_supported_for_rotation(
+            OutputRotation::Deg270
+        ));
+    }
+
+    #[test]
     fn runtime_output_global_advertises_rotated_logical_size_without_client_transform() {
         let shared_state = Arc::new(Mutex::new(CompositorState::new(
             true,
@@ -5425,7 +6180,7 @@ mod tests {
     }
 
     #[test]
-    fn scene_texture_transform_uses_verified_flip_variants() {
+    fn scene_texture_transform_uses_texture_space_flipped_variants_for_quarter_turn_composite() {
         assert_eq!(
             scene_texture_transform(OutputRotation::Deg90),
             Transform::Flipped90
@@ -5446,6 +6201,91 @@ mod tests {
         assert!(!screen_capture_src_flipped(false, OutputRotation::Deg180));
         assert!(!screen_capture_src_flipped(false, OutputRotation::Deg90));
         assert!(!screen_capture_src_flipped(false, OutputRotation::Deg270));
+    }
+
+    #[test]
+    fn quarter_turn_dumb_present_unflips_readback_rows_before_scanout() {
+        let src = vec![
+            0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, //
+            0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+        ];
+        let mut dst = vec![0u8; 16];
+
+        copy_renderer_pixels_to_dumb(&src, true, OutputRotation::Deg90, &mut dst, 8, 2, 2);
+
+        assert_eq!(
+            dst,
+            vec![
+                0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, //
+                0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+            ]
+        );
+    }
+
+    #[test]
+    fn role_surface_mapping_scales_source_bbox_to_target_rect() {
+        let mapping = RoleSurfaceMapping::new(
+            Rectangle::<i32, Logical>::new((40, 20).into(), (80, 40).into()),
+            Rectangle::<i32, Logical>::new((0, 0).into(), (3840, 2160).into()),
+        );
+
+        assert_eq!(
+            mapping.map_rect(Rectangle::new((40, 20).into(), (80, 40).into())),
+            Rectangle::<i32, Logical>::new((0, 0).into(), (3840, 2160).into())
+        );
+    }
+
+    #[test]
+    fn role_surface_mapping_keeps_popup_relative_position_under_same_scale() {
+        let mapping = RoleSurfaceMapping::new(
+            Rectangle::<i32, Logical>::new((0, 0).into(), (80, 40).into()),
+            Rectangle::<i32, Logical>::new((0, 0).into(), (800, 400).into()),
+        );
+
+        assert_eq!(
+            mapping.map_rect(Rectangle::new((60, 10).into(), (20, 10).into())),
+            Rectangle::<i32, Logical>::new((600, 100).into(), (200, 100).into())
+        );
+    }
+
+    #[test]
+    fn source_rect_prefers_window_geometry_when_it_is_inside_bbox() {
+        let bbox = Rectangle::<i32, Logical>::new((-32, -16).into(), (864, 632).into());
+        let geometry = Rectangle::<i32, Logical>::new((0, 0).into(), (800, 600).into());
+
+        assert_eq!(
+            source_rect_from_bbox_and_geometry(bbox, Some(geometry)),
+            geometry
+        );
+    }
+
+    #[test]
+    fn source_rect_falls_back_to_renderer_bbox_when_geometry_exceeds_committed_content() {
+        let bbox = Rectangle::<i32, Logical>::new((-32, -16).into(), (864, 632).into());
+        let geometry = Rectangle::<i32, Logical>::new((0, 0).into(), (3840, 2160).into());
+
+        assert_eq!(
+            source_rect_from_bbox_and_geometry(bbox, Some(geometry)),
+            bbox
+        );
+    }
+
+    #[test]
+    fn source_rect_falls_back_to_bbox_when_geometry_is_missing() {
+        let bbox = Rectangle::<i32, Logical>::new((-12, -8).into(), (824, 616).into());
+
+        assert_eq!(source_rect_from_bbox_and_geometry(bbox, None), bbox);
+    }
+
+    #[test]
+    fn source_rect_falls_back_to_bbox_when_geometry_is_non_positive() {
+        let bbox = Rectangle::<i32, Logical>::new((-12, -8).into(), (824, 616).into());
+        let geometry = Rectangle::<i32, Logical>::new((0, 0).into(), (0, 600).into());
+
+        assert_eq!(
+            source_rect_from_bbox_and_geometry(bbox, Some(geometry)),
+            bbox
+        );
     }
 
     #[test]

@@ -75,6 +75,16 @@ Use one socket consistently:
 export SURF_ACE_SOCKET=/tmp/surf-ace-compositor.sock
 ```
 
+Recovered live tty4 launches must use the current binary contract:
+
+```bash
+./target/debug/surf-ace-compositor serve --runtime host --socket-path "$SURF_ACE_SOCKET"
+```
+
+The older `serve --tty /dev/tty4` form is removed and stale. If a recovery note still
+uses it, treat that note as wrong and fall back to `launch-host-seatd.sh` or the
+`serve --runtime host --socket-path ...` form above.
+
 Do not wrap the verify command in `timeout` or another session-killer when a human is
 checking the screen.
 
@@ -127,19 +137,19 @@ This requires both `zsh` and one supported Wayland terminal (`foot`, `ghostty`,
 Send control requests:
 
 ```bash
-cargo run -- ctl --socket-path /tmp/surf-ace-compositor.sock --request-json '{"type":"get_status"}'
+./target/debug/surf-ace-compositor ctl --socket-path "$SURF_ACE_SOCKET" --request-json '{"type":"get_status"}'
 ```
 
 Rotate output with the first-class operator command:
 
 ```bash
-cargo run -- rotate --socket-path /tmp/surf-ace-compositor.sock --rotation deg90
+./target/debug/surf-ace-compositor rotate --socket-path "$SURF_ACE_SOCKET" --rotation deg90
 ```
 
 Capture the current compositor output to a named path:
 
 ```bash
-cargo run -- capture --socket-path /tmp/surf-ace-compositor.sock --output-path /tmp/surf-ace-capture.png
+./target/debug/surf-ace-compositor capture --socket-path "$SURF_ACE_SOCKET" --output-path /tmp/surf-ace-capture.png
 ```
 
 Set/clear runtime focus target skeleton:
