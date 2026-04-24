@@ -5741,7 +5741,12 @@ fn transform_from_rotation(rotation: OutputRotation) -> Transform {
 }
 
 fn direct_present_supported_for_rotation(rotation: OutputRotation) -> bool {
-    matches!(rotation, OutputRotation::Deg0 | OutputRotation::Deg180)
+    match rotation {
+        OutputRotation::Deg0 | OutputRotation::Deg180 => true,
+        // Quarter-turn direct present is compositor-rendered into a physical
+        // scanout-sized GBM buffer; it does not require KMS plane rotate-90/270.
+        OutputRotation::Deg90 | OutputRotation::Deg270 => true,
+    }
 }
 
 fn send_frames_surface_tree(surface: &WlSurface, time: u32) {
@@ -6030,15 +6035,13 @@ mod tests {
     }
 
     #[test]
-    fn direct_present_support_fails_closed_for_quarter_turn_rotations() {
+    fn direct_present_support_allows_compositor_rendered_quarter_turn_rotations() {
         assert!(direct_present_supported_for_rotation(OutputRotation::Deg0));
-        assert!(!direct_present_supported_for_rotation(
-            OutputRotation::Deg90
-        ));
+        assert!(direct_present_supported_for_rotation(OutputRotation::Deg90));
         assert!(direct_present_supported_for_rotation(
             OutputRotation::Deg180
         ));
-        assert!(!direct_present_supported_for_rotation(
+        assert!(direct_present_supported_for_rotation(
             OutputRotation::Deg270
         ));
     }
