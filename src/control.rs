@@ -1,7 +1,7 @@
 use crate::model::{
     HostRuntimeStartTrigger, MainAppLaunchIntent, NativePaneHostRequest, NativeTargetClass,
     OutputRotation, PaneId, ProcessSpec, ProviderPaneSnapshot, RuntimeBackend, RuntimeFocusTarget,
-    RuntimePhase, StatusSnapshot,
+    RuntimePhase, StatusSnapshot, SurfaceBindingEvidence,
 };
 use crate::screen_capture::ScreenCaptureStore;
 use crate::state::CompositorState;
@@ -30,6 +30,11 @@ pub enum ControlRequest {
     LaunchNativePaneHosts {
         #[serde(default)]
         pane_ids: Vec<PaneId>,
+    },
+    BindNativePaneHostSurface {
+        client_pid: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<SurfaceBindingEvidence>,
     },
     SwitchPaneToExternalNative {
         pane_id: PaneId,
@@ -288,6 +293,15 @@ fn handle_request_with_capture(
             .launch_native_pane_hosts(pane_ids)
             .map(|_| Some(state.status_snapshot()))
             .map_err(|err| err.to_string()),
+        ControlRequest::BindNativePaneHostSurface {
+            client_pid,
+            evidence,
+        } => match state.runtime_mark_native_pane_surface_attached_for_pid(client_pid, evidence) {
+            Some(_) => Ok(Some(state.status_snapshot())),
+            None => Err(format!(
+                "no launched native pane host is waiting for client pid {client_pid}"
+            )),
+        },
         ControlRequest::SwitchPaneToExternalNative {
             pane_id,
             target,
@@ -384,7 +398,8 @@ mod tests {
     use crate::model::{
         ExternalNativeLifecycleState, HostRuntimeStartTrigger, NativePaneHostRequest, PaneGeometry,
         PaneRenderMode, ProcessSpec, RuntimeBackend, RuntimeDmabufFormatStatus,
-        RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource,
+        RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource, SurfaceBindingEvidence,
+        SurfaceBindingEvidenceOutcome,
     };
     use crate::process_manager::{ProcessController, ProcessExit};
     use crate::screen_capture::ScreenCaptureStore;
@@ -558,6 +573,89 @@ mod tests {
             ExternalNativeLifecycleState::Launching { pid: 42 }
         );
         assert!(status.prototype_policy.active_overlay_pane.is_none());
+    }
+
+    #[test]
+    fn bind_native_pane_host_surface_reconciles_launched_pid_and_reports_evidence() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".into()),
+            1280,
+            720,
+        );
+        let plan_response = handle_request(
+            &mut state,
+            ControlRequest::ApplyNativePaneHostPlan {
+                panes: vec![NativePaneHostRequest {
+                    id: PaneId::new("pane-a"),
+                    geometry: PaneGeometry {
+                        x: 10,
+                        y: 20,
+                        width: 300,
+                        height: 200,
+                    },
+                    target: NativeTargetClass::Terminal,
+                    process: ProcessSpec {
+                        command: "ghostty".to_string(),
+                        args: vec!["-e".to_string(), "top".to_string()],
+                        cwd: None,
+                        env: BTreeMap::new(),
+                    },
+                }],
+            },
+            None,
+        );
+        assert!(plan_response.ok);
+        let launch_response = handle_request(
+            &mut state,
+            ControlRequest::LaunchNativePaneHosts {
+                pane_ids: vec![PaneId::new("pane-a")],
+            },
+            None,
+        );
+        assert!(launch_response.ok);
+
+        let evidence = SurfaceBindingEvidence {
+            app_id: Some("com.mitchellh.ghostty".to_string()),
+            title: Some("top".to_string()),
+            outcome: SurfaceBindingEvidenceOutcome::NotRequired,
+        };
+        let bind_response = handle_request(
+            &mut state,
+            ControlRequest::BindNativePaneHostSurface {
+                client_pid: 42,
+                evidence: Some(evidence.clone()),
+            },
+            None,
+        );
+
+        assert!(bind_response.ok);
+        let status = bind_response.status.expect("status should be returned");
+        assert_eq!(
+            status.panes[0].external_native_state,
+            ExternalNativeLifecycleState::Attached { pid: 42 }
+        );
+        assert_eq!(
+            status.panes[0].external_native_binding_evidence,
+            Some(evidence)
+        );
+        assert_eq!(status.panes[0].geometry.x, 10);
+        assert!(status.prototype_policy.active_overlay_pane.is_none());
+
+        let missing_response = handle_request(
+            &mut state,
+            ControlRequest::BindNativePaneHostSurface {
+                client_pid: 99,
+                evidence: None,
+            },
+            None,
+        );
+        assert!(!missing_response.ok);
+        assert_eq!(
+            missing_response.error.as_deref(),
+            Some("no launched native pane host is waiting for client pid 99")
+        );
     }
 
     #[test]
