@@ -13,3 +13,5 @@ Current limitation: this slice proves direct spawned-process PID reconciliation.
 `bind_native_pane_host_surface` is the pane-host binding control primitive for this phase. It accepts an arriving Wayland client PID plus optional app/title evidence and reconciles it to the pane whose native host launch state is waiting for that PID. The response is the normal status snapshot; Surf Ace should read the pane's `external_native_state` and `external_native_binding_evidence`.
 
 This remains a compositor hosting primitive, not a layout primitive. Surf Ace still supplies pane ids and rectangles through the native pane host plan, and the compositor only binds launched native surfaces to those provider-owned pane records.
+
+See `docs/native-pane-control-contract-2026-04-24.md` for the Surf Ace bridge-facing request names, socket discovery, idempotency, release policy, and status shape.

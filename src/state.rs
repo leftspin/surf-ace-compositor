@@ -1,10 +1,11 @@
 use crate::model::{
     ExternalNativeEventContract, ExternalNativeLifecycleState, HostRuntimeStartTrigger,
     MainAppLaunchIntent, MainAppLaunchState, MainAppSurfaceBinding, NativePaneHostRequest,
-    NativeTargetClass, OutputRotation, PaneId, PaneRenderMode, PaneStatus, ProcessSpec,
-    ProviderPaneSnapshot, RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeFocusTarget,
-    RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource, RuntimeHostSelectionState,
-    RuntimePhase, RuntimeSelectionMode, RuntimeStatus, StatusSnapshot, SurfaceBindingEvidence,
+    NativePaneHostStatus, NativeTargetClass, OutputRotation, PaneId, PaneRenderMode, PaneStatus,
+    ProcessSpec, ProviderPaneSnapshot, RuntimeBackend, RuntimeDmabufFormatStatus,
+    RuntimeFocusTarget, RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource,
+    RuntimeHostSelectionState, RuntimePhase, RuntimeSelectionMode, RuntimeStatus, StatusSnapshot,
+    SurfaceBindingEvidence,
 };
 use crate::policy::{PrototypeOverlayPolicy, PrototypePolicyError};
 use crate::process_manager::ProcessController;
@@ -18,6 +19,10 @@ struct PaneRuntimeState {
     geometry: crate::model::PaneGeometry,
     render_mode: PaneRenderMode,
     external_native_state: ExternalNativeLifecycleState,
+    native_host_content_id: Option<String>,
+    native_host_binding_id: Option<String>,
+    native_host_revision: u64,
+    external_native_surface_id: Option<u32>,
     external_native_binding_evidence: Option<SurfaceBindingEvidence>,
 }
 
@@ -485,12 +490,20 @@ impl CompositorState {
                     geometry: pane.geometry,
                     render_mode: prev.render_mode.clone(),
                     external_native_state: prev.external_native_state.clone(),
+                    native_host_content_id: prev.native_host_content_id.clone(),
+                    native_host_binding_id: prev.native_host_binding_id.clone(),
+                    native_host_revision: prev.native_host_revision,
+                    external_native_surface_id: prev.external_native_surface_id,
                     external_native_binding_evidence: prev.external_native_binding_evidence.clone(),
                 },
                 None => PaneRuntimeState {
                     geometry: pane.geometry,
                     render_mode: PaneRenderMode::SurfAceRendered,
                     external_native_state: ExternalNativeLifecycleState::Absent,
+                    native_host_content_id: None,
+                    native_host_binding_id: None,
+                    native_host_revision: 0,
+                    external_native_surface_id: None,
                     external_native_binding_evidence: None,
                 },
             };
@@ -590,6 +603,10 @@ impl CompositorState {
                     geometry: request.geometry,
                     render_mode: PaneRenderMode::SurfAceRendered,
                     external_native_state: ExternalNativeLifecycleState::Absent,
+                    native_host_content_id: None,
+                    native_host_binding_id: None,
+                    native_host_revision: 0,
+                    external_native_surface_id: None,
                     external_native_binding_evidence: None,
                 });
             let next_mode = PaneRenderMode::ExternalNative {
@@ -597,16 +614,23 @@ impl CompositorState {
                 process: request.process,
             };
             pane.geometry = request.geometry;
-            if pane.render_mode != next_mode {
+            let host_identity_changed = pane.render_mode != next_mode
+                || pane.native_host_content_id != request.content_id
+                || pane.native_host_binding_id != request.binding_id;
+            if host_identity_changed {
                 if let Some(pid) = running_pid(&pane.external_native_state) {
                     self.process_controller
                         .terminate(pid)
                         .map_err(StateError::Process)?;
                 }
                 pane.external_native_state = ExternalNativeLifecycleState::Absent;
+                pane.external_native_surface_id = None;
                 pane.external_native_binding_evidence = None;
             }
             pane.render_mode = next_mode;
+            pane.native_host_content_id = request.content_id;
+            pane.native_host_binding_id = request.binding_id;
+            pane.native_host_revision = request.revision;
         }
 
         Ok(())
@@ -664,6 +688,7 @@ impl CompositorState {
                         .get_mut(&pane_id)
                         .ok_or_else(|| StateError::PaneNotFound(pane_id.clone()))?;
                     pane.external_native_state = ExternalNativeLifecycleState::Launching { pid };
+                    pane.external_native_surface_id = None;
                     pane.external_native_binding_evidence = None;
                 }
                 Err(err) => {
@@ -708,6 +733,7 @@ impl CompositorState {
     pub fn runtime_mark_native_pane_surface_attached_for_pid(
         &mut self,
         client_pid: u32,
+        surface_id: Option<u32>,
         evidence: Option<SurfaceBindingEvidence>,
     ) -> Option<PaneId> {
         for (pane_id, pane) in &mut self.panes {
@@ -720,6 +746,7 @@ impl CompositorState {
                     if pid == client_pid =>
                 {
                     pane.external_native_state = ExternalNativeLifecycleState::Attached { pid };
+                    pane.external_native_surface_id = surface_id;
                     pane.external_native_binding_evidence = evidence;
                     return Some(pane_id.clone());
                 }
@@ -747,8 +774,31 @@ impl CompositorState {
 
         pane.render_mode = PaneRenderMode::SurfAceRendered;
         pane.external_native_state = ExternalNativeLifecycleState::Absent;
+        pane.native_host_content_id = None;
+        pane.native_host_binding_id = None;
+        pane.native_host_revision = 0;
+        pane.external_native_surface_id = None;
         pane.external_native_binding_evidence = None;
         self.prototype_overlay_policy.release_if_matches(pane_id);
+        Ok(())
+    }
+
+    pub fn release_native_pane_hosts(&mut self, pane_ids: Vec<PaneId>) -> Result<(), StateError> {
+        let selected_pane_ids = if pane_ids.is_empty() {
+            let mut ids: Vec<_> = self.panes.keys().cloned().collect();
+            ids.sort();
+            ids
+        } else {
+            pane_ids
+        };
+
+        for pane_id in selected_pane_ids {
+            if !self.panes.contains_key(&pane_id) {
+                return Err(StateError::PaneNotFound(pane_id));
+            }
+            self.switch_pane_to_surf_ace(&pane_id)?;
+        }
+
         Ok(())
     }
 
@@ -862,6 +912,7 @@ impl CompositorState {
         match pane.external_native_state {
             ExternalNativeLifecycleState::Attached { pid } if pid == client_pid => {
                 pane.external_native_state = ExternalNativeLifecycleState::Launching { pid };
+                pane.external_native_surface_id = None;
                 pane.external_native_binding_evidence = None;
                 true
             }
@@ -908,6 +959,7 @@ impl CompositorState {
             if running_pid(&pane.external_native_state) == Some(pid) {
                 pane.external_native_state =
                     ExternalNativeLifecycleState::Exited { pid, exit_code };
+                pane.external_native_surface_id = None;
                 pane.external_native_binding_evidence = None;
             }
         }
@@ -930,6 +982,19 @@ impl CompositorState {
                 geometry: state.geometry,
                 render_mode: state.render_mode.clone(),
                 external_native_state: state.external_native_state.clone(),
+                native_host: match &state.render_mode {
+                    PaneRenderMode::ExternalNative { process, .. } => Some(NativePaneHostStatus {
+                        pane_id: id.clone(),
+                        content_id: state.native_host_content_id.clone(),
+                        binding_id: state.native_host_binding_id.clone(),
+                        revision: state.native_host_revision,
+                        surface_id: state.external_native_surface_id,
+                        lifecycle: state.external_native_state.clone(),
+                        process: process.clone(),
+                        binding_evidence: state.external_native_binding_evidence.clone(),
+                    }),
+                    PaneRenderMode::SurfAceRendered => None,
+                },
                 external_native_binding_evidence: state.external_native_binding_evidence.clone(),
                 external_native_event_contract: match state.render_mode {
                     PaneRenderMode::ExternalNative { .. } => {
@@ -1325,6 +1390,9 @@ mod tests {
             .apply_native_pane_host_plan(vec![
                 NativePaneHostRequest {
                     id: PaneId::new("left"),
+                    content_id: Some("content-left".to_string()),
+                    binding_id: Some("binding-left".to_string()),
+                    revision: 1,
                     geometry: PaneGeometry {
                         x: 0,
                         y: 0,
@@ -1336,6 +1404,9 @@ mod tests {
                 },
                 NativePaneHostRequest {
                     id: PaneId::new("right"),
+                    content_id: Some("content-right".to_string()),
+                    binding_id: Some("binding-right".to_string()),
+                    revision: 1,
                     geometry: PaneGeometry {
                         x: 640,
                         y: 0,
@@ -1394,6 +1465,9 @@ mod tests {
             .apply_native_pane_host_plan(vec![
                 NativePaneHostRequest {
                     id: PaneId::new("left"),
+                    content_id: Some("content-left".to_string()),
+                    binding_id: Some("binding-left".to_string()),
+                    revision: 1,
                     geometry: PaneGeometry {
                         x: 0,
                         y: 0,
@@ -1405,6 +1479,9 @@ mod tests {
                 },
                 NativePaneHostRequest {
                     id: PaneId::new("right"),
+                    content_id: Some("content-right".to_string()),
+                    binding_id: Some("binding-right".to_string()),
+                    revision: 1,
                     geometry: PaneGeometry {
                         x: 640,
                         y: 0,
@@ -1476,6 +1553,9 @@ mod tests {
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
                 id: PaneId::new("left"),
+                content_id: Some("content-left".to_string()),
+                binding_id: Some("binding-left".to_string()),
+                revision: 1,
                 geometry: PaneGeometry {
                     x: 0,
                     y: 0,
@@ -1496,7 +1576,11 @@ mod tests {
             outcome: SurfaceBindingEvidenceOutcome::NotRequired,
         };
         assert_eq!(
-            state.runtime_mark_native_pane_surface_attached_for_pid(1, Some(evidence.clone())),
+            state.runtime_mark_native_pane_surface_attached_for_pid(
+                1,
+                Some(101),
+                Some(evidence.clone())
+            ),
             Some(PaneId::new("left"))
         );
 
@@ -1509,9 +1593,18 @@ mod tests {
             status.panes[0].external_native_binding_evidence,
             Some(evidence)
         );
+        let native_host = status.panes[0]
+            .native_host
+            .as_ref()
+            .expect("native host status should be present");
+        assert_eq!(native_host.pane_id, PaneId::new("left"));
+        assert_eq!(native_host.content_id.as_deref(), Some("content-left"));
+        assert_eq!(native_host.binding_id.as_deref(), Some("binding-left"));
+        assert_eq!(native_host.revision, 1);
+        assert_eq!(native_host.surface_id, Some(101));
         assert!(
             state
-                .runtime_mark_native_pane_surface_attached_for_pid(99, None)
+                .runtime_mark_native_pane_surface_attached_for_pid(99, None, None)
                 .is_none()
         );
     }

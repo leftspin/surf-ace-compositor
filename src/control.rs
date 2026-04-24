@@ -27,12 +27,27 @@ pub enum ControlRequest {
     ApplyNativePaneHostPlan {
         panes: Vec<NativePaneHostRequest>,
     },
+    #[serde(rename = "native_pane.host")]
+    NativePaneHost {
+        panes: Vec<NativePaneHostRequest>,
+    },
+    #[serde(rename = "native_pane.update")]
+    NativePaneUpdate {
+        panes: Vec<NativePaneHostRequest>,
+    },
+    #[serde(rename = "native_pane.release")]
+    NativePaneRelease {
+        #[serde(default)]
+        pane_ids: Vec<PaneId>,
+    },
     LaunchNativePaneHosts {
         #[serde(default)]
         pane_ids: Vec<PaneId>,
     },
     BindNativePaneHostSurface {
         client_pid: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        surface_id: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         evidence: Option<SurfaceBindingEvidence>,
     },
@@ -289,14 +304,33 @@ fn handle_request_with_capture(
             .apply_native_pane_host_plan(panes)
             .map(|_| Some(state.status_snapshot()))
             .map_err(|err| err.to_string()),
+        ControlRequest::NativePaneHost { panes } => {
+            let pane_ids = panes.iter().map(|request| request.id.clone()).collect();
+            state
+                .apply_native_pane_host_plan(panes)
+                .and_then(|_| state.launch_native_pane_hosts(pane_ids))
+                .map(|_| Some(state.status_snapshot()))
+                .map_err(|err| err.to_string())
+        }
+        ControlRequest::NativePaneUpdate { panes } => state
+            .apply_native_pane_host_plan(panes)
+            .map(|_| Some(state.status_snapshot()))
+            .map_err(|err| err.to_string()),
+        ControlRequest::NativePaneRelease { pane_ids } => state
+            .release_native_pane_hosts(pane_ids)
+            .map(|_| Some(state.status_snapshot()))
+            .map_err(|err| err.to_string()),
         ControlRequest::LaunchNativePaneHosts { pane_ids } => state
             .launch_native_pane_hosts(pane_ids)
             .map(|_| Some(state.status_snapshot()))
             .map_err(|err| err.to_string()),
         ControlRequest::BindNativePaneHostSurface {
             client_pid,
+            surface_id,
             evidence,
-        } => match state.runtime_mark_native_pane_surface_attached_for_pid(client_pid, evidence) {
+        } => match state
+            .runtime_mark_native_pane_surface_attached_for_pid(client_pid, surface_id, evidence)
+        {
             Some(_) => Ok(Some(state.status_snapshot())),
             None => Err(format!(
                 "no launched native pane host is waiting for client pid {client_pid}"
@@ -477,6 +511,9 @@ mod tests {
                 panes: vec![
                     NativePaneHostRequest {
                         id: PaneId::new("pane-a"),
+                        content_id: None,
+                        binding_id: None,
+                        revision: 0,
                         geometry: PaneGeometry {
                             x: 10,
                             y: 20,
@@ -493,6 +530,9 @@ mod tests {
                     },
                     NativePaneHostRequest {
                         id: PaneId::new("pane-b"),
+                        content_id: None,
+                        binding_id: None,
+                        revision: 0,
                         geometry: PaneGeometry {
                             x: 320,
                             y: 20,
@@ -538,6 +578,9 @@ mod tests {
             ControlRequest::ApplyNativePaneHostPlan {
                 panes: vec![NativePaneHostRequest {
                     id: PaneId::new("pane-a"),
+                    content_id: None,
+                    binding_id: None,
+                    revision: 0,
                     geometry: PaneGeometry {
                         x: 10,
                         y: 20,
@@ -589,6 +632,9 @@ mod tests {
             ControlRequest::ApplyNativePaneHostPlan {
                 panes: vec![NativePaneHostRequest {
                     id: PaneId::new("pane-a"),
+                    content_id: Some("content-a".to_string()),
+                    binding_id: Some("binding-a".to_string()),
+                    revision: 1,
                     geometry: PaneGeometry {
                         x: 10,
                         y: 20,
@@ -625,6 +671,7 @@ mod tests {
             &mut state,
             ControlRequest::BindNativePaneHostSurface {
                 client_pid: 42,
+                surface_id: Some(101),
                 evidence: Some(evidence.clone()),
             },
             None,
@@ -640,6 +687,15 @@ mod tests {
             status.panes[0].external_native_binding_evidence,
             Some(evidence)
         );
+        let native_host = status.panes[0]
+            .native_host
+            .as_ref()
+            .expect("native host status should be present");
+        assert_eq!(native_host.pane_id, PaneId::new("pane-a"));
+        assert_eq!(native_host.content_id.as_deref(), Some("content-a"));
+        assert_eq!(native_host.binding_id.as_deref(), Some("binding-a"));
+        assert_eq!(native_host.revision, 1);
+        assert_eq!(native_host.surface_id, Some(101));
         assert_eq!(status.panes[0].geometry.x, 10);
         assert!(status.prototype_policy.active_overlay_pane.is_none());
 
@@ -647,6 +703,7 @@ mod tests {
             &mut state,
             ControlRequest::BindNativePaneHostSurface {
                 client_pid: 99,
+                surface_id: None,
                 evidence: None,
             },
             None,
@@ -656,6 +713,107 @@ mod tests {
             missing_response.error.as_deref(),
             Some("no launched native pane host is waiting for client pid 99")
         );
+    }
+
+    #[test]
+    fn native_pane_host_update_and_release_are_idempotent_hosting_controls() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".into()),
+            1280,
+            720,
+        );
+
+        let host_response = handle_request(
+            &mut state,
+            ControlRequest::NativePaneHost {
+                panes: vec![NativePaneHostRequest {
+                    id: PaneId::new("pane-a"),
+                    content_id: Some("content-a".to_string()),
+                    binding_id: Some("binding-a".to_string()),
+                    revision: 1,
+                    geometry: PaneGeometry {
+                        x: 10,
+                        y: 20,
+                        width: 300,
+                        height: 200,
+                    },
+                    target: NativeTargetClass::Terminal,
+                    process: ProcessSpec {
+                        command: "foot".to_string(),
+                        args: vec!["top".to_string()],
+                        cwd: None,
+                        env: BTreeMap::new(),
+                    },
+                }],
+            },
+            None,
+        );
+        assert!(host_response.ok);
+        let status = host_response.status.expect("status should be returned");
+        assert_eq!(
+            status.panes[0].external_native_state,
+            ExternalNativeLifecycleState::Launching { pid: 42 }
+        );
+
+        let update_response = handle_request(
+            &mut state,
+            ControlRequest::NativePaneUpdate {
+                panes: vec![NativePaneHostRequest {
+                    id: PaneId::new("pane-a"),
+                    content_id: Some("content-a".to_string()),
+                    binding_id: Some("binding-a".to_string()),
+                    revision: 2,
+                    geometry: PaneGeometry {
+                        x: 30,
+                        y: 40,
+                        width: 320,
+                        height: 220,
+                    },
+                    target: NativeTargetClass::Terminal,
+                    process: ProcessSpec {
+                        command: "foot".to_string(),
+                        args: vec!["top".to_string()],
+                        cwd: None,
+                        env: BTreeMap::new(),
+                    },
+                }],
+            },
+            None,
+        );
+        assert!(update_response.ok);
+        let status = update_response.status.expect("status should be returned");
+        assert_eq!(status.panes[0].geometry.x, 30);
+        assert_eq!(
+            status.panes[0].external_native_state,
+            ExternalNativeLifecycleState::Launching { pid: 42 }
+        );
+        let native_host = status.panes[0]
+            .native_host
+            .as_ref()
+            .expect("native host status should be present");
+        assert_eq!(native_host.revision, 2);
+        assert_eq!(native_host.content_id.as_deref(), Some("content-a"));
+
+        let release_response = handle_request(
+            &mut state,
+            ControlRequest::NativePaneRelease {
+                pane_ids: vec![PaneId::new("pane-a")],
+            },
+            None,
+        );
+        assert!(release_response.ok);
+        let status = release_response.status.expect("status should be returned");
+        assert!(matches!(
+            status.panes[0].render_mode,
+            PaneRenderMode::SurfAceRendered
+        ));
+        assert_eq!(
+            status.panes[0].external_native_state,
+            ExternalNativeLifecycleState::Absent
+        );
+        assert!(status.panes[0].native_host.is_none());
     }
 
     #[test]

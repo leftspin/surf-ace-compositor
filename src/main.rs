@@ -25,6 +25,7 @@ use surf_ace_compositor::state::CompositorState;
 const RUNTIME_ENV: &str = "SURF_ACE_COMPOSITOR_RUNTIME";
 const HOST_DRM_DEVICE_ENV: &str = "SURF_ACE_COMPOSITOR_HOST_DRM_DEVICE";
 const HOST_OUTPUT_ENV: &str = "SURF_ACE_COMPOSITOR_HOST_OUTPUT";
+const CONTROL_SOCKET_ENV: &str = "SURF_ACE_COMPOSITOR_SOCKET";
 const TEST_HOST_RUNTIME_CAPABLE_ENV: &str = "SURF_ACE_COMPOSITOR_TEST_HOST_RUNTIME_CAPABLE";
 const SHELL_OVERLAY_TOGGLE_SHORTCUT_ENV: &str = "SURF_ACE_COMPOSITOR_SHELL_OVERLAY_TOGGLE_SHORTCUT";
 const SHELL_OVERLAY_APP_ID: &str = "surf-ace-shell-overlay";
@@ -53,7 +54,7 @@ enum Command {
         after_help = "Verified host example:\n  surf-ace-compositor serve --runtime host --socket-path /tmp/surf-ace-zsh-tty4.sock"
     )]
     Serve {
-        #[arg(long, default_value = "/tmp/surf-ace-compositor.sock")]
+        #[arg(long, env = CONTROL_SOCKET_ENV, default_value = "/tmp/surf-ace-compositor.sock")]
         socket_path: PathBuf,
         #[arg(
             long,
@@ -85,7 +86,7 @@ enum Command {
         after_help = "Verified control examples:\n  surf-ace-compositor ctl --socket-path /tmp/surf-ace-zsh-tty4.sock --request-json '{\"type\":\"get_status\"}'\n  surf-ace-compositor ctl --socket-path /tmp/surf-ace-zsh-tty4.sock --request-json '{\"type\":\"set_output_rotation\",\"rotation\":\"deg270\"}'\n  surf-ace-compositor ctl --socket-path /tmp/surf-ace-zsh-tty4.sock --request-json '{\"type\":\"capture_screen\",\"output_path\":\"/tmp/surf-ace-capture.png\"}'"
     )]
     Ctl {
-        #[arg(long, default_value = "/tmp/surf-ace-compositor.sock")]
+        #[arg(long, env = CONTROL_SOCKET_ENV, default_value = "/tmp/surf-ace-compositor.sock")]
         socket_path: PathBuf,
         #[arg(
             long,
@@ -103,7 +104,7 @@ enum Command {
         after_help = "Verified rotate example:\n  surf-ace-compositor rotate --socket-path /tmp/surf-ace-zsh-tty4.sock --rotation deg90"
     )]
     Rotate {
-        #[arg(long, default_value = "/tmp/surf-ace-compositor.sock")]
+        #[arg(long, env = CONTROL_SOCKET_ENV, default_value = "/tmp/surf-ace-compositor.sock")]
         socket_path: PathBuf,
         #[arg(long, value_parser = ["deg0", "deg90", "deg180", "deg270"])]
         rotation: String,
@@ -113,7 +114,7 @@ enum Command {
         after_help = "Verified capture example:\n  surf-ace-compositor capture --socket-path /tmp/surf-ace-zsh-tty4.sock --output-path /tmp/surf-ace-capture.png"
     )]
     Capture {
-        #[arg(long, default_value = "/tmp/surf-ace-compositor.sock")]
+        #[arg(long, env = CONTROL_SOCKET_ENV, default_value = "/tmp/surf-ace-compositor.sock")]
         socket_path: PathBuf,
         #[arg(long)]
         output_path: String,
@@ -137,7 +138,7 @@ fn main() {
                 eprintln!("missing subcommand; use 'serve' or pass --launch <command>");
                 std::process::exit(2);
             });
-            let socket_path = PathBuf::from("/tmp/surf-ace-compositor.sock");
+            let socket_path = default_control_socket_path();
             if control_socket_is_active(&socket_path) {
                 let request = match build_launch_control_request(launch) {
                     Ok(request) => request,
@@ -727,6 +728,12 @@ fn control_socket_is_active(socket_path: &Path) -> bool {
         return false;
     };
     file_type.is_socket()
+}
+
+fn default_control_socket_path() -> PathBuf {
+    std::env::var_os(CONTROL_SOCKET_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp/surf-ace-compositor.sock"))
 }
 
 fn run_rotate(socket_path: PathBuf, rotation: &str) {

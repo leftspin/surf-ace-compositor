@@ -238,9 +238,32 @@ pub struct ProviderPaneSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativePaneHostRequest {
     pub id: PaneId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_id: Option<String>,
+    #[serde(default)]
+    pub revision: u64,
     pub geometry: PaneGeometry,
     pub target: NativeTargetClass,
     pub process: ProcessSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativePaneHostStatus {
+    pub pane_id: PaneId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_id: Option<String>,
+    pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_id: Option<u32>,
+    pub lifecycle: ExternalNativeLifecycleState,
+    pub process: ProcessSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_evidence: Option<SurfaceBindingEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,6 +272,12 @@ pub struct PaneStatus {
     pub geometry: PaneGeometry,
     pub render_mode: PaneRenderMode,
     pub external_native_state: ExternalNativeLifecycleState,
+    #[serde(
+        rename = "nativeHost",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub native_host: Option<NativePaneHostStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_native_binding_evidence: Option<SurfaceBindingEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
