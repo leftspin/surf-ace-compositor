@@ -6183,14 +6183,14 @@ mod tests {
     }
 
     #[test]
-    fn scene_texture_transform_uses_texture_space_flipped_variants_for_quarter_turn_composite() {
+    fn scene_texture_transform_uses_physical_scanout_rotation_for_quarter_turn_composite() {
         assert_eq!(
             scene_texture_transform(OutputRotation::Deg90),
-            Transform::Flipped90
+            Transform::_270
         );
         assert_eq!(
             scene_texture_transform(OutputRotation::Deg270),
-            Transform::Flipped270
+            Transform::_90
         );
     }
 
