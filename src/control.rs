@@ -1,7 +1,7 @@
 use crate::model::{
-    HostRuntimeStartTrigger, MainAppLaunchIntent, NativeTargetClass, OutputRotation, PaneId,
-    ProcessSpec, ProviderPaneSnapshot, RuntimeBackend, RuntimeFocusTarget, RuntimePhase,
-    StatusSnapshot,
+    HostRuntimeStartTrigger, MainAppLaunchIntent, NativePaneHostRequest, NativeTargetClass,
+    OutputRotation, PaneId, ProcessSpec, ProviderPaneSnapshot, RuntimeBackend, RuntimeFocusTarget,
+    RuntimePhase, StatusSnapshot,
 };
 use crate::screen_capture::ScreenCaptureStore;
 use crate::state::CompositorState;
@@ -23,6 +23,9 @@ pub enum ControlRequest {
     },
     ApplyProviderSnapshot {
         panes: Vec<ProviderPaneSnapshot>,
+    },
+    ApplyNativePaneHostPlan {
+        panes: Vec<NativePaneHostRequest>,
     },
     SwitchPaneToExternalNative {
         pane_id: PaneId,
@@ -273,6 +276,10 @@ fn handle_request_with_capture(
             .apply_provider_snapshot(panes)
             .map(|_| Some(state.status_snapshot()))
             .map_err(|err| err.to_string()),
+        ControlRequest::ApplyNativePaneHostPlan { panes } => state
+            .apply_native_pane_host_plan(panes)
+            .map(|_| Some(state.status_snapshot()))
+            .map_err(|err| err.to_string()),
         ControlRequest::SwitchPaneToExternalNative {
             pane_id,
             target,
@@ -367,8 +374,9 @@ fn handle_request_with_capture(
 mod tests {
     use super::*;
     use crate::model::{
-        HostRuntimeStartTrigger, ProcessSpec, RuntimeBackend, RuntimeDmabufFormatStatus,
-        RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource,
+        HostRuntimeStartTrigger, NativePaneHostRequest, PaneGeometry, PaneRenderMode, ProcessSpec,
+        RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeHostPresentOwnership,
+        RuntimeHostQueuedPresentSource,
     };
     use crate::process_manager::{ProcessController, ProcessExit};
     use crate::screen_capture::ScreenCaptureStore;
@@ -434,6 +442,69 @@ mod tests {
         prepare_control_socket_path(&socket_path)
             .expect("stale socket file should be removed for fresh bind");
         assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn apply_native_pane_host_plan_uses_provider_pane_geometry_and_process_intent() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+
+        let response = handle_request(
+            &mut state,
+            ControlRequest::ApplyNativePaneHostPlan {
+                panes: vec![
+                    NativePaneHostRequest {
+                        id: PaneId::new("pane-a"),
+                        geometry: PaneGeometry {
+                            x: 10,
+                            y: 20,
+                            width: 300,
+                            height: 200,
+                        },
+                        target: NativeTargetClass::Terminal,
+                        process: ProcessSpec {
+                            command: "foot".to_string(),
+                            args: vec!["top".to_string()],
+                            cwd: None,
+                            env: BTreeMap::new(),
+                        },
+                    },
+                    NativePaneHostRequest {
+                        id: PaneId::new("pane-b"),
+                        geometry: PaneGeometry {
+                            x: 320,
+                            y: 20,
+                            width: 300,
+                            height: 200,
+                        },
+                        target: NativeTargetClass::Terminal,
+                        process: ProcessSpec {
+                            command: "ghostty".to_string(),
+                            args: vec!["-e".to_string(), "htop".to_string()],
+                            cwd: None,
+                            env: BTreeMap::new(),
+                        },
+                    },
+                ],
+            },
+            None,
+        );
+
+        assert!(response.ok);
+        let status = response.status.expect("status should be returned");
+        assert_eq!(status.panes.len(), 2);
+        assert_eq!(status.panes[0].id, PaneId::new("pane-a"));
+        assert_eq!(status.panes[0].geometry.x, 10);
+        assert!(matches!(
+            status.panes[0].render_mode,
+            PaneRenderMode::ExternalNative { .. }
+        ));
+        assert_eq!(status.panes[1].id, PaneId::new("pane-b"));
+        assert_eq!(status.panes[1].geometry.x, 320);
+        assert!(matches!(
+            status.panes[1].render_mode,
+            PaneRenderMode::ExternalNative { .. }
+        ));
+        assert!(status.prototype_policy.active_overlay_pane.is_none());
     }
 
     #[test]

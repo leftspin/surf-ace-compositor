@@ -198,6 +198,14 @@ Minimum v1 requirement for that representation:
 - it must identify the requested native target class as `terminal`
 - it must leave room for a future target-specific payload without changing the fullscreen/overlay topology model
 
+The compositor control API may accept a provider-authored native pane host plan
+containing pane identity, pane rectangle, target class, and process intent for
+more than one pane at a time. That API is a mapping/configuration primitive: Surf
+Ace remains the source of pane geometry and content-mode truth, while the
+compositor records and later realizes those native surface slots. The compositor
+must not derive new panes or reinterpret provider geometry as its own layout
+model.
+
 V1 does not need a generalized external-app schema beyond that minimum contract.
 
 ## Recommended Stack

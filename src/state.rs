@@ -1,10 +1,10 @@
 use crate::model::{
     ExternalNativeEventContract, ExternalNativeLifecycleState, HostRuntimeStartTrigger,
-    MainAppLaunchIntent, MainAppLaunchState, MainAppSurfaceBinding, NativeTargetClass,
-    OutputRotation, PaneId, PaneRenderMode, PaneStatus, ProcessSpec, ProviderPaneSnapshot,
-    RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeFocusTarget, RuntimeHostPresentOwnership,
-    RuntimeHostQueuedPresentSource, RuntimeHostSelectionState, RuntimePhase, RuntimeSelectionMode,
-    RuntimeStatus, StatusSnapshot,
+    MainAppLaunchIntent, MainAppLaunchState, MainAppSurfaceBinding, NativePaneHostRequest,
+    NativeTargetClass, OutputRotation, PaneId, PaneRenderMode, PaneStatus, ProcessSpec,
+    ProviderPaneSnapshot, RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeFocusTarget,
+    RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource, RuntimeHostSelectionState,
+    RuntimePhase, RuntimeSelectionMode, RuntimeStatus, StatusSnapshot,
 };
 use crate::policy::{PrototypeOverlayPolicy, PrototypePolicyError};
 use crate::process_manager::ProcessController;
@@ -549,6 +549,44 @@ impl CompositorState {
                 Err(StateError::Process(err))
             }
         }
+    }
+
+    pub fn apply_native_pane_host_plan(
+        &mut self,
+        requests: Vec<NativePaneHostRequest>,
+    ) -> Result<(), StateError> {
+        for request in &requests {
+            if request.process.command.trim().is_empty() {
+                return Err(StateError::InvalidProcessSpec);
+            }
+        }
+
+        for request in requests {
+            let pane = self
+                .panes
+                .entry(request.id)
+                .or_insert_with(|| PaneRuntimeState {
+                    geometry: request.geometry,
+                    render_mode: PaneRenderMode::SurfAceRendered,
+                    external_native_state: ExternalNativeLifecycleState::Absent,
+                });
+            let next_mode = PaneRenderMode::ExternalNative {
+                target: request.target,
+                process: request.process,
+            };
+            pane.geometry = request.geometry;
+            if pane.render_mode != next_mode {
+                if let Some(pid) = running_pid(&pane.external_native_state) {
+                    self.process_controller
+                        .terminate(pid)
+                        .map_err(StateError::Process)?;
+                }
+                pane.external_native_state = ExternalNativeLifecycleState::Absent;
+            }
+            pane.render_mode = next_mode;
+        }
+
+        Ok(())
     }
 
     pub fn mark_external_surface_attached(&mut self, pane_id: &PaneId) -> Result<(), StateError> {
@@ -1134,6 +1172,72 @@ mod tests {
             .expect_err("second concurrent overlay pane should be denied");
 
         assert!(matches!(err, StateError::PrototypePolicy(_)));
+    }
+
+    #[test]
+    fn native_pane_host_plan_records_multiple_provider_owned_rectangles_without_overlay_claim() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state
+            .apply_provider_snapshot(vec![pane("surf", 0, 720, 1280, 720)])
+            .expect("existing Surf Ace pane should apply");
+
+        state
+            .apply_native_pane_host_plan(vec![
+                NativePaneHostRequest {
+                    id: PaneId::new("left"),
+                    geometry: PaneGeometry {
+                        x: 0,
+                        y: 0,
+                        width: 640,
+                        height: 720,
+                    },
+                    target: NativeTargetClass::Terminal,
+                    process: terminal_process(),
+                },
+                NativePaneHostRequest {
+                    id: PaneId::new("right"),
+                    geometry: PaneGeometry {
+                        x: 640,
+                        y: 0,
+                        width: 640,
+                        height: 720,
+                    },
+                    target: NativeTargetClass::Terminal,
+                    process: ProcessSpec {
+                        command: "ghostty".to_string(),
+                        args: vec!["-e".to_string(), "top".to_string()],
+                        cwd: None,
+                        env: BTreeMap::new(),
+                    },
+                },
+            ])
+            .expect("provider-authored native pane plan should apply");
+
+        let status = state.status_snapshot();
+        assert_eq!(status.panes.len(), 3);
+        assert_eq!(status.panes[0].id, PaneId::new("left"));
+        assert_eq!(status.panes[0].geometry.width, 640);
+        assert!(matches!(
+            status.panes[0].render_mode,
+            PaneRenderMode::ExternalNative { .. }
+        ));
+        assert!(matches!(
+            status.panes[0].external_native_state,
+            ExternalNativeLifecycleState::Absent
+        ));
+        assert_eq!(status.panes[1].id, PaneId::new("right"));
+        assert_eq!(status.panes[1].geometry.x, 640);
+        assert!(matches!(
+            status.panes[1].render_mode,
+            PaneRenderMode::ExternalNative { .. }
+        ));
+        assert_eq!(status.panes[2].id, PaneId::new("surf"));
+        assert!(matches!(
+            status.panes[2].render_mode,
+            PaneRenderMode::SurfAceRendered
+        ));
+        assert!(status.prototype_policy.active_overlay_pane.is_none());
     }
 
     #[test]

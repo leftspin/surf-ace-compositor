@@ -208,6 +208,14 @@ pub struct ProviderPaneSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativePaneHostRequest {
+    pub id: PaneId,
+    pub geometry: PaneGeometry,
+    pub target: NativeTargetClass,
+    pub process: ProcessSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneStatus {
     pub id: PaneId,
     pub geometry: PaneGeometry,
