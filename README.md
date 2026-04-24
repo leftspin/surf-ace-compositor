@@ -19,7 +19,8 @@ The current implementation ships:
   - reports host seat/device snapshot in runtime status (`host_seat_name`, detected/opened DRM counts, primary opened device path)
 - real xdg-shell handling in runtime:
   - toplevel role assignment (`main_app` fullscreen slot, `overlay_native` slot, deny extra independent toplevels)
-  - deterministic main-app binding via configurable `main_app_match_hint` (default: `surf-ace`) with pending-identity queueing
+  - deterministic main-app binding via an explicit launch contract: exact process spec plus exact declared surface binding identity
+  - the same main-app launch-selection action is accepted at startup and over the control surface
   - runtime/product bridge guard: `overlay_native` role only binds when state has an active external/native overlay pane in expected lifecycle state
   - runtime/product bridge lifecycle: overlay role attach/detach transitions active overlay pane state between `launching` and `attached`
   - runtime status now reports `overlay_bound_pane_id` when an overlay role surface is bound
@@ -49,7 +50,18 @@ Start host-compositor backend preflight (`libseat` + `udev` + DRM):
 cargo run -- serve --runtime host --socket-path /tmp/surf-ace-compositor.sock
 ```
 
+Start host mode with an explicit fullscreen main-app launch contract:
+
+```bash
+cargo run -- serve --runtime host --socket-path /tmp/surf-ace-compositor.sock --main-app-launch-intent-json '{"process":{"command":"foot","args":["--app-id","surf-ace-demo"]},"binding":{"kind":"app_id","app_id":"surf-ace-demo"}}'
+```
+
 Note: `--runtime host` requires host-compositor permissions for seat-managed DRM device access (for example through seatd/systemd-logind policy). In restricted environments, startup may fail after detecting DRM nodes but before opening them.
+
+If host mode has been selected and later fails, the daemon stays in failed host
+mode on the same socket. Recovery is explicit: use `start_host_runtime` over the
+control socket or relaunch cleanly on that socket. It does not silently downgrade
+to `winit`.
 
 Operator launcher (seatd, handles stale-shell group inheritance):
 
@@ -107,8 +119,9 @@ zsh main-app verification (rotated 90 degrees CCW):
 ```
 
 This path launches a supported Wayland terminal as the compositor `main_app`, runs
-`zsh` inside it, and waits until runtime status shows the terminal bound in the
-fullscreen slot after the compositor rotation is set to `deg90`.
+`zsh` inside it through the compositor startup launch contract, and waits until
+runtime status shows the terminal attached in the fullscreen slot after the
+compositor rotation is set to `deg90`.
 
 Stale same-socket recovery behavior:
 
@@ -116,6 +129,12 @@ Stale same-socket recovery behavior:
 If an earlier run on the same socket is paused/failed (for example host session paused),
 verify-visible-host-seatd.sh tears down that stale runtime and relaunches cleanly on the
 same socket before applying rotation and starting the demo.
+```
+
+```text
+The socket path is single-owner. A new daemon should not steal a live socket from
+an already-running compositor; same-socket recovery means reusing the running daemon
+or explicitly tearing down the stale one first.
 ```
 
 Expected on screen (success criteria):
@@ -159,10 +178,10 @@ cargo run -- ctl --socket-path /tmp/surf-ace-compositor.sock --request-json '{"t
 cargo run -- ctl --socket-path /tmp/surf-ace-compositor.sock --request-json '{"type":"clear_runtime_focus_target"}'
 ```
 
-Set deterministic Surf Ace main-app match hint:
+Set exact main-app launch intent over the control surface:
 
 ```bash
-cargo run -- ctl --socket-path /tmp/surf-ace-compositor.sock --request-json '{"type":"set_runtime_main_app_match_hint","hint":"surf"}'
+cargo run -- ctl --socket-path /tmp/surf-ace-compositor.sock --request-json '{"type":"set_main_app_launch_intent","intent":{"process":{"command":"foot","args":["--app-id","surf-ace"]},"binding":{"kind":"app_id","app_id":"surf-ace"}}}'
 ```
 
 Example provider snapshot + external/native switch:

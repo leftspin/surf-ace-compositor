@@ -1,14 +1,17 @@
 use crate::model::{
     ExternalNativeEventContract, ExternalNativeLifecycleState, HostRuntimeStartTrigger,
-    NativeTargetClass, OutputRotation, PaneId, PaneRenderMode, PaneStatus, ProcessSpec,
-    ProviderPaneSnapshot, RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeFocusTarget,
-    RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource, RuntimeHostSelectionState,
-    RuntimePhase, RuntimeSelectionMode, RuntimeStatus, StatusSnapshot,
+    MainAppLaunchIntent, MainAppLaunchState, MainAppSurfaceBinding, NativeTargetClass,
+    OutputRotation, PaneId, PaneRenderMode, PaneStatus, ProcessSpec, ProviderPaneSnapshot,
+    RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeFocusTarget, RuntimeHostPresentOwnership,
+    RuntimeHostQueuedPresentSource, RuntimeHostSelectionState, RuntimePhase, RuntimeSelectionMode,
+    RuntimeStatus, StatusSnapshot,
 };
 use crate::policy::{PrototypeOverlayPolicy, PrototypePolicyError};
 use crate::process_manager::ProcessController;
 use std::collections::{BTreeMap, HashMap};
 use thiserror::Error;
+
+const SHELL_OVERLAY_PANE_ID: &str = "shell-overlay";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PaneRuntimeState {
@@ -23,6 +26,8 @@ pub enum StateError {
     PaneNotFound(PaneId),
     #[error("invalid process spec: command must not be empty")]
     InvalidProcessSpec,
+    #[error("invalid main app launch intent: {0}")]
+    InvalidMainAppLaunchIntent(String),
     #[error("pane is not in external/native mode: {0:?}")]
     PaneNotExternalNative(PaneId),
     #[error("cannot switch pane to external/native mode: {0:?}")]
@@ -31,53 +36,34 @@ pub enum StateError {
     PrototypePolicy(#[from] PrototypePolicyError),
     #[error("{0}")]
     Process(String),
+    #[error("{0}")]
+    ShellOverlayUnavailable(String),
 }
 
 pub struct CompositorState {
     host_mode_active: bool,
     output_rotation: OutputRotation,
     panes: HashMap<PaneId, PaneRuntimeState>,
+    shell_overlay_process: Option<ProcessSpec>,
+    shell_overlay_lifecycle: ExternalNativeLifecycleState,
+    shell_overlay_focus_on_attach: bool,
     prototype_overlay_policy: PrototypeOverlayPolicy,
     runtime: RuntimeStatus,
     process_controller: Box<dyn ProcessController>,
 }
 
 impl CompositorState {
-    pub fn new(host_mode_active: bool, process_controller: Box<dyn ProcessController>) -> Self {
-        Self {
-            host_mode_active,
-            output_rotation: OutputRotation::Deg0,
-            panes: HashMap::new(),
-            prototype_overlay_policy: PrototypeOverlayPolicy::default(),
-            runtime: RuntimeStatus::default(),
-            process_controller,
-        }
+    fn clear_runtime_session_status(&mut self) {
+        self.runtime.wayland_socket = None;
+        self.runtime.window_width = None;
+        self.runtime.window_height = None;
+        self.runtime.main_app_surface_id = None;
+        self.runtime.overlay_surface_id = None;
+        self.runtime.overlay_bound_pane_id = None;
+        self.runtime.active_focus_target = None;
     }
 
-    pub fn host_mode_active(&self) -> bool {
-        self.host_mode_active
-    }
-
-    pub fn set_output_rotation(&mut self, rotation: OutputRotation) {
-        self.output_rotation = rotation;
-    }
-
-    pub fn output_rotation(&self) -> OutputRotation {
-        self.output_rotation
-    }
-
-    pub fn runtime_main_app_match_hint(&self) -> &str {
-        &self.runtime.main_app_match_hint
-    }
-
-    pub fn set_runtime_main_app_match_hint(&mut self, hint: impl Into<String>) {
-        self.runtime.main_app_match_hint = hint.into();
-    }
-
-    pub fn mark_runtime_starting(&mut self, backend: RuntimeBackend) {
-        self.runtime.backend = backend;
-        self.runtime.phase = RuntimePhase::Starting;
-        self.runtime.last_error = None;
+    fn clear_host_runtime_route_status(&mut self) {
         self.runtime.host_seat_name = None;
         self.runtime.host_detected_drm_device_count = 0;
         self.runtime.host_opened_drm_device_count = 0;
@@ -99,18 +85,97 @@ impl CompositorState {
         self.runtime.dmabuf_protocol_formats.clear();
     }
 
+    pub fn new(host_mode_active: bool, process_controller: Box<dyn ProcessController>) -> Self {
+        Self {
+            host_mode_active,
+            output_rotation: OutputRotation::Deg0,
+            panes: HashMap::new(),
+            shell_overlay_process: None,
+            shell_overlay_lifecycle: ExternalNativeLifecycleState::Absent,
+            shell_overlay_focus_on_attach: false,
+            prototype_overlay_policy: PrototypeOverlayPolicy::default(),
+            runtime: RuntimeStatus::default(),
+            process_controller,
+        }
+    }
+
+    pub fn host_mode_active(&self) -> bool {
+        self.host_mode_active
+    }
+
+    pub fn set_output_rotation(&mut self, rotation: OutputRotation) {
+        self.output_rotation = rotation;
+    }
+
+    pub fn output_rotation(&self) -> OutputRotation {
+        self.output_rotation
+    }
+
+    pub fn runtime_main_app_launch_intent(&self) -> Option<&MainAppLaunchIntent> {
+        self.runtime.main_app_launch_intent.as_ref()
+    }
+
+    pub fn select_main_app_launch_intent(
+        &mut self,
+        intent: MainAppLaunchIntent,
+    ) -> Result<(), StateError> {
+        intent
+            .validate()
+            .map_err(|err| StateError::InvalidMainAppLaunchIntent(err.to_string()))?;
+
+        self.terminate_running_main_app_process();
+        self.runtime.main_app_surface_id = None;
+        self.runtime.main_app_launch_intent = Some(intent);
+        self.runtime.main_app_launch_state = MainAppLaunchState::WaitingForRuntime;
+        self.launch_configured_main_app_if_runtime_ready();
+        Ok(())
+    }
+
+    pub fn set_shell_overlay_toggle_shortcut(&mut self, shortcut: impl Into<String>) {
+        self.runtime.shell_overlay_toggle_shortcut = shortcut.into();
+    }
+
+    pub fn configure_shell_overlay_process(&mut self, process: Option<ProcessSpec>) {
+        self.shell_overlay_process = process;
+    }
+
+    pub fn mark_runtime_starting(&mut self, backend: RuntimeBackend) {
+        self.prepare_main_app_for_runtime_reset();
+        self.runtime.backend = backend;
+        self.runtime.phase = RuntimePhase::Starting;
+        self.runtime.host_start_request_pending = false;
+        self.runtime.runtime_operator_action_needed = false;
+        self.runtime.runtime_operator_action_reason = None;
+        self.clear_runtime_session_status();
+        self.clear_host_runtime_route_status();
+    }
+
     pub fn mark_host_runtime_start_requested(&mut self, trigger: HostRuntimeStartTrigger) {
-        self.mark_runtime_starting(RuntimeBackend::HostDrm);
+        self.prepare_main_app_for_runtime_reset();
+        self.runtime.backend = RuntimeBackend::HostDrm;
+        self.runtime.host_start_request_pending = true;
         self.runtime.host_start_attempt_count =
             self.runtime.host_start_attempt_count.saturating_add(1);
         self.runtime.host_last_start_trigger = Some(trigger);
+        self.runtime.runtime_operator_action_needed = false;
+        self.runtime.runtime_operator_action_reason = None;
+        self.clear_runtime_session_status();
+        self.clear_host_runtime_route_status();
     }
 
     pub fn mark_runtime_host_preflight_ready(&mut self, wayland_socket: Option<String>) {
         self.runtime.backend = RuntimeBackend::HostDrm;
         self.runtime.phase = RuntimePhase::PreflightReady;
+        self.runtime.host_start_request_pending = false;
         self.runtime.wayland_socket = wayland_socket;
-        self.runtime.last_error = None;
+        self.runtime.runtime_operator_action_needed = false;
+        self.runtime.runtime_operator_action_reason = None;
+        self.runtime.window_width = None;
+        self.runtime.window_height = None;
+        self.runtime.main_app_surface_id = None;
+        self.runtime.overlay_surface_id = None;
+        self.runtime.overlay_bound_pane_id = None;
+        self.runtime.active_focus_target = None;
         self.runtime.host_output_ownership = false;
         self.runtime.host_active_connector_name = None;
         self.runtime.host_active_connector_id = None;
@@ -135,11 +200,57 @@ impl CompositorState {
     ) {
         self.runtime.backend = backend;
         self.runtime.phase = RuntimePhase::Running;
+        self.runtime.host_start_request_pending = false;
         self.runtime.wayland_socket = wayland_socket;
         self.runtime.window_width = Some(window_width);
         self.runtime.window_height = Some(window_height);
         self.runtime.last_error = None;
+        self.runtime.runtime_operator_action_needed = false;
+        self.runtime.runtime_operator_action_reason = None;
         self.runtime.host_output_ownership = matches!(backend, RuntimeBackend::HostDrm);
+        self.launch_configured_main_app_if_runtime_ready();
+    }
+
+    pub fn mark_runtime_host_running(
+        &mut self,
+        wayland_socket: String,
+        window_width: i32,
+        window_height: i32,
+        seat_name: Option<String>,
+        detected_drm_device_count: usize,
+        opened_drm_device_count: usize,
+        primary_drm_path: Option<String>,
+        active_connector_name: Option<String>,
+        active_connector_id: Option<u32>,
+        last_selection_attempt: Option<String>,
+        last_selection_result: Option<String>,
+        present_ownership: RuntimeHostPresentOwnership,
+        atomic_commit_enabled: bool,
+        overlay_plane_capable: bool,
+    ) {
+        self.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some(wayland_socket),
+            window_width,
+            window_height,
+        );
+        self.set_runtime_host_backend_snapshot(
+            seat_name,
+            detected_drm_device_count,
+            opened_drm_device_count,
+            primary_drm_path,
+        );
+        self.set_runtime_host_route_selection_status(
+            active_connector_name,
+            active_connector_id,
+            last_selection_attempt,
+            last_selection_result,
+        );
+        self.set_runtime_host_present_capabilities(
+            present_ownership,
+            atomic_commit_enabled,
+            overlay_plane_capable,
+        );
     }
 
     pub fn set_runtime_selection_status(
@@ -264,43 +375,83 @@ impl CompositorState {
         self.runtime.active_focus_target = target;
     }
 
+    pub fn runtime_expected_main_app_binding(&self) -> Option<(u32, MainAppSurfaceBinding)> {
+        let binding = self
+            .runtime
+            .main_app_launch_intent
+            .as_ref()
+            .map(|intent| intent.binding.clone())?;
+        match self.runtime.main_app_launch_state {
+            MainAppLaunchState::Launching { pid } | MainAppLaunchState::Attached { pid } => {
+                Some((pid, binding))
+            }
+            MainAppLaunchState::NotRequested
+            | MainAppLaunchState::WaitingForRuntime
+            | MainAppLaunchState::Failed { .. }
+            | MainAppLaunchState::Exited { .. } => None,
+        }
+    }
+
+    pub fn runtime_mark_main_app_surface_attached_for_pid(&mut self, client_pid: u32) -> bool {
+        match self.runtime.main_app_launch_state {
+            MainAppLaunchState::Launching { pid } if pid == client_pid => {
+                self.runtime.main_app_launch_state = MainAppLaunchState::Attached { pid };
+                true
+            }
+            MainAppLaunchState::Attached { pid } if pid == client_pid => true,
+            MainAppLaunchState::NotRequested
+            | MainAppLaunchState::WaitingForRuntime
+            | MainAppLaunchState::Launching { .. }
+            | MainAppLaunchState::Attached { .. }
+            | MainAppLaunchState::Failed { .. }
+            | MainAppLaunchState::Exited { .. } => false,
+        }
+    }
+
+    pub fn runtime_mark_main_app_surface_detached_for_pid(&mut self, client_pid: u32) -> bool {
+        match self.runtime.main_app_launch_state {
+            MainAppLaunchState::Attached { pid } if pid == client_pid => {
+                self.runtime.main_app_launch_state = MainAppLaunchState::Launching { pid };
+                true
+            }
+            MainAppLaunchState::Launching { pid } if pid == client_pid => true,
+            MainAppLaunchState::NotRequested
+            | MainAppLaunchState::WaitingForRuntime
+            | MainAppLaunchState::Launching { .. }
+            | MainAppLaunchState::Attached { .. }
+            | MainAppLaunchState::Failed { .. }
+            | MainAppLaunchState::Exited { .. } => false,
+        }
+    }
+
     pub fn increment_runtime_denied_toplevel(&mut self) {
         self.runtime.denied_toplevel_count += 1;
     }
 
     pub fn mark_runtime_failed(&mut self, error: impl Into<String>) {
+        self.prepare_main_app_for_runtime_reset();
+        let error = error.into();
         self.runtime.phase = RuntimePhase::Failed;
-        self.runtime.last_error = Some(error.into());
-        self.runtime.host_output_ownership = false;
-        self.runtime.host_active_connector_name = None;
-        self.runtime.host_active_connector_id = None;
-        self.runtime.host_present_ownership = RuntimeHostPresentOwnership::None;
-        self.runtime.host_atomic_commit_enabled = false;
-        self.runtime.host_overlay_plane_capable = false;
-        self.runtime.host_last_queued_present_source = RuntimeHostQueuedPresentSource::None;
-        self.runtime.host_last_queued_atomic_commit = false;
-        self.runtime.host_last_queued_overlay_plane = false;
-        self.runtime.host_last_queued_primary_dmabuf_format = None;
-        self.runtime.host_last_queued_overlay_dmabuf_format = None;
-        self.runtime.dmabuf_protocol_enabled = false;
-        self.runtime.dmabuf_protocol_formats.clear();
+        self.runtime.host_start_request_pending = false;
+        self.runtime.last_error = Some(error.clone());
+        self.runtime.runtime_operator_action_needed = matches!(
+            self.runtime.backend,
+            RuntimeBackend::HostDrm | RuntimeBackend::None
+        ) && self.host_mode_active;
+        self.runtime.runtime_operator_action_reason = self
+            .runtime
+            .runtime_operator_action_needed
+            .then(|| format!("host runtime failed; explicit recovery required: {error}"));
+        self.clear_runtime_session_status();
+        self.clear_host_runtime_route_status();
     }
 
     pub fn mark_runtime_stopped(&mut self) {
+        self.prepare_main_app_for_runtime_reset();
         self.runtime.phase = RuntimePhase::Stopped;
-        self.runtime.host_output_ownership = false;
-        self.runtime.host_active_connector_name = None;
-        self.runtime.host_active_connector_id = None;
-        self.runtime.host_present_ownership = RuntimeHostPresentOwnership::None;
-        self.runtime.host_atomic_commit_enabled = false;
-        self.runtime.host_overlay_plane_capable = false;
-        self.runtime.host_last_queued_present_source = RuntimeHostQueuedPresentSource::None;
-        self.runtime.host_last_queued_atomic_commit = false;
-        self.runtime.host_last_queued_overlay_plane = false;
-        self.runtime.host_last_queued_primary_dmabuf_format = None;
-        self.runtime.host_last_queued_overlay_dmabuf_format = None;
-        self.runtime.dmabuf_protocol_enabled = false;
-        self.runtime.dmabuf_protocol_formats.clear();
+        self.runtime.host_start_request_pending = false;
+        self.clear_runtime_session_status();
+        self.clear_host_runtime_route_status();
     }
 
     pub fn apply_provider_snapshot(
@@ -338,8 +489,9 @@ impl CompositorState {
         }
 
         self.panes = incoming;
-        self.prototype_overlay_policy
-            .clear_if_removed(|pane_id| self.panes.contains_key(pane_id));
+        self.prototype_overlay_policy.clear_if_removed(|pane_id| {
+            self.panes.contains_key(pane_id) || is_shell_overlay_pane_id(pane_id)
+        });
         Ok(())
     }
 
@@ -381,6 +533,9 @@ impl CompositorState {
         let mut extra_env = BTreeMap::new();
         extra_env.insert("SURF_ACE_COMPOSITOR_HOST_MODE".to_string(), "1".to_string());
         extra_env.insert("SURF_ACE_PANE_ID".to_string(), pane_id.0.clone());
+        if let Some(wayland_socket) = self.runtime.wayland_socket.clone() {
+            extra_env.insert("WAYLAND_DISPLAY".to_string(), wayland_socket);
+        }
 
         match self.process_controller.spawn(&process, &extra_env) {
             Ok(pid) => {
@@ -428,12 +583,31 @@ impl CompositorState {
         Ok(())
     }
 
+    pub fn toggle_shell_overlay(&mut self) -> Result<(), StateError> {
+        match self.shell_overlay_lifecycle {
+            ExternalNativeLifecycleState::Launching { .. }
+            | ExternalNativeLifecycleState::Attached { .. } => self.dismiss_shell_overlay(),
+            ExternalNativeLifecycleState::Absent
+            | ExternalNativeLifecycleState::Failed { .. }
+            | ExternalNativeLifecycleState::Exited { .. } => self.open_shell_overlay(),
+        }
+    }
+
     pub fn active_overlay_pane_id(&self) -> Option<PaneId> {
         self.prototype_overlay_policy.active_overlay_pane().cloned()
     }
 
     pub fn runtime_expected_overlay_binding(&self) -> Option<(PaneId, u32)> {
         let pane_id = self.active_overlay_pane_id()?;
+        if is_shell_overlay_pane_id(&pane_id) {
+            return match self.shell_overlay_lifecycle {
+                ExternalNativeLifecycleState::Launching { pid }
+                | ExternalNativeLifecycleState::Attached { pid } => Some((pane_id, pid)),
+                ExternalNativeLifecycleState::Absent
+                | ExternalNativeLifecycleState::Failed { .. }
+                | ExternalNativeLifecycleState::Exited { .. } => None,
+            };
+        }
         let pane = self.panes.get(&pane_id)?;
         if !matches!(pane.render_mode, PaneRenderMode::ExternalNative { .. }) {
             return None;
@@ -457,6 +631,20 @@ impl CompositorState {
         };
         if expected_pid != client_pid {
             return false;
+        }
+        if is_shell_overlay_pane_id(&pane_id) {
+            return match self.shell_overlay_lifecycle {
+                ExternalNativeLifecycleState::Launching { pid } if pid == client_pid => {
+                    self.shell_overlay_lifecycle = ExternalNativeLifecycleState::Attached { pid };
+                    true
+                }
+                ExternalNativeLifecycleState::Attached { pid } if pid == client_pid => true,
+                ExternalNativeLifecycleState::Absent
+                | ExternalNativeLifecycleState::Launching { .. }
+                | ExternalNativeLifecycleState::Attached { .. }
+                | ExternalNativeLifecycleState::Failed { .. }
+                | ExternalNativeLifecycleState::Exited { .. } => false,
+            };
         }
         let Some(pane) = self.panes.get_mut(&pane_id) else {
             return false;
@@ -483,6 +671,20 @@ impl CompositorState {
         if expected_pid != client_pid {
             return false;
         }
+        if is_shell_overlay_pane_id(&pane_id) {
+            return match self.shell_overlay_lifecycle {
+                ExternalNativeLifecycleState::Attached { pid } if pid == client_pid => {
+                    self.shell_overlay_lifecycle = ExternalNativeLifecycleState::Launching { pid };
+                    true
+                }
+                ExternalNativeLifecycleState::Launching { pid } if pid == client_pid => true,
+                ExternalNativeLifecycleState::Absent
+                | ExternalNativeLifecycleState::Launching { .. }
+                | ExternalNativeLifecycleState::Attached { .. }
+                | ExternalNativeLifecycleState::Failed { .. }
+                | ExternalNativeLifecycleState::Exited { .. } => false,
+            };
+        }
         let Some(pane) = self.panes.get_mut(&pane_id) else {
             return false;
         };
@@ -508,12 +710,42 @@ impl CompositorState {
     }
 
     pub fn record_process_exit(&mut self, pid: u32, exit_code: Option<i32>) {
+        match self.runtime.main_app_launch_state {
+            MainAppLaunchState::Launching { pid: current_pid }
+            | MainAppLaunchState::Attached { pid: current_pid }
+                if current_pid == pid =>
+            {
+                self.runtime.main_app_launch_state = MainAppLaunchState::Exited { pid, exit_code };
+                self.runtime.main_app_surface_id = None;
+                if self.runtime.active_focus_target == Some(RuntimeFocusTarget::MainApp) {
+                    self.runtime.active_focus_target = None;
+                }
+            }
+            MainAppLaunchState::NotRequested
+            | MainAppLaunchState::WaitingForRuntime
+            | MainAppLaunchState::Launching { .. }
+            | MainAppLaunchState::Attached { .. }
+            | MainAppLaunchState::Failed { .. }
+            | MainAppLaunchState::Exited { .. } => {}
+        }
+        if running_pid(&self.shell_overlay_lifecycle) == Some(pid) {
+            self.shell_overlay_lifecycle = ExternalNativeLifecycleState::Exited { pid, exit_code };
+            self.shell_overlay_focus_on_attach = false;
+        }
         for pane in self.panes.values_mut() {
             if running_pid(&pane.external_native_state) == Some(pid) {
                 pane.external_native_state =
                     ExternalNativeLifecycleState::Exited { pid, exit_code };
             }
         }
+    }
+
+    pub fn shell_overlay_focus_requested(&self) -> bool {
+        self.shell_overlay_focus_on_attach
+    }
+
+    pub fn mark_shell_overlay_focus_applied(&mut self) {
+        self.shell_overlay_focus_on_attach = false;
     }
 
     pub fn status_snapshot(&self) -> StatusSnapshot {
@@ -543,6 +775,130 @@ impl CompositorState {
             runtime: self.runtime.clone(),
         }
     }
+
+    fn open_shell_overlay(&mut self) -> Result<(), StateError> {
+        let process = self.shell_overlay_process.clone().ok_or_else(|| {
+            StateError::ShellOverlayUnavailable(
+                "shell overlay process is not configured".to_string(),
+            )
+        })?;
+        let pane_id = shell_overlay_pane_id();
+        self.prototype_overlay_policy.reserve_for(&pane_id)?;
+
+        let mut extra_env = BTreeMap::new();
+        extra_env.insert("SURF_ACE_COMPOSITOR_HOST_MODE".to_string(), "1".to_string());
+        extra_env.insert("SURF_ACE_PANE_ID".to_string(), pane_id.0.clone());
+        if let Some(wayland_socket) = self.runtime.wayland_socket.clone() {
+            extra_env.insert("WAYLAND_DISPLAY".to_string(), wayland_socket);
+        }
+
+        match self.process_controller.spawn(&process, &extra_env) {
+            Ok(pid) => {
+                self.shell_overlay_lifecycle = ExternalNativeLifecycleState::Launching { pid };
+                self.shell_overlay_focus_on_attach = true;
+                Ok(())
+            }
+            Err(err) => {
+                self.shell_overlay_lifecycle = ExternalNativeLifecycleState::Failed {
+                    reason: err.clone(),
+                };
+                self.shell_overlay_focus_on_attach = false;
+                Err(StateError::Process(err))
+            }
+        }
+    }
+
+    fn dismiss_shell_overlay(&mut self) -> Result<(), StateError> {
+        if let Some(pid) = running_pid(&self.shell_overlay_lifecycle) {
+            self.process_controller
+                .terminate(pid)
+                .map_err(StateError::Process)?;
+        }
+
+        self.shell_overlay_lifecycle = ExternalNativeLifecycleState::Absent;
+        self.shell_overlay_focus_on_attach = false;
+        self.prototype_overlay_policy
+            .release_if_matches(&shell_overlay_pane_id());
+        self.runtime.active_focus_target = self
+            .runtime
+            .main_app_surface_id
+            .map(|_| RuntimeFocusTarget::MainApp);
+        Ok(())
+    }
+
+    fn launch_configured_main_app_if_runtime_ready(&mut self) {
+        if !matches!(self.runtime.phase, RuntimePhase::Running) {
+            if self.runtime.main_app_launch_intent.is_some()
+                && !matches!(
+                    self.runtime.main_app_launch_state,
+                    MainAppLaunchState::Launching { .. } | MainAppLaunchState::Attached { .. }
+                )
+            {
+                self.runtime.main_app_launch_state = MainAppLaunchState::WaitingForRuntime;
+            }
+            return;
+        }
+
+        let Some(intent) = self.runtime.main_app_launch_intent.clone() else {
+            self.runtime.main_app_launch_state = MainAppLaunchState::NotRequested;
+            return;
+        };
+
+        if matches!(
+            self.runtime.main_app_launch_state,
+            MainAppLaunchState::Launching { .. } | MainAppLaunchState::Attached { .. }
+        ) {
+            return;
+        }
+
+        let mut extra_env = BTreeMap::new();
+        extra_env.insert("SURF_ACE_COMPOSITOR_MAIN_APP".to_string(), "1".to_string());
+        if self.host_mode_active {
+            extra_env.insert("SURF_ACE_COMPOSITOR_HOST_MODE".to_string(), "1".to_string());
+        }
+        if let Some(wayland_socket) = self.runtime.wayland_socket.clone() {
+            extra_env.insert("WAYLAND_DISPLAY".to_string(), wayland_socket);
+        }
+
+        match self.process_controller.spawn(&intent.process, &extra_env) {
+            Ok(pid) => {
+                self.runtime.main_app_launch_state = MainAppLaunchState::Launching { pid };
+                self.runtime.main_app_surface_id = None;
+            }
+            Err(err) => {
+                self.runtime.main_app_launch_state = MainAppLaunchState::Failed {
+                    reason: err.clone(),
+                };
+                self.runtime.main_app_surface_id = None;
+            }
+        }
+    }
+
+    fn prepare_main_app_for_runtime_reset(&mut self) {
+        self.terminate_running_main_app_process();
+        self.runtime.main_app_surface_id = None;
+        self.runtime.main_app_launch_state = if self.runtime.main_app_launch_intent.is_some() {
+            MainAppLaunchState::WaitingForRuntime
+        } else {
+            MainAppLaunchState::NotRequested
+        };
+    }
+
+    fn terminate_running_main_app_process(&mut self) {
+        let pid = match self.runtime.main_app_launch_state {
+            MainAppLaunchState::Launching { pid } | MainAppLaunchState::Attached { pid } => {
+                Some(pid)
+            }
+            MainAppLaunchState::NotRequested
+            | MainAppLaunchState::WaitingForRuntime
+            | MainAppLaunchState::Failed { .. }
+            | MainAppLaunchState::Exited { .. } => None,
+        };
+
+        if let Some(pid) = pid {
+            let _ = self.process_controller.terminate(pid);
+        }
+    }
 }
 
 fn running_pid(state: &ExternalNativeLifecycleState) -> Option<u32> {
@@ -555,10 +911,21 @@ fn running_pid(state: &ExternalNativeLifecycleState) -> Option<u32> {
     }
 }
 
+fn shell_overlay_pane_id() -> PaneId {
+    PaneId::new(SHELL_OVERLAY_PANE_ID)
+}
+
+fn is_shell_overlay_pane_id(pane_id: &PaneId) -> bool {
+    pane_id.0 == SHELL_OVERLAY_PANE_ID
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{PaneGeometry, ProviderPaneSnapshot};
+    use crate::model::{
+        MainAppLaunchIntent, MainAppLaunchState, MainAppSurfaceBinding, PaneGeometry,
+        ProviderPaneSnapshot,
+    };
     use crate::process_manager::{ProcessController, ProcessExit};
     use std::collections::{BTreeMap, HashSet};
     use std::sync::{Arc, Mutex};
@@ -575,6 +942,7 @@ mod tests {
         terminated: Vec<u32>,
         queued_exits: Vec<ProcessExit>,
         fail_spawn: bool,
+        spawned_env: Vec<BTreeMap<String, String>>,
     }
 
     impl FakeProcessController {
@@ -594,18 +962,23 @@ mod tests {
                 .queued_exits
                 .push(ProcessExit { pid, exit_code });
         }
+
+        fn spawned_env(&self) -> Vec<BTreeMap<String, String>> {
+            self.inner.lock().expect("lock").spawned_env.clone()
+        }
     }
 
     impl ProcessController for FakeProcessController {
         fn spawn(
             &mut self,
             _spec: &ProcessSpec,
-            _extra_env: &BTreeMap<String, String>,
+            extra_env: &BTreeMap<String, String>,
         ) -> Result<u32, String> {
             let mut inner = self.inner.lock().expect("lock");
             if inner.fail_spawn {
                 return Err("spawn failed".to_string());
             }
+            inner.spawned_env.push(extra_env.clone());
             inner.next_pid += 1;
             let pid = inner.next_pid;
             inner.running.insert(pid);
@@ -646,6 +1019,20 @@ mod tests {
             args: vec![],
             cwd: None,
             env: BTreeMap::new(),
+        }
+    }
+
+    fn main_app_intent() -> MainAppLaunchIntent {
+        MainAppLaunchIntent {
+            process: ProcessSpec {
+                command: "foot".to_string(),
+                args: vec!["--app-id".to_string(), "surf-ace-main".to_string()],
+                cwd: None,
+                env: BTreeMap::new(),
+            },
+            binding: MainAppSurfaceBinding::AppId {
+                app_id: "surf-ace-main".to_string(),
+            },
         }
     }
 
@@ -849,11 +1236,337 @@ mod tests {
     }
 
     #[test]
+    fn shell_overlay_toggle_launches_without_claiming_attached_binding_truth() {
+        let process = FakeProcessController::default();
+        let process_view = process.clone();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            1280,
+            800,
+        );
+        state.configure_shell_overlay_process(Some(terminal_process()));
+        state.set_shell_overlay_toggle_shortcut("Super+`");
+
+        state
+            .toggle_shell_overlay()
+            .expect("shell overlay launch should succeed");
+
+        assert_eq!(
+            state
+                .status_snapshot()
+                .runtime
+                .shell_overlay_toggle_shortcut,
+            "Super+`"
+        );
+        assert_eq!(
+            state.status_snapshot().prototype_policy.active_overlay_pane,
+            Some(PaneId::new(SHELL_OVERLAY_PANE_ID))
+        );
+        assert!(matches!(
+            state.shell_overlay_lifecycle,
+            ExternalNativeLifecycleState::Launching { pid: 1 }
+        ));
+        assert_eq!(
+            state.runtime_expected_overlay_binding(),
+            Some((PaneId::new(SHELL_OVERLAY_PANE_ID), 1))
+        );
+        assert!(
+            state
+                .status_snapshot()
+                .runtime
+                .overlay_bound_pane_id
+                .is_none()
+        );
+        assert!(state.shell_overlay_focus_requested());
+        assert_eq!(
+            process_view.spawned_env(),
+            vec![BTreeMap::from([
+                ("SURF_ACE_COMPOSITOR_HOST_MODE".to_string(), "1".to_string()),
+                (
+                    "SURF_ACE_PANE_ID".to_string(),
+                    SHELL_OVERLAY_PANE_ID.to_string()
+                ),
+                ("WAYLAND_DISPLAY".to_string(), "wayland-77".to_string()),
+            ])]
+        );
+    }
+
+    #[test]
+    fn shell_overlay_bridge_requires_expected_pid_and_allows_reopen_after_exit() {
+        let process = FakeProcessController::default();
+        let process_view = process.clone();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.configure_shell_overlay_process(Some(terminal_process()));
+
+        state
+            .toggle_shell_overlay()
+            .expect("shell overlay launch should succeed");
+        assert!(!state.runtime_mark_overlay_surface_attached_for_pid(99));
+        assert!(state.runtime_mark_overlay_surface_attached_for_pid(1));
+        assert!(matches!(
+            state.shell_overlay_lifecycle,
+            ExternalNativeLifecycleState::Attached { pid: 1 }
+        ));
+
+        process_view.queue_exit(1, Some(0));
+        state.poll_processes();
+        assert!(matches!(
+            state.shell_overlay_lifecycle,
+            ExternalNativeLifecycleState::Exited {
+                pid: 1,
+                exit_code: Some(0)
+            }
+        ));
+        assert!(!state.shell_overlay_focus_requested());
+        assert!(state.runtime_expected_overlay_binding().is_none());
+        assert!(
+            state
+                .status_snapshot()
+                .runtime
+                .overlay_bound_pane_id
+                .is_none()
+        );
+
+        state
+            .toggle_shell_overlay()
+            .expect("shell overlay should reopen after exit");
+        assert!(matches!(
+            state.shell_overlay_lifecycle,
+            ExternalNativeLifecycleState::Launching { pid: 2 }
+        ));
+        assert_eq!(
+            state.runtime_expected_overlay_binding(),
+            Some((PaneId::new(SHELL_OVERLAY_PANE_ID), 2))
+        );
+    }
+
+    #[test]
+    fn shell_overlay_toggle_dismisses_cleanly_and_returns_focus_to_main_app() {
+        let process = FakeProcessController::default();
+        let process_view = process.clone();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.configure_shell_overlay_process(Some(terminal_process()));
+        state
+            .toggle_shell_overlay()
+            .expect("shell overlay launch should succeed");
+        state.set_runtime_surface_roles(Some(101), None, None);
+        state.set_runtime_focus_target(Some(RuntimeFocusTarget::OverlayNative));
+
+        state
+            .toggle_shell_overlay()
+            .expect("second toggle should dismiss shell overlay");
+
+        assert!(matches!(
+            state.shell_overlay_lifecycle,
+            ExternalNativeLifecycleState::Absent
+        ));
+        assert_eq!(process_view.terminated(), vec![1]);
+        assert!(
+            state
+                .status_snapshot()
+                .prototype_policy
+                .active_overlay_pane
+                .is_none()
+        );
+        assert!(!state.shell_overlay_focus_requested());
+        assert_eq!(
+            state.status_snapshot().runtime.active_focus_target,
+            Some(RuntimeFocusTarget::MainApp)
+        );
+    }
+
+    #[test]
+    fn main_app_launch_intent_waits_for_runtime_then_spawns_with_exact_contract_env() {
+        let process = FakeProcessController::default();
+        let process_view = process.clone();
+        let mut state = CompositorState::new(true, Box::new(process));
+
+        state
+            .select_main_app_launch_intent(main_app_intent())
+            .expect("main app intent should be accepted");
+        assert_eq!(
+            state.status_snapshot().runtime.main_app_launch_state,
+            MainAppLaunchState::WaitingForRuntime
+        );
+
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            1280,
+            800,
+        );
+
+        let runtime = state.status_snapshot().runtime;
+        assert_eq!(runtime.main_app_launch_intent, Some(main_app_intent()));
+        assert_eq!(
+            runtime.main_app_launch_state,
+            MainAppLaunchState::Launching { pid: 1 }
+        );
+        assert_eq!(runtime.main_app_surface_id, None);
+        assert_eq!(
+            process_view.spawned_env(),
+            vec![BTreeMap::from([
+                ("SURF_ACE_COMPOSITOR_HOST_MODE".to_string(), "1".to_string()),
+                ("SURF_ACE_COMPOSITOR_MAIN_APP".to_string(), "1".to_string()),
+                ("WAYLAND_DISPLAY".to_string(), "wayland-77".to_string()),
+            ])]
+        );
+        assert_eq!(
+            state.runtime_expected_main_app_binding(),
+            Some((
+                1,
+                MainAppSurfaceBinding::AppId {
+                    app_id: "surf-ace-main".to_string()
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn main_app_surface_binding_requires_expected_pid_and_tracks_detach() {
+        let process = FakeProcessController::default();
+        let process_view = process.clone();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state
+            .select_main_app_launch_intent(main_app_intent())
+            .expect("main app intent should be accepted");
+        state.mark_runtime_running(
+            RuntimeBackend::Winit,
+            Some("wayland-55".to_string()),
+            1280,
+            800,
+        );
+
+        assert!(!state.runtime_mark_main_app_surface_attached_for_pid(99));
+        assert!(state.runtime_mark_main_app_surface_attached_for_pid(1));
+        assert_eq!(
+            state.status_snapshot().runtime.main_app_launch_state,
+            MainAppLaunchState::Attached { pid: 1 }
+        );
+        assert!(state.runtime_mark_main_app_surface_detached_for_pid(1));
+        assert_eq!(
+            state.status_snapshot().runtime.main_app_launch_state,
+            MainAppLaunchState::Launching { pid: 1 }
+        );
+
+        process_view.queue_exit(1, Some(0));
+        state.poll_processes();
+        assert_eq!(
+            state.status_snapshot().runtime.main_app_launch_state,
+            MainAppLaunchState::Exited {
+                pid: 1,
+                exit_code: Some(0)
+            }
+        );
+    }
+
+    #[test]
+    fn exited_main_app_clears_main_focus_and_shell_overlay_can_open_for_recovery() {
+        let process = FakeProcessController::default();
+        let process_view = process.clone();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.configure_shell_overlay_process(Some(terminal_process()));
+        state
+            .select_main_app_launch_intent(main_app_intent())
+            .expect("main app intent should be accepted");
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-55".to_string()),
+            1280,
+            800,
+        );
+        assert!(state.runtime_mark_main_app_surface_attached_for_pid(1));
+        state.set_runtime_surface_roles(Some(101), None, None);
+        state.set_runtime_focus_target(Some(RuntimeFocusTarget::MainApp));
+
+        process_view.queue_exit(1, Some(0));
+        state.poll_processes();
+
+        let runtime = state.status_snapshot().runtime;
+        assert_eq!(
+            runtime.main_app_launch_state,
+            MainAppLaunchState::Exited {
+                pid: 1,
+                exit_code: Some(0)
+            }
+        );
+        assert!(runtime.main_app_surface_id.is_none());
+        assert!(runtime.active_focus_target.is_none());
+
+        state
+            .toggle_shell_overlay()
+            .expect("shell overlay remains available for recovery after main app exit");
+        assert!(matches!(
+            state.shell_overlay_lifecycle,
+            ExternalNativeLifecycleState::Launching { pid: 2 }
+        ));
+        assert_eq!(
+            state.runtime_expected_overlay_binding(),
+            Some((PaneId::new(SHELL_OVERLAY_PANE_ID), 2))
+        );
+        assert!(state.shell_overlay_focus_requested());
+    }
+
+    #[test]
+    fn selecting_new_main_app_intent_terminates_previous_running_process() {
+        let process = FakeProcessController::default();
+        let process_view = process.clone();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state
+            .select_main_app_launch_intent(main_app_intent())
+            .expect("main app intent should be accepted");
+        state.mark_runtime_running(
+            RuntimeBackend::Winit,
+            Some("wayland-55".to_string()),
+            1280,
+            800,
+        );
+        assert!(state.runtime_mark_main_app_surface_attached_for_pid(1));
+
+        let replacement = MainAppLaunchIntent {
+            process: ProcessSpec {
+                command: "foot".to_string(),
+                args: vec!["--app-id".to_string(), "surf-ace-next".to_string()],
+                cwd: None,
+                env: BTreeMap::new(),
+            },
+            binding: MainAppSurfaceBinding::AppId {
+                app_id: "surf-ace-next".to_string(),
+            },
+        };
+        state
+            .select_main_app_launch_intent(replacement.clone())
+            .expect("replacement main app intent should be accepted");
+
+        assert_eq!(process_view.terminated(), vec![1]);
+        assert_eq!(
+            state.status_snapshot().runtime.main_app_launch_intent,
+            Some(replacement)
+        );
+        assert_eq!(
+            state.status_snapshot().runtime.main_app_launch_state,
+            MainAppLaunchState::Launching { pid: 2 }
+        );
+        assert!(
+            state
+                .status_snapshot()
+                .runtime
+                .main_app_surface_id
+                .is_none()
+        );
+    }
+
+    #[test]
     fn runtime_status_transitions_are_explicit() {
         let process = FakeProcessController::default();
         let mut state = CompositorState::new(true, Box::new(process));
 
         state.mark_runtime_starting(RuntimeBackend::Winit);
+        state
+            .select_main_app_launch_intent(main_app_intent())
+            .expect("main app intent should be accepted");
         state.mark_runtime_running(
             RuntimeBackend::Winit,
             Some("wayland-55".to_string()),
@@ -863,7 +1576,6 @@ mod tests {
         state.mark_runtime_input_event();
         state.mark_runtime_redraw();
         state.mark_runtime_resize(1024, 600);
-        state.set_runtime_main_app_match_hint("surf");
         state.set_runtime_host_backend_snapshot(
             Some("seat0".to_string()),
             2,
@@ -871,6 +1583,7 @@ mod tests {
             Some("/dev/dri/card0".to_string()),
         );
         state.set_runtime_surface_roles(Some(101), Some(202), Some(PaneId::new("pane-1")));
+        assert!(state.runtime_mark_main_app_surface_attached_for_pid(1));
         state.set_runtime_focus_target(Some(RuntimeFocusTarget::OverlayNative));
         state.increment_runtime_denied_toplevel();
 
@@ -878,7 +1591,11 @@ mod tests {
         assert_eq!(runtime.backend, RuntimeBackend::Winit);
         assert_eq!(runtime.phase, RuntimePhase::Running);
         assert_eq!(runtime.wayland_socket.as_deref(), Some("wayland-55"));
-        assert_eq!(runtime.main_app_match_hint, "surf");
+        assert_eq!(runtime.main_app_launch_intent, Some(main_app_intent()));
+        assert_eq!(
+            runtime.main_app_launch_state,
+            MainAppLaunchState::Attached { pid: 1 }
+        );
         assert_eq!(runtime.window_width, Some(1024));
         assert_eq!(runtime.window_height, Some(600));
         assert_eq!(runtime.redraw_count, 1);
@@ -888,6 +1605,7 @@ mod tests {
         assert_eq!(runtime.host_opened_drm_device_count, 1);
         assert!(!runtime.host_output_ownership);
         assert_eq!(runtime.host_start_attempt_count, 0);
+        assert!(!runtime.host_start_request_pending);
         assert!(runtime.host_last_start_trigger.is_none());
         assert_eq!(
             runtime.host_primary_drm_path.as_deref(),
@@ -952,6 +1670,7 @@ mod tests {
         assert_eq!(runtime.host_opened_drm_device_count, 1);
         assert!(!runtime.host_output_ownership);
         assert_eq!(runtime.host_start_attempt_count, 1);
+        assert!(!runtime.host_start_request_pending);
         assert_eq!(
             runtime.host_last_start_trigger,
             Some(HostRuntimeStartTrigger::Bootstrap)
@@ -968,10 +1687,126 @@ mod tests {
 
         let runtime = state.status_snapshot().runtime;
         assert_eq!(runtime.host_start_attempt_count, 2);
+        assert!(runtime.host_start_request_pending);
         assert_eq!(
             runtime.host_last_start_trigger,
             Some(HostRuntimeStartTrigger::ControlRetry)
         );
+        assert_eq!(runtime.last_error.as_deref(), Some("forced"));
+    }
+
+    #[test]
+    fn runtime_failure_clears_stale_runtime_bindings_and_requires_operator_recovery() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            1280,
+            800,
+        );
+        state.set_runtime_surface_roles(Some(101), Some(202), Some(PaneId::new("pane-1")));
+        state.set_runtime_focus_target(Some(RuntimeFocusTarget::OverlayNative));
+        state.set_runtime_host_present_capabilities(
+            RuntimeHostPresentOwnership::DirectGbm,
+            true,
+            true,
+        );
+
+        state.mark_runtime_failed("forced");
+
+        let runtime = state.status_snapshot().runtime;
+        assert_eq!(runtime.phase, RuntimePhase::Failed);
+        assert!(runtime.runtime_operator_action_needed);
+        assert_eq!(runtime.last_error.as_deref(), Some("forced"));
+        assert!(runtime.wayland_socket.is_none());
+        assert!(runtime.window_width.is_none());
+        assert!(runtime.window_height.is_none());
+        assert!(runtime.main_app_surface_id.is_none());
+        assert!(runtime.overlay_surface_id.is_none());
+        assert!(runtime.overlay_bound_pane_id.is_none());
+        assert!(runtime.active_focus_target.is_none());
+        assert_eq!(
+            runtime.host_present_ownership,
+            RuntimeHostPresentOwnership::None
+        );
+    }
+
+    #[test]
+    fn runtime_starting_clears_pending_retry_but_preserves_last_failure_until_running() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.mark_runtime_failed("forced");
+        state.mark_host_runtime_start_requested(HostRuntimeStartTrigger::ControlRetry);
+
+        state.mark_runtime_starting(RuntimeBackend::HostDrm);
+
+        let runtime = state.status_snapshot().runtime;
+        assert_eq!(runtime.phase, RuntimePhase::Starting);
+        assert!(!runtime.host_start_request_pending);
+        assert_eq!(runtime.last_error.as_deref(), Some("forced"));
+        assert!(!runtime.runtime_operator_action_needed);
+    }
+
+    #[test]
+    fn host_preflight_ready_preserves_last_failure_until_running() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.mark_runtime_failed("forced");
+        state.mark_host_runtime_start_requested(HostRuntimeStartTrigger::ControlRetry);
+        state.mark_runtime_starting(RuntimeBackend::HostDrm);
+
+        state.mark_runtime_host_preflight_ready(Some("wayland-77".to_string()));
+
+        let runtime = state.status_snapshot().runtime;
+        assert_eq!(runtime.phase, RuntimePhase::PreflightReady);
+        assert_eq!(runtime.wayland_socket.as_deref(), Some("wayland-77"));
+        assert_eq!(runtime.last_error.as_deref(), Some("forced"));
+        assert!(!runtime.host_start_request_pending);
+        assert!(!runtime.host_output_ownership);
+        assert!(!runtime.runtime_operator_action_needed);
+
+        state.mark_runtime_host_running(
+            "wayland-77".to_string(),
+            1280,
+            800,
+            Some("seat0".to_string()),
+            2,
+            1,
+            Some("/dev/dri/card0".to_string()),
+            Some("HDMI-A-1".to_string()),
+            Some(7),
+            Some("selected connector HDMI-A-1".to_string()),
+            Some("claimed output ownership on HDMI-A-1".to_string()),
+            RuntimeHostPresentOwnership::DirectGbm,
+            true,
+            true,
+        );
+
+        let runtime = state.status_snapshot().runtime;
+        assert_eq!(runtime.phase, RuntimePhase::Running);
+        assert_eq!(runtime.last_error, None);
+        assert!(runtime.host_output_ownership);
+        assert_eq!(runtime.host_seat_name.as_deref(), Some("seat0"));
+        assert_eq!(
+            runtime.host_primary_drm_path.as_deref(),
+            Some("/dev/dri/card0")
+        );
+        assert_eq!(
+            runtime.host_active_connector_name.as_deref(),
+            Some("HDMI-A-1")
+        );
+        assert_eq!(runtime.host_active_connector_id, Some(7));
+        assert_eq!(
+            runtime.host_last_selection_result.as_deref(),
+            Some("claimed output ownership on HDMI-A-1")
+        );
+        assert_eq!(
+            runtime.host_present_ownership,
+            RuntimeHostPresentOwnership::DirectGbm
+        );
+        assert!(runtime.host_atomic_commit_enabled);
+        assert!(runtime.host_overlay_plane_capable);
     }
 
     #[test]

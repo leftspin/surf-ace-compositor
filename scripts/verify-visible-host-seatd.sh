@@ -17,8 +17,9 @@ usage() {
 Usage: verify-visible-host-seatd.sh [--socket-path <path>] [--evidence-dir <dir>] [--timeout-seconds <n>]
 
 Launches the compositor through the seatd host launcher, waits for running state,
-applies 90-degree CCW output rotation, starts a fullscreen visible Wayland demo,
-and keeps the session live for human verification.
+applies 90-degree CCW output rotation, selects a fullscreen visible Wayland demo
+through the compositor control surface's exact main-app launch contract, and keeps
+the session live for human verification.
 USAGE
 }
 
@@ -212,36 +213,43 @@ gcc -std=c11 -O2 -Wall -Wextra \
   -o "$DEMO_BIN" \
   $(pkg-config --cflags --libs wayland-client)
 
-UID_VALUE="$(id -u)"
-XDG_RUNTIME_DIR_VALUE="${XDG_RUNTIME_DIR:-/run/user/$UID_VALUE}"
-if [[ ! -d "$XDG_RUNTIME_DIR_VALUE" ]]; then
-  echo "missing XDG runtime dir: $XDG_RUNTIME_DIR_VALUE" >&2
+MAIN_APP_LAUNCH_INTENT_JSON="$(
+  jq -nc \
+    --arg command "$DEMO_BIN" \
+    '{
+      process: {
+        command: $command,
+        args: [],
+        env: {}
+      },
+      binding: {
+        kind: "app_id",
+        app_id: "surf-ace-demo"
+      }
+    }'
+)"
+printf '%s\n' "$MAIN_APP_LAUNCH_INTENT_JSON" >"$EVIDENCE_DIR/main_app_launch_intent.json"
+
+main_app_response="$("$CONTROL_BIN" ctl --socket-path "$SOCKET_PATH" --request-json "{\"type\":\"set_main_app_launch_intent\",\"intent\":$MAIN_APP_LAUNCH_INTENT_JSON}")"
+printf '%s\n' "$main_app_response" >"$EVIDENCE_DIR/main_app_launch_response.json"
+if [[ "$(printf '%s\n' "$main_app_response" | jq -r '.ok // false')" != "true" ]]; then
+  echo "main-app launch-intent request failed: $main_app_response" >&2
   exit 1
 fi
-
-echo "starting visible demo on WAYLAND_DISPLAY=$wayland_socket"
-env XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR_VALUE" WAYLAND_DISPLAY="$wayland_socket" \
-  "$DEMO_BIN" >"$DEMO_LOG" 2>&1 &
-DEMO_PID="$!"
-echo "demo_pid=$DEMO_PID"
 
 demo_bound="false"
 deadline=$((SECONDS + 15))
 while (( SECONDS < deadline )); do
-  if ! kill -0 "$DEMO_PID" >/dev/null 2>&1; then
-    echo "visible demo exited unexpectedly; see $DEMO_LOG" >&2
-    tail -n 40 "$DEMO_LOG" >&2 || true
-    exit 1
-  fi
-
   status_json="$("$CONTROL_BIN" ctl --socket-path "$SOCKET_PATH" --request-json '{"type":"get_status"}')"
   printf '%s\n' "$status_json" >"$EVIDENCE_DIR/status_after_demo_latest.json"
 
   phase="$(printf '%s\n' "$status_json" | jq -r '.status.runtime.phase // empty')"
   rotation="$(printf '%s\n' "$status_json" | jq -r '.status.output_rotation // empty')"
   main_app_surface_id="$(printf '%s\n' "$status_json" | jq -r '.status.runtime.main_app_surface_id // empty')"
+  main_app_state="$(printf '%s\n' "$status_json" | jq -r '.status.runtime.main_app_launch_state.state // empty')"
+  DEMO_PID="$(printf '%s\n' "$status_json" | jq -r '.status.runtime.main_app_launch_state.pid // empty')"
 
-  if [[ "$phase" == "running" && "$rotation" == "deg90" && -n "$main_app_surface_id" && "$main_app_surface_id" != "null" ]]; then
+  if [[ "$phase" == "running" && "$rotation" == "deg90" && "$main_app_state" == "attached" && -n "$main_app_surface_id" && "$main_app_surface_id" != "null" ]]; then
     printf '%s\n' "$status_json" >"$EVIDENCE_DIR/status_visible_ready.json"
     demo_bound="true"
     break
@@ -260,7 +268,7 @@ phase=running
 output_rotation=deg90
 wayland_socket=$wayland_socket
 compositor_pid=$COMPOSITOR_PID
-demo_pid=$DEMO_PID
+main_app_pid=$DEMO_PID
 evidence_dir=$EVIDENCE_DIR
 SUMMARY
 
@@ -269,12 +277,12 @@ echo "summary: $EVIDENCE_DIR/summary.txt"
 echo "press Ctrl-C to stop compositor + demo"
 
 while true; do
-  if ! kill -0 "$COMPOSITOR_PID" >/dev/null 2>&1; then
+  if [[ "$STARTED_COMPOSITOR" == "true" && -n "$COMPOSITOR_PID" ]] && ! kill -0 "$COMPOSITOR_PID" >/dev/null 2>&1; then
     echo "compositor exited; see $COMPOSITOR_LOG" >&2
     exit 1
   fi
-  if ! kill -0 "$DEMO_PID" >/dev/null 2>&1; then
-    echo "demo exited; see $DEMO_LOG" >&2
+  if [[ -n "$DEMO_PID" ]] && ! kill -0 "$DEMO_PID" >/dev/null 2>&1; then
+    echo "demo exited; see latest status under $EVIDENCE_DIR" >&2
     exit 1
   fi
   sleep 1

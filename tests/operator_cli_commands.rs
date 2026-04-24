@@ -161,3 +161,149 @@ fn capture_command_sends_capture_request_and_reports_path() {
     let _ = fs::remove_file(&capture_path);
     server.join().expect("server should finish");
 }
+
+#[test]
+fn ctl_command_passes_exact_main_app_launch_intent_request_through() {
+    let socket_path = unique_temp_path("surf-ace-main-app-ctl-command", ".sock");
+    let server = serve_single_request(&socket_path, |request| {
+        assert_eq!(
+            request,
+            json!({
+                "type": "set_main_app_launch_intent",
+                "intent": {
+                    "process": {
+                        "command": "foot",
+                        "args": ["--app-id", "surf-ace-demo"]
+                    },
+                    "binding": {
+                        "kind": "app_id",
+                        "app_id": "surf-ace-demo"
+                    }
+                }
+            })
+        );
+        json!({
+            "ok": true,
+            "status": {
+                "host_mode_active": true,
+                "output_rotation": "deg0",
+                "panes": [],
+                "prototype_policy": {},
+                "runtime": {
+                    "backend": "none",
+                    "phase": "inactive",
+                    "runtime_selection_mode": "automatic",
+                    "runtime_operator_action_needed": false,
+                    "main_app_launch_intent": {
+                        "process": {
+                            "command": "foot",
+                            "args": ["--app-id", "surf-ace-demo"]
+                        },
+                        "binding": {
+                            "kind": "app_id",
+                            "app_id": "surf-ace-demo"
+                        }
+                    },
+                    "main_app_launch_state": {
+                        "state": "waiting_for_runtime"
+                    },
+                    "shell_overlay_toggle_shortcut": "Super+`",
+                    "redraw_count": 0,
+                    "input_event_count": 0,
+                    "host_detected_drm_device_count": 0,
+                    "host_opened_drm_device_count": 0,
+                    "host_output_ownership": false,
+                    "host_start_attempt_count": 0,
+                    "host_start_request_pending": false,
+                    "host_device_selection_state": "automatic",
+                    "host_output_selection_state": "automatic",
+                    "host_present_ownership": "none",
+                    "host_atomic_commit_enabled": false,
+                    "host_overlay_plane_capable": false,
+                    "host_last_queued_present_source": "none",
+                    "host_last_queued_atomic_commit": false,
+                    "host_last_queued_overlay_plane": false,
+                    "dmabuf_protocol_enabled": false,
+                    "denied_toplevel_count": 0
+                }
+            }
+        })
+    });
+
+    wait_for_socket(&socket_path);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_surf-ace-compositor"))
+        .args([
+            "ctl",
+            "--socket-path",
+            socket_path
+                .to_str()
+                .expect("socket path should be valid UTF-8"),
+            "--request-json",
+            "{\"type\":\"set_main_app_launch_intent\",\"intent\":{\"process\":{\"command\":\"foot\",\"args\":[\"--app-id\",\"surf-ace-demo\"]},\"binding\":{\"kind\":\"app_id\",\"app_id\":\"surf-ace-demo\"}}}",
+        ])
+        .output()
+        .expect("ctl command should run");
+
+    assert!(
+        output.status.success(),
+        "ctl command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = serde_json::from_slice::<Value>(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(
+        stdout["status"]["runtime"]["main_app_launch_state"]["state"],
+        Value::String("waiting_for_runtime".to_string())
+    );
+
+    server.join().expect("server should finish");
+}
+
+#[test]
+fn ctl_launch_shorthand_sends_main_app_launch_intent_request() {
+    let socket_path = unique_temp_path("surf-ace-ctl-launch-command", ".sock");
+    let server = serve_single_request(&socket_path, |request| {
+        assert_eq!(
+            request,
+            json!({
+                "type": "set_main_app_launch_intent",
+                "intent": {
+                    "process": {
+                        "command": "ghostty",
+                        "args": ["--class=surf-ace-main-app", "-e", "top"]
+                    },
+                    "binding": {
+                        "kind": "app_id",
+                        "app_id": "surf-ace-main-app"
+                    }
+                }
+            })
+        );
+        json!({ "ok": true })
+    });
+
+    wait_for_socket(&socket_path);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_surf-ace-compositor"))
+        .args([
+            "ctl",
+            "--socket-path",
+            socket_path
+                .to_str()
+                .expect("socket path should be valid UTF-8"),
+            "--launch",
+            "ghostty -e top",
+        ])
+        .output()
+        .expect("ctl launch command should run");
+
+    assert!(
+        output.status.success(),
+        "ctl launch command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = serde_json::from_slice::<Value>(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(stdout, json!({ "ok": true }));
+
+    server.join().expect("server should finish");
+}

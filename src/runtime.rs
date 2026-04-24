@@ -1,7 +1,7 @@
 use crate::model::{
-    OutputRotation, RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeFocusTarget,
-    RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource, RuntimeHostSelectionState,
-    RuntimeSelectionMode,
+    MainAppSurfaceBindingMatch, OutputRotation, RuntimeBackend, RuntimeDmabufFormatStatus,
+    RuntimeFocusTarget, RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource,
+    RuntimeHostSelectionState, RuntimeSelectionMode,
 };
 use crate::output_rotation_model::OutputRotationModel;
 use crate::screen_capture::ScreenCaptureStore;
@@ -15,7 +15,7 @@ use smithay::backend::allocator::{
     dmabuf::{AsDmabuf, Dmabuf},
 };
 use smithay::backend::drm::gbm::{GbmFramebuffer, framebuffer_from_bo};
-use smithay::backend::drm::{DrmDeviceFd, DrmNode};
+use smithay::backend::drm::{DrmDeviceFd, DrmNode, NodeType};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
@@ -46,7 +46,7 @@ use smithay::delegate_output;
 use smithay::delegate_seat;
 use smithay::delegate_shm;
 use smithay::delegate_xdg_shell;
-use smithay::input::keyboard::FilterResult;
+use smithay::input::keyboard::{FilterResult, Keysym, ModifiersState, keysyms, xkb};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{
@@ -69,7 +69,9 @@ use smithay::reexports::drm::{
     },
 };
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
-use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
+use smithay::reexports::wayland_server::backend::{
+    ClientData, ClientId, DisconnectReason, ObjectId,
+};
 use smithay::reexports::wayland_server::protocol::wl_buffer;
 use smithay::reexports::wayland_server::protocol::wl_seat;
 use smithay::reexports::wayland_server::protocol::wl_shm;
@@ -101,6 +103,7 @@ use smithay::wayland::shm::{BufferAccessError, ShmHandler, ShmState, with_buffer
 use smithay::wayland::socket::ListeningSocketSource;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsFd, BorrowedFd};
 use std::path::{Path, PathBuf};
@@ -148,6 +151,109 @@ impl RuntimeSelectionReport {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellOverlayToggleShortcut {
+    normalized: String,
+    keysym: Keysym,
+}
+
+impl ShellOverlayToggleShortcut {
+    pub fn display_string(&self) -> String {
+        self.normalized.clone()
+    }
+
+    fn matches(&self, modifiers: &ModifiersState, raw_syms: &[Keysym]) -> bool {
+        modifiers.logo
+            && !modifiers.ctrl
+            && !modifiers.alt
+            && raw_syms.iter().copied().any(|sym| sym == self.keysym)
+    }
+}
+
+fn format_shell_overlay_raw_syms(raw_syms: &[Keysym]) -> String {
+    if raw_syms.is_empty() {
+        return "<none>".to_string();
+    }
+
+    raw_syms
+        .iter()
+        .map(|sym| {
+            let name = xkb::keysym_get_name(*sym);
+            if name.is_empty() {
+                "NoSymbol".to_string()
+            } else {
+                name
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_shell_overlay_modifiers(modifiers: &ModifiersState) -> String {
+    format!(
+        "logo={} ctrl={} alt={} shift={} caps_lock={} num_lock={} iso_level3_shift={} iso_level5_shift={}",
+        modifiers.logo,
+        modifiers.ctrl,
+        modifiers.alt,
+        modifiers.shift,
+        modifiers.caps_lock,
+        modifiers.num_lock,
+        modifiers.iso_level3_shift,
+        modifiers.iso_level5_shift,
+    )
+}
+
+pub fn parse_shell_overlay_toggle_shortcut(
+    value: &str,
+) -> Result<ShellOverlayToggleShortcut, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("shortcut must not be empty".to_string());
+    }
+
+    let parts: Vec<_> = trimmed.split('+').map(str::trim).collect();
+    if parts.len() != 2 {
+        return Err(format!(
+            "shortcut must use the form Super+<keysym>; got '{trimmed}'"
+        ));
+    }
+    if !matches!(
+        parts[0].to_ascii_lowercase().as_str(),
+        "super" | "logo" | "meta" | "win"
+    ) {
+        return Err(format!(
+            "shortcut modifier must be Super; got '{}'",
+            parts[0]
+        ));
+    }
+
+    let key_name = match parts[1] {
+        "`" => "grave".to_string(),
+        other => other.to_string(),
+    };
+    let keysym = {
+        let exact = xkb::keysym_from_name(&key_name, xkb::KEYSYM_NO_FLAGS);
+        if exact != Keysym::NoSymbol {
+            exact
+        } else {
+            xkb::keysym_from_name(&key_name, xkb::KEYSYM_CASE_INSENSITIVE)
+        }
+    };
+    if keysym == Keysym::NoSymbol {
+        return Err(format!("unknown shell overlay shortcut key '{}'", parts[1]));
+    }
+
+    let normalized_key = if keysym == Keysym::new(keysyms::KEY_grave) {
+        "`".to_string()
+    } else {
+        xkb::keysym_get_name(keysym)
+    };
+    Ok(ShellOverlayToggleShortcut {
+        normalized: format!("Super+{normalized_key}"),
+        keysym,
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     #[error("failed to create calloop event loop: {0}")]
@@ -180,6 +286,111 @@ pub enum RuntimeError {
     RegisterSource(String),
     #[error("runtime loop failed: {0}")]
     Loop(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostRuntimeTestScriptedFailurePhase {
+    Starting,
+    PreflightReady,
+    Running,
+}
+
+fn host_runtime_test_scripted_failure_phase() -> Option<HostRuntimeTestScriptedFailurePhase> {
+    let value = std::env::var("SURF_ACE_HOST_RUNTIME_TEST_SCRIPTED_PHASE")
+        .ok()
+        .or_else(|| std::env::var("SURF_ACE_HOST_RUNTIME_TEST_SCRIPTED_FAILURE_PHASE").ok())?;
+    match value.trim() {
+        "starting" => Some(HostRuntimeTestScriptedFailurePhase::Starting),
+        "preflight_ready" => Some(HostRuntimeTestScriptedFailurePhase::PreflightReady),
+        "running" => Some(HostRuntimeTestScriptedFailurePhase::Running),
+        _ => None,
+    }
+}
+
+fn host_runtime_test_scripted_phase(
+    shared_state: &Arc<Mutex<CompositorState>>,
+) -> Option<HostRuntimeTestScriptedFailurePhase> {
+    if let Ok(phases) = std::env::var("SURF_ACE_HOST_RUNTIME_TEST_SCRIPTED_PHASES") {
+        let attempt = {
+            let state = lock_state(shared_state);
+            state.status_snapshot().runtime.host_start_attempt_count
+        };
+        let attempt_index = usize::try_from(attempt.saturating_sub(1)).ok()?;
+        let phase = phases
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .nth(attempt_index)?;
+        return match phase {
+            "starting" => Some(HostRuntimeTestScriptedFailurePhase::Starting),
+            "preflight_ready" => Some(HostRuntimeTestScriptedFailurePhase::PreflightReady),
+            "running" => Some(HostRuntimeTestScriptedFailurePhase::Running),
+            _ => None,
+        };
+    }
+
+    host_runtime_test_scripted_failure_phase()
+}
+
+fn host_runtime_test_scripted_hold_duration() -> Duration {
+    std::env::var("SURF_ACE_HOST_RUNTIME_TEST_SCRIPTED_HOLD_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_default()
+}
+
+fn maybe_sleep_host_runtime_test_scripted_hold() {
+    let hold_duration = host_runtime_test_scripted_hold_duration();
+    if !hold_duration.is_zero() {
+        std::thread::sleep(hold_duration);
+    }
+}
+
+fn run_host_test_scripted_running(
+    shared_state: Arc<Mutex<CompositorState>>,
+) -> Result<(), RuntimeError> {
+    const SCRIPTED_WAYLAND_SOCKET: &str = "wayland-test-running";
+    const SCRIPTED_SEAT_NAME: &str = "seat-test";
+    const SCRIPTED_DRM_PATH: &str = "/dev/dri/card-test";
+    const SCRIPTED_CONNECTOR_NAME: &str = "TEST-1";
+    const SCRIPTED_CONNECTOR_ID: u32 = 7;
+    const SCRIPTED_WIDTH: i32 = 1280;
+    const SCRIPTED_HEIGHT: i32 = 800;
+
+    {
+        let mut state = lock_state(&shared_state);
+        state.set_runtime_host_backend_snapshot(
+            Some(SCRIPTED_SEAT_NAME.to_string()),
+            1,
+            1,
+            Some(SCRIPTED_DRM_PATH.to_string()),
+        );
+        state.mark_runtime_host_preflight_ready(Some(SCRIPTED_WAYLAND_SOCKET.to_string()));
+    }
+    maybe_sleep_host_runtime_test_scripted_hold();
+
+    {
+        let mut state = lock_state(&shared_state);
+        state.mark_runtime_host_running(
+            SCRIPTED_WAYLAND_SOCKET.to_string(),
+            SCRIPTED_WIDTH,
+            SCRIPTED_HEIGHT,
+            Some(SCRIPTED_SEAT_NAME.to_string()),
+            1,
+            1,
+            Some(SCRIPTED_DRM_PATH.to_string()),
+            Some(SCRIPTED_CONNECTOR_NAME.to_string()),
+            Some(SCRIPTED_CONNECTOR_ID),
+            Some("scripted host runtime selected test connector".to_string()),
+            Some("scripted host runtime claimed output ownership".to_string()),
+            RuntimeHostPresentOwnership::Dumb,
+            false,
+            false,
+        );
+    }
+    maybe_sleep_host_runtime_test_scripted_hold();
+    Ok(())
 }
 
 pub fn run_winit(shared_state: Arc<Mutex<CompositorState>>) -> Result<(), RuntimeError> {
@@ -352,6 +563,30 @@ pub fn run_host(
         state.mark_runtime_starting(RuntimeBackend::HostDrm);
     }
 
+    match host_runtime_test_scripted_phase(&shared_state) {
+        Some(HostRuntimeTestScriptedFailurePhase::Starting) => {
+            maybe_sleep_host_runtime_test_scripted_hold();
+            return Err(RuntimeError::HostSession(
+                "scripted host runtime failure after starting".to_string(),
+            ));
+        }
+        Some(HostRuntimeTestScriptedFailurePhase::PreflightReady) => {
+            {
+                let mut state = lock_state(&shared_state);
+                state.mark_runtime_host_preflight_ready(Some("wayland-test-preflight".to_string()));
+            }
+            maybe_sleep_host_runtime_test_scripted_hold();
+            return Err(RuntimeError::HostOutputClaim {
+                path: "<test-scripted-host-runtime>".to_string(),
+                error: "scripted host runtime failure after preflight_ready".to_string(),
+            });
+        }
+        Some(HostRuntimeTestScriptedFailurePhase::Running) => {
+            return run_host_test_scripted_running(shared_state);
+        }
+        None => {}
+    }
+
     if std::env::var_os("SURF_ACE_HOST_RUNTIME_FORCE_FAIL").is_some() {
         return Err(RuntimeError::HostSession(
             "forced host runtime failure".to_string(),
@@ -502,23 +737,28 @@ pub fn run_host(
     wayland_state.reconfigure_roles(mode_w as i32, mode_h as i32);
     wayland_state.sync_runtime_status_with_roles();
     {
+        let (active_connector_name, active_connector_id) = host_backend.active_connector_status();
+        let (last_selection_attempt, last_selection_result) = host_backend.selection_logs();
+        let rotation = { lock_state(&shared_state).output_rotation() };
+        let (ownership, atomic_enabled, overlay_capable) =
+            runtime_host_present_capabilities_for_status(&host_backend, rotation);
         let mut state = lock_state(&shared_state);
-        state.mark_runtime_running(
-            RuntimeBackend::HostDrm,
-            Some(socket_name.clone()),
+        state.mark_runtime_host_running(
+            socket_name.clone(),
             mode_w as i32,
             mode_h as i32,
-        );
-        state.set_runtime_host_backend_snapshot(
             Some(host_backend.seat_name.clone()),
             host_backend.detected_count(),
             host_backend.opened_count(),
             host_backend.primary_opened_path(),
+            active_connector_name,
+            active_connector_id,
+            last_selection_attempt,
+            last_selection_result,
+            ownership,
+            atomic_enabled,
+            overlay_capable,
         );
-        let (ownership, atomic_enabled, overlay_capable) = host_backend
-            .claimed_present_capabilities()
-            .unwrap_or((RuntimeHostPresentOwnership::None, false, false));
-        state.set_runtime_host_present_capabilities(ownership, atomic_enabled, overlay_capable);
     }
 
     let drm_events_source_token = Rc::new(RefCell::new(None));
@@ -787,6 +1027,16 @@ fn sync_runtime_host_present_capabilities(
     host_backend: &HostBackendState,
 ) {
     let rotation = { lock_state(shared_state).output_rotation() };
+    let (ownership, atomic_enabled, overlay_capable) =
+        runtime_host_present_capabilities_for_status(host_backend, rotation);
+    let mut state = lock_state(shared_state);
+    state.set_runtime_host_present_capabilities(ownership, atomic_enabled, overlay_capable);
+}
+
+fn runtime_host_present_capabilities_for_status(
+    host_backend: &HostBackendState,
+    rotation: OutputRotation,
+) -> (RuntimeHostPresentOwnership, bool, bool) {
     let (mut ownership, atomic_enabled, overlay_capable) = host_backend
         .claimed_present_capabilities()
         .unwrap_or((RuntimeHostPresentOwnership::None, false, false));
@@ -795,8 +1045,7 @@ fn sync_runtime_host_present_capabilities(
     {
         ownership = RuntimeHostPresentOwnership::Dumb;
     }
-    let mut state = lock_state(shared_state);
-    state.set_runtime_host_present_capabilities(ownership, atomic_enabled, overlay_capable);
+    (ownership, atomic_enabled, overlay_capable)
 }
 
 fn sync_runtime_host_selection_status(
@@ -953,7 +1202,9 @@ struct ClaimedPresentationPipeline {
 }
 
 struct HostGlesRendererState {
-    _gbm_device: GbmDevice<DeviceFd>,
+    render_node: DrmNode,
+    _render_gbm_device: GbmDevice<DeviceFd>,
+    _scanout_gbm_device: GbmDevice<DeviceFd>,
     _drm_device_fd: DrmDeviceFd,
     _egl_display: EGLDisplay,
     renderer: GlesRenderer,
@@ -1528,7 +1779,7 @@ impl HostBackendState {
         let pipeline = opened.claimed_pipeline.as_ref()?;
         let gles = pipeline.gles_renderer.as_ref()?;
         Some((
-            opened.node,
+            gles.render_node,
             gles.renderer.dmabuf_formats().iter().copied().collect(),
         ))
     }
@@ -2821,6 +3072,7 @@ fn claim_output_on_device(
 
     let gles_renderer = match build_host_gles_renderer_state(
         &opened.fd,
+        opened.node,
         &opened.path,
         plan.mode.size(),
         primary_scanout_format,
@@ -3033,6 +3285,7 @@ fn ensure_dumb_fallback_buffers(
 
 fn build_host_gles_renderer_state(
     fd: &OwnedFd,
+    scanout_node: DrmNode,
     device_path: &Path,
     mode_size: (u16, u16),
     primary_scanout_format: DrmFourcc,
@@ -3045,19 +3298,79 @@ fn build_host_gles_renderer_state(
         error: format!("failed to duplicate drm fd for framebuffer export: {err}"),
     })?;
     let drm_device_fd = DrmDeviceFd::new(DeviceFd::from(drm_fd));
-    let render_fd = dup(fd.as_fd()).map_err(|err| RuntimeError::HostOutputClaim {
+    let scanout_fd = dup(fd.as_fd()).map_err(|err| RuntimeError::HostOutputClaim {
         path: device_path.display().to_string(),
-        error: format!("failed to duplicate drm fd for gbm/egl renderer: {err}"),
+        error: format!("failed to duplicate drm fd for gbm scanout allocation: {err}"),
     })?;
-    let gbm_device =
-        GbmDevice::new(DeviceFd::from(render_fd)).map_err(|err| RuntimeError::HostOutputClaim {
-            path: device_path.display().to_string(),
-            error: format!("failed to create gbm device: {err}"),
-        })?;
-    let egl_display = unsafe { EGLDisplay::new(gbm_device.clone()) }.map_err(|err| {
+    let scanout_gbm_device = GbmDevice::new(DeviceFd::from(scanout_fd)).map_err(|err| {
         RuntimeError::HostOutputClaim {
             path: device_path.display().to_string(),
-            error: format!("failed to create egl display for gbm device: {err}"),
+            error: format!("failed to create gbm scanout device: {err}"),
+        }
+    })?;
+
+    let (render_fd, render_node, render_path) = match scanout_node.node_with_type(NodeType::Render)
+    {
+        Some(render_node_result) => {
+            let render_node = render_node_result.map_err(|err| RuntimeError::HostOutputClaim {
+                path: device_path.display().to_string(),
+                error: format!("failed to resolve render node for {}: {err}", scanout_node),
+            })?;
+            let render_path =
+                render_node
+                    .dev_path()
+                    .ok_or_else(|| RuntimeError::HostOutputClaim {
+                        path: device_path.display().to_string(),
+                        error: format!("resolved render node {} has no device path", render_node),
+                    })?;
+            let render_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&render_path)
+                .map_err(|err| {
+                    let hint = if err.kind() == std::io::ErrorKind::PermissionDenied {
+                        "; grant the compositor user access to the render node (for example via the render group or a logind ACL)"
+                    } else {
+                        ""
+                    };
+                    RuntimeError::HostOutputClaim {
+                        path: device_path.display().to_string(),
+                        error: format!(
+                            "failed to open render node {} for gbm/egl renderer: {err}{}",
+                            render_path.display(),
+                            hint
+                        ),
+                    }
+                })?;
+            (render_file.into(), render_node, render_path)
+        }
+        None => {
+            let render_fd = dup(fd.as_fd()).map_err(|err| RuntimeError::HostOutputClaim {
+                path: device_path.display().to_string(),
+                error: format!("failed to duplicate drm fd for gbm/egl renderer: {err}"),
+            })?;
+            let render_path = scanout_node
+                .dev_path()
+                .unwrap_or_else(|| device_path.to_path_buf());
+            (render_fd, scanout_node, render_path)
+        }
+    };
+
+    let render_gbm_device =
+        GbmDevice::new(DeviceFd::from(render_fd)).map_err(|err| RuntimeError::HostOutputClaim {
+            path: device_path.display().to_string(),
+            error: format!(
+                "failed to create gbm device on {}: {err}",
+                render_path.display()
+            ),
+        })?;
+    let egl_display = unsafe { EGLDisplay::new(render_gbm_device.clone()) }.map_err(|err| {
+        RuntimeError::HostOutputClaim {
+            path: device_path.display().to_string(),
+            error: format!(
+                "failed to create egl display for gbm device on {}: {err}",
+                render_path.display()
+            ),
         }
     })?;
     let egl_context =
@@ -3084,7 +3397,7 @@ fn build_host_gles_renderer_state(
         })?;
     let direct_scanout = match build_host_direct_scanout_state(
         &drm_device_fd,
-        &gbm_device,
+        &scanout_gbm_device,
         device_path,
         size,
         primary_scanout_format,
@@ -3100,7 +3413,9 @@ fn build_host_gles_renderer_state(
     };
 
     Ok(HostGlesRendererState {
-        _gbm_device: gbm_device,
+        render_node,
+        _render_gbm_device: render_gbm_device,
+        _scanout_gbm_device: scanout_gbm_device,
         _drm_device_fd: drm_device_fd,
         _egl_display: egl_display,
         renderer,
@@ -3200,7 +3515,7 @@ fn ensure_direct_scanout_state(
     }
     let state = build_host_direct_scanout_state(
         &gles_state._drm_device_fd,
-        &gles_state._gbm_device,
+        &gles_state._scanout_gbm_device,
         device_path,
         size,
         gles_state.primary_scanout_format,
@@ -3222,7 +3537,7 @@ fn ensure_overlay_scanout_state(
         return Ok(());
     }
     let gbm_buffer = gles_state
-        ._gbm_device
+        ._scanout_gbm_device
         .create_buffer_object(
             size.w.max(1) as u32,
             size.h.max(1) as u32,
@@ -3719,14 +4034,17 @@ fn ensure_gles_render_target_size(
     Ok(())
 }
 
-fn render_elements_to_texture(
+fn render_elements_to_texture<E>(
     renderer: &mut GlesRenderer,
     device_path: &Path,
     target_texture: &mut GlesTexture,
     render_size: Size<i32, Physical>,
-    elements: &[WaylandSurfaceRenderElement<GlesRenderer>],
+    elements: &[E],
     target_name: &str,
-) -> Result<(), RuntimeError> {
+) -> Result<(), RuntimeError>
+where
+    E: smithay::backend::renderer::element::RenderElement<GlesRenderer>,
+{
     let damage = Rectangle::from_size(render_size);
     let mut render_target =
         renderer
@@ -3977,9 +4295,10 @@ struct RuntimeWaylandState {
     popups: Vec<ManagedPopup>,
     pointer_location: Point<f64, Logical>,
     start_time: std::time::Instant,
-    host_surface_buffers: HashMap<u32, SurfaceBufferSnapshot>,
+    host_surface_buffers: HashMap<ObjectId, SurfaceBufferSnapshot>,
     backend_output_size: Size<i32, Physical>,
     applied_output_rotation: OutputRotation,
+    shell_overlay_toggle_shortcut: ShellOverlayToggleShortcut,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4016,8 +4335,9 @@ impl RenderElementCapture {
     }
 
     fn primary_plane_slice(&self) -> &[WaylandSurfaceRenderElement<GlesRenderer>] {
-        let end = self.counts.main + self.counts.main_popups;
-        &self.elements[..end]
+        // Render elements are stored top-to-bottom for Smithay's occlusion pass.
+        let start = self.counts.overlay_popups + self.counts.overlay;
+        &self.elements[start..]
     }
 }
 
@@ -4203,7 +4523,7 @@ impl RuntimeWaylandState {
     }
 
     fn new(display_handle: DisplayHandle, shared_state: Arc<Mutex<CompositorState>>) -> Self {
-        let (backend_output_size, applied_output_rotation) = {
+        let (backend_output_size, applied_output_rotation, shell_overlay_toggle_shortcut) = {
             let state = lock_state(&shared_state);
             let width = state
                 .status_snapshot()
@@ -4217,9 +4537,20 @@ impl RuntimeWaylandState {
                 .window_height
                 .unwrap_or(800)
                 .max(1);
+            let shell_overlay_toggle_shortcut = parse_shell_overlay_toggle_shortcut(
+                &state
+                    .status_snapshot()
+                    .runtime
+                    .shell_overlay_toggle_shortcut,
+            )
+            .unwrap_or_else(|_| {
+                parse_shell_overlay_toggle_shortcut("Super+`")
+                    .expect("default shell overlay shortcut must remain valid")
+            });
             (
                 Size::<i32, Physical>::from((width, height)),
                 state.output_rotation(),
+                shell_overlay_toggle_shortcut,
             )
         };
         let compositor_state = SmithayCompositorState::new::<Self>(&display_handle);
@@ -4267,6 +4598,7 @@ impl RuntimeWaylandState {
             host_surface_buffers: HashMap::new(),
             backend_output_size,
             applied_output_rotation,
+            shell_overlay_toggle_shortcut,
         };
         state.sync_output_state();
         state.sync_runtime_dmabuf_protocol_status();
@@ -4407,14 +4739,41 @@ impl RuntimeWaylandState {
                 self.apply_focus_route();
                 let serial = SERIAL_COUNTER.next_serial();
                 if let Some(keyboard) = self.seat.get_keyboard() {
-                    keyboard.input::<(), _>(
+                    let intercepted = keyboard.input::<bool, _>(
                         self,
                         event.key_code(),
                         event.state(),
                         serial,
                         event.time_msec(),
-                        |_, _, _| FilterResult::Forward,
+                        |data, modifiers, handle| {
+                            let raw_syms = handle.raw_syms();
+                            let is_pressed =
+                                event.state() == smithay::backend::input::KeyState::Pressed;
+                            let matched = data
+                                .shell_overlay_toggle_shortcut
+                                .matches(modifiers, &raw_syms);
+                            if is_pressed {
+                                eprintln!(
+                                    "shell overlay shortcut check: key_code={:?} state={:?} shortcut={} modifiers={} raw_syms=[{}] matched={}",
+                                    event.key_code(),
+                                    event.state(),
+                                    data.shell_overlay_toggle_shortcut.display_string(),
+                                    format_shell_overlay_modifiers(modifiers),
+                                    format_shell_overlay_raw_syms(&raw_syms),
+                                    matched,
+                                );
+                            }
+                            if is_pressed && matched {
+                                FilterResult::Intercept(true)
+                            } else {
+                                FilterResult::Forward
+                            }
+                        },
                     );
+                    if intercepted == Some(true) {
+                        self.handle_shell_overlay_toggle();
+                        return;
+                    }
                 }
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
@@ -4495,40 +4854,51 @@ impl RuntimeWaylandState {
     }
 
     fn apply_focus_route(&mut self) {
-        let requested_target = {
-            lock_state(&self.shared_state)
-                .status_snapshot()
-                .runtime
-                .active_focus_target
+        let (requested_target, shell_overlay_focus_requested) = {
+            let state = lock_state(&self.shared_state);
+            (
+                state.status_snapshot().runtime.active_focus_target,
+                state.shell_overlay_focus_requested(),
+            )
         };
-        let resolved = match requested_target {
-            Some(RuntimeFocusTarget::MainApp) => self
-                .main_toplevel
-                .as_ref()
-                .map(|surface| (RuntimeFocusTarget::MainApp, surface.wl_surface().clone())),
-            Some(RuntimeFocusTarget::OverlayNative) => {
+        let resolved = shell_overlay_focus_requested
+            .then(|| {
                 self.overlay_toplevel.as_ref().map(|surface| {
                     (
                         RuntimeFocusTarget::OverlayNative,
                         surface.wl_surface().clone(),
                     )
                 })
-            }
-            None => None,
-        }
-        .or_else(|| {
-            self.overlay_toplevel.as_ref().map(|surface| {
-                (
-                    RuntimeFocusTarget::OverlayNative,
-                    surface.wl_surface().clone(),
-                )
             })
-        })
-        .or_else(|| {
-            self.main_toplevel
-                .as_ref()
-                .map(|surface| (RuntimeFocusTarget::MainApp, surface.wl_surface().clone()))
-        });
+            .flatten()
+            .or_else(|| match requested_target {
+                Some(RuntimeFocusTarget::MainApp) => self
+                    .main_toplevel
+                    .as_ref()
+                    .map(|surface| (RuntimeFocusTarget::MainApp, surface.wl_surface().clone())),
+                Some(RuntimeFocusTarget::OverlayNative) => {
+                    self.overlay_toplevel.as_ref().map(|surface| {
+                        (
+                            RuntimeFocusTarget::OverlayNative,
+                            surface.wl_surface().clone(),
+                        )
+                    })
+                }
+                None => None,
+            })
+            .or_else(|| {
+                self.overlay_toplevel.as_ref().map(|surface| {
+                    (
+                        RuntimeFocusTarget::OverlayNative,
+                        surface.wl_surface().clone(),
+                    )
+                })
+            })
+            .or_else(|| {
+                self.main_toplevel
+                    .as_ref()
+                    .map(|surface| (RuntimeFocusTarget::MainApp, surface.wl_surface().clone()))
+            });
 
         let focus_surface = resolved.as_ref().map(|(_, surface)| surface.clone());
         if let Some(keyboard) = self.seat.get_keyboard() {
@@ -4536,13 +4906,62 @@ impl RuntimeWaylandState {
         }
 
         let resolved_target = resolved.map(|(target, _)| target);
-        if requested_target != resolved_target {
+        if requested_target != resolved_target || shell_overlay_focus_requested {
             let mut state = lock_state(&self.shared_state);
+            if shell_overlay_focus_requested
+                && resolved_target == Some(RuntimeFocusTarget::OverlayNative)
+            {
+                state.mark_shell_overlay_focus_applied();
+            }
             state.set_runtime_focus_target(resolved_target);
         }
     }
 
+    fn handle_shell_overlay_toggle(&mut self) {
+        let (before, result, after) = {
+            let mut state = lock_state(&self.shared_state);
+            let before = state.status_snapshot();
+            let result = state.toggle_shell_overlay();
+            let after = state.status_snapshot();
+            (before, result, after)
+        };
+        match &result {
+            Ok(()) => eprintln!(
+                "shell overlay toggle result: ok shortcut={} focus_before={:?} focus_after={:?} active_overlay_before={:?} active_overlay_after={:?} overlay_surface_before={:?} overlay_surface_after={:?} overlay_bound_pane_before={:?} overlay_bound_pane_after={:?}",
+                before.runtime.shell_overlay_toggle_shortcut,
+                before.runtime.active_focus_target,
+                after.runtime.active_focus_target,
+                before.prototype_policy.active_overlay_pane,
+                after.prototype_policy.active_overlay_pane,
+                before.runtime.overlay_surface_id,
+                after.runtime.overlay_surface_id,
+                before.runtime.overlay_bound_pane_id,
+                after.runtime.overlay_bound_pane_id,
+            ),
+            Err(err) => eprintln!(
+                "shell overlay toggle result: err={err} shortcut={} focus_before={:?} focus_after={:?} active_overlay_before={:?} active_overlay_after={:?} overlay_surface_before={:?} overlay_surface_after={:?} overlay_bound_pane_before={:?} overlay_bound_pane_after={:?}",
+                before.runtime.shell_overlay_toggle_shortcut,
+                before.runtime.active_focus_target,
+                after.runtime.active_focus_target,
+                before.prototype_policy.active_overlay_pane,
+                after.prototype_policy.active_overlay_pane,
+                before.runtime.overlay_surface_id,
+                after.runtime.overlay_surface_id,
+                before.runtime.overlay_bound_pane_id,
+                after.runtime.overlay_bound_pane_id,
+            ),
+        }
+        if let Err(err) = result {
+            eprintln!("shell overlay toggle failed: {err}");
+            return;
+        }
+        self.enforce_overlay_binding_policy();
+        self.sync_runtime_status_with_roles();
+        self.apply_focus_route();
+    }
+
     fn assign_toplevel_role(&mut self, surface: ToplevelSurface) {
+        self.enforce_main_app_binding_policy();
         match self.classify_toplevel(&surface) {
             SurfaceClassification::MainApp => self.assign_main_role(surface),
             SurfaceClassification::OverlayCandidate => self.assign_overlay_role_or_queue(surface),
@@ -4552,8 +4971,15 @@ impl RuntimeWaylandState {
 
     fn assign_main_role(&mut self, surface: ToplevelSurface) {
         if self.main_toplevel.is_none() {
+            let Some(client_pid) = self.client_pid_for_toplevel(&surface) else {
+                surface.send_close();
+                let mut state = lock_state(&self.shared_state);
+                state.increment_runtime_denied_toplevel();
+                return;
+            };
             self.configure_toplevel_for_role(&surface, RuntimeSurfaceRole::MainApp);
             self.main_toplevel = Some(surface);
+            self.bridge_main_app_surface_attached(client_pid);
             self.promote_pending_toplevels();
             self.sync_runtime_status_with_roles();
             self.apply_focus_route();
@@ -4561,7 +4987,7 @@ impl RuntimeWaylandState {
             if self
                 .main_toplevel
                 .as_ref()
-                .map(|main| surface_id(main.wl_surface()) != surface_id(surface.wl_surface()))
+                .map(|main| !same_surface(main.wl_surface(), surface.wl_surface()))
                 .unwrap_or(true)
             {
                 surface.send_close();
@@ -4572,10 +4998,6 @@ impl RuntimeWaylandState {
     }
 
     fn assign_overlay_role_or_queue(&mut self, surface: ToplevelSurface) {
-        if self.main_toplevel.is_none() {
-            self.pending_toplevels.push(surface);
-            return;
-        }
         let Some(expected_pid) = self.expected_overlay_client_pid() else {
             surface.send_close();
             let mut state = lock_state(&self.shared_state);
@@ -4636,17 +5058,79 @@ impl RuntimeWaylandState {
             return SurfaceClassification::PendingIdentity;
         }
 
-        let hint = {
-            let state = lock_state(&self.shared_state);
-            state.runtime_main_app_match_hint().to_lowercase()
-        };
-        let app_id_l = app_id.unwrap_or_default().to_lowercase();
-        let title_l = title.unwrap_or_default().to_lowercase();
-        if !hint.is_empty() && (app_id_l.contains(&hint) || title_l.contains(&hint)) {
-            SurfaceClassification::MainApp
-        } else {
-            SurfaceClassification::OverlayCandidate
+        if let (Some(expected_pid), Some(binding)) = (
+            self.expected_main_app_client_pid(),
+            self.expected_main_app_surface_binding(),
+        ) {
+            match self.client_pid_for_toplevel(surface) {
+                Some(client_pid) if client_pid == expected_pid => {
+                    return match binding.match_identity(app_id.as_deref(), title.as_deref()) {
+                        MainAppSurfaceBindingMatch::Match => SurfaceClassification::MainApp,
+                        MainAppSurfaceBindingMatch::Pending => {
+                            SurfaceClassification::PendingIdentity
+                        }
+                        MainAppSurfaceBindingMatch::Mismatch => {
+                            SurfaceClassification::OverlayCandidate
+                        }
+                    };
+                }
+                Some(_) | None => {}
+            }
         }
+
+        SurfaceClassification::OverlayCandidate
+    }
+
+    fn main_surface_matches_current_contract(&self, surface: &ToplevelSurface) -> bool {
+        let Some(expected_pid) = self.expected_main_app_client_pid() else {
+            return false;
+        };
+        let Some(binding) = self.expected_main_app_surface_binding() else {
+            return false;
+        };
+        let Some(client_pid) = self.client_pid_for_toplevel(surface) else {
+            return false;
+        };
+        if client_pid != expected_pid {
+            return false;
+        }
+
+        let (app_id, title) =
+            smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
+                let attrs = states
+                    .data_map
+                    .get::<XdgToplevelSurfaceData>()
+                    .and_then(|data| data.lock().ok());
+                let app_id = attrs.as_ref().and_then(|attrs| attrs.app_id.clone());
+                let title = attrs.as_ref().and_then(|attrs| attrs.title.clone());
+                (app_id, title)
+            });
+        matches!(
+            binding.match_identity(app_id.as_deref(), title.as_deref()),
+            MainAppSurfaceBindingMatch::Match
+        )
+    }
+
+    fn enforce_main_app_binding_policy(&mut self) {
+        let should_clear = self
+            .main_toplevel
+            .as_ref()
+            .map(|surface| !self.main_surface_matches_current_contract(surface))
+            .unwrap_or(false);
+        if !should_clear {
+            return;
+        }
+
+        if let Some(main) = self.main_toplevel.as_ref() {
+            if let Some(pid) = self
+                .client_pid_for_toplevel(main)
+                .or_else(|| self.expected_main_app_client_pid())
+            {
+                self.bridge_main_app_surface_detached(pid);
+            }
+            main.send_close();
+        }
+        self.main_toplevel = None;
     }
 
     fn runtime_output_width(&self) -> i32 {
@@ -4712,11 +5196,11 @@ impl RuntimeWaylandState {
     }
 
     fn popup_owner_role(&self, popup: &PopupSurface) -> Option<RuntimeSurfaceRole> {
-        let parent_id = popup.get_parent_surface().as_ref().map(surface_id)?;
+        let parent = popup.get_parent_surface()?;
         if self
             .main_toplevel
             .as_ref()
-            .map(|main| surface_id(main.wl_surface()) == parent_id)
+            .map(|main| same_surface(main.wl_surface(), &parent))
             .unwrap_or(false)
         {
             return Some(RuntimeSurfaceRole::MainApp);
@@ -4724,7 +5208,7 @@ impl RuntimeWaylandState {
         if self
             .overlay_toplevel
             .as_ref()
-            .map(|overlay| surface_id(overlay.wl_surface()) == parent_id)
+            .map(|overlay| same_surface(overlay.wl_surface(), &parent))
             .unwrap_or(false)
         {
             return Some(RuntimeSurfaceRole::OverlayNative);
@@ -4791,11 +5275,11 @@ impl RuntimeWaylandState {
     }
 
     fn handle_surface_identity_update(&mut self, surface: &ToplevelSurface) {
-        let updated_id = surface_id(surface.wl_surface());
+        let updated_id = surface_key(surface.wl_surface());
         if let Some(idx) = self
             .pending_toplevels
             .iter()
-            .position(|pending| surface_id(pending.wl_surface()) == updated_id)
+            .position(|pending| surface_key(pending.wl_surface()) == updated_id)
         {
             let pending = self.pending_toplevels.remove(idx);
             self.assign_toplevel_role(pending);
@@ -4809,13 +5293,14 @@ impl RuntimeWaylandState {
         {
             self.assign_main_role(surface.clone());
         }
+        self.enforce_main_app_binding_policy();
     }
 
-    fn role_for_surface_id(&self, id: u32) -> Option<RuntimeSurfaceRole> {
+    fn role_for_surface(&self, surface: &WlSurface) -> Option<RuntimeSurfaceRole> {
         if self
             .main_toplevel
             .as_ref()
-            .map(|main| surface_id(main.wl_surface()) == id)
+            .map(|main| same_surface(main.wl_surface(), surface))
             .unwrap_or(false)
         {
             return Some(RuntimeSurfaceRole::MainApp);
@@ -4823,13 +5308,13 @@ impl RuntimeWaylandState {
         if self
             .overlay_toplevel
             .as_ref()
-            .map(|overlay| surface_id(overlay.wl_surface()) == id)
+            .map(|overlay| same_surface(overlay.wl_surface(), surface))
             .unwrap_or(false)
         {
             return Some(RuntimeSurfaceRole::OverlayNative);
         }
         for popup in &self.popups {
-            if surface_id(popup.surface.wl_surface()) == id {
+            if same_surface(popup.surface.wl_surface(), surface) {
                 return Some(popup.owner_role);
             }
         }
@@ -4901,6 +5386,7 @@ impl RuntimeWaylandState {
 
     fn prune_dead_surfaces(&mut self) {
         self.pending_toplevels.retain(ToplevelSurface::alive);
+        self.enforce_main_app_binding_policy();
         self.enforce_overlay_binding_policy();
         if self
             .main_toplevel
@@ -4908,6 +5394,14 @@ impl RuntimeWaylandState {
             .map(|surface| !surface.alive())
             .unwrap_or(false)
         {
+            if let Some(main) = self.main_toplevel.as_ref() {
+                if let Some(pid) = self
+                    .client_pid_for_toplevel(main)
+                    .or_else(|| self.expected_main_app_client_pid())
+                {
+                    self.bridge_main_app_surface_detached(pid);
+                }
+            }
             self.main_toplevel = None;
         }
         if self
@@ -4938,6 +5432,10 @@ impl RuntimeWaylandState {
         _output_height: i32,
     ) -> RenderElementCapture {
         let mut capture = RenderElementCapture::default();
+        let mut main_elements = Vec::new();
+        let mut main_popup_elements = Vec::new();
+        let mut overlay_elements = Vec::new();
+        let mut overlay_popup_elements = Vec::new();
         let output_rect = Rectangle::new(
             (0, 0).into(),
             (self.runtime_output_width(), self.runtime_output_height()).into(),
@@ -4962,7 +5460,7 @@ impl RuntimeWaylandState {
                     1.0,
                     Kind::Unspecified,
                 );
-                capture.push(RenderElementSource::Main, elements);
+                main_elements.extend(elements);
             }
         }
 
@@ -4986,7 +5484,7 @@ impl RuntimeWaylandState {
                     1.0,
                     Kind::Unspecified,
                 );
-                capture.push(RenderElementSource::MainPopup, elements);
+                main_popup_elements.extend(elements);
             }
         }
 
@@ -5006,7 +5504,7 @@ impl RuntimeWaylandState {
                     1.0,
                     Kind::Unspecified,
                 );
-                capture.push(RenderElementSource::Overlay, elements);
+                overlay_elements.extend(elements);
             }
         }
 
@@ -5030,9 +5528,16 @@ impl RuntimeWaylandState {
                     1.0,
                     Kind::Unspecified,
                 );
-                capture.push(RenderElementSource::OverlayPopup, elements);
+                overlay_popup_elements.extend(elements);
             }
         }
+
+        // Smithay expects top-to-bottom order; otherwise an opaque main surface
+        // can cull the overlay before it is drawn.
+        capture.push(RenderElementSource::OverlayPopup, overlay_popup_elements);
+        capture.push(RenderElementSource::Overlay, overlay_elements);
+        capture.push(RenderElementSource::MainPopup, main_popup_elements);
+        capture.push(RenderElementSource::Main, main_elements);
 
         capture
     }
@@ -5051,7 +5556,7 @@ impl RuntimeWaylandState {
                 err = err
             );
         }
-        let mut elements = render_elements_from_surface_tree(
+        let overlay_elements = render_elements_from_surface_tree(
             renderer,
             overlay.wl_surface(),
             (0, 0),
@@ -5059,6 +5564,7 @@ impl RuntimeWaylandState {
             1.0,
             Kind::Unspecified,
         );
+        let mut elements = Vec::new();
 
         for popup in &self.popups {
             if popup.owner_role != RuntimeSurfaceRole::OverlayNative {
@@ -5081,6 +5587,7 @@ impl RuntimeWaylandState {
             );
             elements.extend(popup_elements);
         }
+        elements.extend(overlay_elements);
 
         elements
     }
@@ -5102,6 +5609,18 @@ impl RuntimeWaylandState {
         lock_state(&self.shared_state).runtime_overlay_binding_expected()
     }
 
+    fn expected_main_app_surface_binding(&self) -> Option<crate::model::MainAppSurfaceBinding> {
+        lock_state(&self.shared_state)
+            .runtime_expected_main_app_binding()
+            .map(|(_pid, binding)| binding)
+    }
+
+    fn expected_main_app_client_pid(&self) -> Option<u32> {
+        lock_state(&self.shared_state)
+            .runtime_expected_main_app_binding()
+            .map(|(pid, _binding)| pid)
+    }
+
     fn expected_overlay_client_pid(&self) -> Option<u32> {
         lock_state(&self.shared_state)
             .runtime_expected_overlay_binding()
@@ -5121,9 +5640,19 @@ impl RuntimeWaylandState {
         let _ = state.runtime_mark_overlay_surface_attached_for_pid(client_pid);
     }
 
+    fn bridge_main_app_surface_attached(&self, client_pid: u32) {
+        let mut state = lock_state(&self.shared_state);
+        let _ = state.runtime_mark_main_app_surface_attached_for_pid(client_pid);
+    }
+
     fn bridge_overlay_surface_detached(&self, client_pid: u32) {
         let mut state = lock_state(&self.shared_state);
         let _ = state.runtime_mark_overlay_surface_detached_for_pid(client_pid);
+    }
+
+    fn bridge_main_app_surface_detached(&self, client_pid: u32) {
+        let mut state = lock_state(&self.shared_state);
+        let _ = state.runtime_mark_main_app_surface_detached_for_pid(client_pid);
     }
 
     fn enforce_overlay_binding_policy(&self) {
@@ -5146,7 +5675,7 @@ impl RuntimeWaylandState {
             }
         });
 
-        let id = surface_id(surface);
+        let id = surface_key(surface);
         match assignment {
             Some(Some(buffer)) => {
                 let mut kind = SurfaceBufferKind::Other;
@@ -5204,7 +5733,7 @@ impl RuntimeWaylandState {
     }
 
     fn drop_surface_buffer(&mut self, surface: &WlSurface) {
-        self.host_surface_buffers.remove(&surface_id(surface));
+        self.host_surface_buffers.remove(&surface_key(surface));
     }
 
     fn host_scene_surfaces(&self, output_w: i32, output_h: i32) -> Vec<HostSceneSurface> {
@@ -5238,7 +5767,7 @@ impl RuntimeWaylandState {
         for popup in &self.popups {
             if let Some(snapshot) = self
                 .host_surface_buffers
-                .get(&surface_id(popup.surface.wl_surface()))
+                .get(&surface_key(popup.surface.wl_surface()))
             {
                 let mapping = match popup.owner_role {
                     RuntimeSurfaceRole::MainApp => main_mapping,
@@ -5289,8 +5818,8 @@ impl RuntimeWaylandState {
                 let next_offset = Point::new(offset.x + location.x, offset.y + location.y);
                 TraversalAction::DoChildren(next_offset)
             },
-            |_surface, _, &offset| {
-                if let Some(snapshot) = self.host_surface_buffers.get(&surface_id(surface)) {
+            |surface, _, &offset| {
+                if let Some(snapshot) = self.host_surface_buffers.get(&surface_key(surface)) {
                     let target_size = if let Some(size) = snapshot.size.as_ref() {
                         Some(Size::new(size.w, size.h))
                     } else if let Some(info) = snapshot.dmabuf.as_ref() {
@@ -5437,22 +5966,28 @@ impl XdgShellHandler for RuntimeWaylandState {
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        let destroyed_id = surface_id(surface.wl_surface());
+        let destroyed_id = surface_key(surface.wl_surface());
         self.drop_surface_buffer(surface.wl_surface());
         self.pending_toplevels
-            .retain(|pending| surface_id(pending.wl_surface()) != destroyed_id);
+            .retain(|pending| surface_key(pending.wl_surface()) != destroyed_id);
         if self
             .main_toplevel
             .as_ref()
-            .map(|item| surface_id(item.wl_surface()) == destroyed_id)
+            .map(|item| surface_key(item.wl_surface()) == destroyed_id)
             .unwrap_or(false)
         {
+            if let Some(pid) = self
+                .client_pid_for_toplevel(&surface)
+                .or_else(|| self.expected_main_app_client_pid())
+            {
+                self.bridge_main_app_surface_detached(pid);
+            }
             self.main_toplevel = None;
         }
         if self
             .overlay_toplevel
             .as_ref()
-            .map(|item| surface_id(item.wl_surface()) == destroyed_id)
+            .map(|item| surface_key(item.wl_surface()) == destroyed_id)
             .unwrap_or(false)
         {
             if let Some(pid) = self
@@ -5465,10 +6000,10 @@ impl XdgShellHandler for RuntimeWaylandState {
         }
         let mut removed_popup_ids = Vec::new();
         self.popups.retain(|popup| {
-            let keep =
-                popup.surface.get_parent_surface().as_ref().map(surface_id) != Some(destroyed_id);
+            let keep = popup.surface.get_parent_surface().as_ref().map(surface_key)
+                != Some(destroyed_id.clone());
             if !keep {
-                removed_popup_ids.push(surface_id(popup.surface.wl_surface()));
+                removed_popup_ids.push(surface_key(popup.surface.wl_surface()));
             }
             keep
         });
@@ -5481,10 +6016,10 @@ impl XdgShellHandler for RuntimeWaylandState {
     }
 
     fn popup_destroyed(&mut self, surface: PopupSurface) {
-        let destroyed_id = surface_id(surface.wl_surface());
+        let destroyed_id = surface_key(surface.wl_surface());
         self.drop_surface_buffer(surface.wl_surface());
         self.popups
-            .retain(|popup| surface_id(popup.surface.wl_surface()) != destroyed_id);
+            .retain(|popup| surface_key(popup.surface.wl_surface()) != destroyed_id);
     }
 
     fn app_id_changed(&mut self, surface: ToplevelSurface) {
@@ -5544,8 +6079,7 @@ impl SeatHandler for RuntimeWaylandState {
             focused.and_then(Resource::client),
         );
         let target = focused
-            .map(surface_id)
-            .and_then(|id| self.role_for_surface_id(id))
+            .and_then(|surface| self.role_for_surface(surface))
             .map(|role| match role {
                 RuntimeSurfaceRole::MainApp => RuntimeFocusTarget::MainApp,
                 RuntimeSurfaceRole::OverlayNative => RuntimeFocusTarget::OverlayNative,
@@ -5732,6 +6266,14 @@ fn lock_state(
     }
 }
 
+fn surface_key(surface: &WlSurface) -> ObjectId {
+    surface.id()
+}
+
+fn same_surface(left: &WlSurface, right: &WlSurface) -> bool {
+    surface_key(left) == surface_key(right)
+}
+
 fn surface_id(surface: &WlSurface) -> u32 {
     surface.id().protocol_id()
 }
@@ -5784,8 +6326,9 @@ mod tests {
     use super::{
         AtomicPlaneLayout, DrmFourcc, GBM_BUFFER_FROM_BO_PRESERVE_EXPLICIT_MODIFIER,
         GLES_INTERMEDIATE_RENDER_FORMAT, PlaneSelection, RoleSurfaceMapping, RuntimeWaylandState,
-        copy_renderer_pixels_to_dumb, direct_present_supported_for_rotation,
-        overlay_scanout_format_supports_alpha, render_output_size_before_transform,
+        ShellOverlayToggleShortcut, copy_renderer_pixels_to_dumb,
+        direct_present_supported_for_rotation, overlay_scanout_format_supports_alpha,
+        parse_shell_overlay_toggle_shortcut, render_output_size_before_transform,
         scene_texture_transform, screen_capture_src_flipped, select_atomic_plane_zpos_values,
         select_preferred_scanout_format, select_primary_path, source_rect_from_bbox_and_geometry,
         transform_from_rotation,
@@ -5793,6 +6336,7 @@ mod tests {
     use crate::model::{OutputRotation, ProcessSpec};
     use crate::process_manager::{ProcessController, ProcessExit};
     use crate::state::CompositorState;
+    use smithay::input::keyboard::{Keysym, ModifiersState, keysyms};
     use smithay::reexports::wayland_server::Display;
     use smithay::utils::{Logical, Physical, Rectangle, Size, Transform};
     use std::path::{Path, PathBuf};
@@ -5817,6 +6361,38 @@ mod tests {
         fn reap_exited(&mut self) -> Vec<ProcessExit> {
             Vec::new()
         }
+    }
+
+    #[test]
+    fn shell_overlay_shortcut_parser_normalizes_default_super_grave() {
+        let shortcut = parse_shell_overlay_toggle_shortcut("super+grave")
+            .expect("default shortcut alias should parse");
+        assert_eq!(shortcut.display_string(), "Super+`");
+    }
+
+    #[test]
+    fn shell_overlay_shortcut_parser_rejects_non_super_modifier() {
+        let err = parse_shell_overlay_toggle_shortcut("ctrl+grave")
+            .expect_err("non-super shortcut should be rejected");
+        assert!(err.contains("modifier must be Super"));
+    }
+
+    #[test]
+    fn shell_overlay_shortcut_match_requires_super_and_raw_bound_key() {
+        let shortcut = ShellOverlayToggleShortcut {
+            normalized: "Super+`".to_string(),
+            keysym: Keysym::new(keysyms::KEY_grave),
+        };
+        let modifiers = ModifiersState {
+            logo: true,
+            ..ModifiersState::default()
+        };
+        assert!(shortcut.matches(&modifiers, &[Keysym::new(keysyms::KEY_grave)]));
+        assert!(!shortcut.matches(
+            &ModifiersState::default(),
+            &[Keysym::new(keysyms::KEY_grave)]
+        ));
+        assert!(!shortcut.matches(&modifiers, &[Keysym::new(keysyms::KEY_F12)]));
     }
 
     #[test]
@@ -6248,6 +6824,22 @@ mod tests {
         assert_eq!(
             mapping.map_rect(Rectangle::new((60, 10).into(), (20, 10).into())),
             Rectangle::<i32, Logical>::new((600, 100).into(), (200, 100).into())
+        );
+    }
+
+    #[test]
+    fn role_surface_mapping_reports_render_element_transform_for_scaled_popup_tree() {
+        let mapping = RoleSurfaceMapping::new(
+            Rectangle::<i32, Logical>::new((40, 20).into(), (80, 40).into()),
+            Rectangle::<i32, Logical>::new((944, 16).into(), (960, 540).into()),
+        );
+
+        assert_eq!(mapping.render_element_location(), (464, -254).into());
+        assert_eq!(mapping.render_element_scale().x, 12.0);
+        assert_eq!(mapping.render_element_scale().y, 13.5);
+        assert_eq!(
+            mapping.map_render_element_location((60, 10).into()),
+            (1184, -119).into()
         );
     }
 

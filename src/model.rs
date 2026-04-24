@@ -47,6 +47,115 @@ pub struct ProcessSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MainAppSurfaceBinding {
+    AppId { app_id: String },
+    Title { title: String },
+    AppIdAndTitle { app_id: String, title: String },
+}
+
+impl MainAppSurfaceBinding {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::AppId { app_id } if app_id.trim().is_empty() => {
+                Err("main app binding app_id must not be empty")
+            }
+            Self::Title { title } if title.trim().is_empty() => {
+                Err("main app binding title must not be empty")
+            }
+            Self::AppIdAndTitle { app_id, .. } if app_id.trim().is_empty() => {
+                Err("main app binding app_id must not be empty")
+            }
+            Self::AppIdAndTitle { title, .. } if title.trim().is_empty() => {
+                Err("main app binding title must not be empty")
+            }
+            Self::AppId { .. } | Self::Title { .. } | Self::AppIdAndTitle { .. } => Ok(()),
+        }
+    }
+
+    pub fn match_identity(
+        &self,
+        app_id: Option<&str>,
+        title: Option<&str>,
+    ) -> MainAppSurfaceBindingMatch {
+        match self {
+            Self::AppId { app_id: expected } => match app_id {
+                Some(actual) if actual == expected => MainAppSurfaceBindingMatch::Match,
+                Some(_) => MainAppSurfaceBindingMatch::Mismatch,
+                None => MainAppSurfaceBindingMatch::Pending,
+            },
+            Self::Title { title: expected } => match title {
+                Some(actual) if actual == expected => MainAppSurfaceBindingMatch::Match,
+                Some(_) => MainAppSurfaceBindingMatch::Mismatch,
+                None => MainAppSurfaceBindingMatch::Pending,
+            },
+            Self::AppIdAndTitle {
+                app_id: expected_app_id,
+                title: expected_title,
+            } => {
+                if app_id.is_some_and(|actual| actual != expected_app_id) {
+                    return MainAppSurfaceBindingMatch::Mismatch;
+                }
+                if title.is_some_and(|actual| actual != expected_title) {
+                    return MainAppSurfaceBindingMatch::Mismatch;
+                }
+                match (app_id, title) {
+                    (Some(actual_app_id), Some(actual_title))
+                        if actual_app_id == expected_app_id && actual_title == expected_title =>
+                    {
+                        MainAppSurfaceBindingMatch::Match
+                    }
+                    _ => MainAppSurfaceBindingMatch::Pending,
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MainAppSurfaceBindingMatch {
+    Match,
+    Pending,
+    Mismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MainAppLaunchIntent {
+    pub process: ProcessSpec,
+    pub binding: MainAppSurfaceBinding,
+}
+
+impl MainAppLaunchIntent {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.process.command.trim().is_empty() {
+            return Err("main app process command must not be empty");
+        }
+        self.binding.validate()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MainAppLaunchState {
+    #[default]
+    NotRequested,
+    WaitingForRuntime,
+    Launching {
+        pid: u32,
+    },
+    Attached {
+        pid: u32,
+    },
+    Failed {
+        reason: String,
+    },
+    Exited {
+        pid: u32,
+        exit_code: Option<i32>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PaneRenderMode {
     SurfAceRendered,
     ExternalNative {
@@ -203,7 +312,10 @@ pub struct RuntimeStatus {
     pub runtime_last_selection_attempt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_last_selection_result: Option<String>,
-    pub main_app_match_hint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_app_launch_intent: Option<MainAppLaunchIntent>,
+    pub main_app_launch_state: MainAppLaunchState,
+    pub shell_overlay_toggle_shortcut: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wayland_socket: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -218,6 +330,7 @@ pub struct RuntimeStatus {
     pub host_opened_drm_device_count: u32,
     pub host_output_ownership: bool,
     pub host_start_attempt_count: u64,
+    pub host_start_request_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_last_start_trigger: Option<HostRuntimeStartTrigger>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -272,7 +385,9 @@ impl Default for RuntimeStatus {
             runtime_operator_action_reason: None,
             runtime_last_selection_attempt: None,
             runtime_last_selection_result: None,
-            main_app_match_hint: "surf-ace".to_string(),
+            main_app_launch_intent: None,
+            main_app_launch_state: MainAppLaunchState::NotRequested,
+            shell_overlay_toggle_shortcut: "Super+`".to_string(),
             wayland_socket: None,
             window_width: None,
             window_height: None,
@@ -283,6 +398,7 @@ impl Default for RuntimeStatus {
             host_opened_drm_device_count: 0,
             host_output_ownership: false,
             host_start_attempt_count: 0,
+            host_start_request_pending: false,
             host_last_start_trigger: None,
             host_primary_drm_path: None,
             host_forced_drm_path: None,
@@ -320,4 +436,97 @@ pub struct StatusSnapshot {
     pub panes: Vec<PaneStatus>,
     pub prototype_policy: PrototypePolicyStatus,
     pub runtime: RuntimeStatus,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MainAppLaunchIntent, MainAppLaunchState, MainAppSurfaceBinding, MainAppSurfaceBindingMatch,
+        ProcessSpec,
+    };
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn main_app_surface_binding_matches_exact_app_id() {
+        let binding = MainAppSurfaceBinding::AppId {
+            app_id: "surf-ace".to_string(),
+        };
+
+        assert_eq!(
+            binding.match_identity(Some("surf-ace"), Some("ignored")),
+            MainAppSurfaceBindingMatch::Match
+        );
+        assert_eq!(
+            binding.match_identity(Some("surf-ace-dev"), Some("ignored")),
+            MainAppSurfaceBindingMatch::Mismatch
+        );
+        assert_eq!(
+            binding.match_identity(None, Some("ignored")),
+            MainAppSurfaceBindingMatch::Pending
+        );
+    }
+
+    #[test]
+    fn main_app_surface_binding_requires_both_app_id_and_title_when_declared() {
+        let binding = MainAppSurfaceBinding::AppIdAndTitle {
+            app_id: "surf-ace".to_string(),
+            title: "Surf Ace".to_string(),
+        };
+
+        assert_eq!(
+            binding.match_identity(Some("surf-ace"), None),
+            MainAppSurfaceBindingMatch::Pending
+        );
+        assert_eq!(
+            binding.match_identity(Some("surf-ace"), Some("Other")),
+            MainAppSurfaceBindingMatch::Mismatch
+        );
+        assert_eq!(
+            binding.match_identity(Some("surf-ace"), Some("Surf Ace")),
+            MainAppSurfaceBindingMatch::Match
+        );
+    }
+
+    #[test]
+    fn main_app_launch_intent_validation_rejects_empty_binding_or_command() {
+        let invalid_command = MainAppLaunchIntent {
+            process: ProcessSpec {
+                command: "   ".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                env: BTreeMap::new(),
+            },
+            binding: MainAppSurfaceBinding::AppId {
+                app_id: "surf-ace".to_string(),
+            },
+        };
+        assert_eq!(
+            invalid_command.validate(),
+            Err("main app process command must not be empty")
+        );
+
+        let invalid_binding = MainAppLaunchIntent {
+            process: ProcessSpec {
+                command: "foot".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                env: BTreeMap::new(),
+            },
+            binding: MainAppSurfaceBinding::Title {
+                title: "".to_string(),
+            },
+        };
+        assert_eq!(
+            invalid_binding.validate(),
+            Err("main app binding title must not be empty")
+        );
+    }
+
+    #[test]
+    fn main_app_launch_state_defaults_to_not_requested() {
+        assert_eq!(
+            MainAppLaunchState::default(),
+            MainAppLaunchState::NotRequested
+        );
+    }
 }

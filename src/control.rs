@@ -1,11 +1,13 @@
 use crate::model::{
-    HostRuntimeStartTrigger, NativeTargetClass, OutputRotation, PaneId, ProcessSpec,
-    ProviderPaneSnapshot, RuntimeBackend, RuntimeFocusTarget, RuntimePhase, StatusSnapshot,
+    HostRuntimeStartTrigger, MainAppLaunchIntent, NativeTargetClass, OutputRotation, PaneId,
+    ProcessSpec, ProviderPaneSnapshot, RuntimeBackend, RuntimeFocusTarget, RuntimePhase,
+    StatusSnapshot,
 };
 use crate::screen_capture::ScreenCaptureStore;
 use crate::state::CompositorState;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::mpsc::Sender;
@@ -33,8 +35,9 @@ pub enum ControlRequest {
     SwitchPaneToSurfAce {
         pane_id: PaneId,
     },
-    SetRuntimeMainAppMatchHint {
-        hint: String,
+    ToggleShellOverlay,
+    SetMainAppLaunchIntent {
+        intent: MainAppLaunchIntent,
     },
     SetRuntimeFocusTarget {
         target: RuntimeFocusTarget,
@@ -106,11 +109,21 @@ pub fn serve_with_runtime_control(
     runtime_control: Option<Sender<RuntimeControlCommand>>,
     screen_capture: ScreenCaptureStore,
 ) -> io::Result<()> {
-    if socket_path.exists() {
-        std::fs::remove_file(socket_path)?;
-    }
+    let listener = bind_control_listener(socket_path)?;
+    serve_listener_with_runtime_control(listener, shared_state, runtime_control, screen_capture)
+}
 
-    let listener = UnixListener::bind(socket_path)?;
+pub fn bind_control_listener(socket_path: &Path) -> io::Result<UnixListener> {
+    prepare_control_socket_path(socket_path)?;
+    UnixListener::bind(socket_path)
+}
+
+pub fn serve_listener_with_runtime_control(
+    listener: UnixListener,
+    shared_state: Arc<Mutex<CompositorState>>,
+    runtime_control: Option<Sender<RuntimeControlCommand>>,
+    screen_capture: ScreenCaptureStore,
+) -> io::Result<()> {
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(stream) => stream,
@@ -130,6 +143,41 @@ pub fn serve_with_runtime_control(
     }
 
     Ok(())
+}
+
+fn prepare_control_socket_path(socket_path: &Path) -> io::Result<()> {
+    if !socket_path.exists() {
+        return Ok(());
+    }
+
+    let file_type = std::fs::symlink_metadata(socket_path)?.file_type();
+    if !file_type.is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "control socket path exists and is not a socket: {}",
+                socket_path.display()
+            ),
+        ));
+    }
+
+    match UnixStream::connect(socket_path) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("control socket already active at {}", socket_path.display()),
+        )),
+        Err(err) if err.kind() == io::ErrorKind::ConnectionRefused => {
+            std::fs::remove_file(socket_path)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(io::Error::new(
+            err.kind(),
+            format!(
+                "failed to validate existing control socket {}: {err}",
+                socket_path.display()
+            ),
+        )),
+    }
 }
 
 pub fn send_request(socket_path: &Path, request: &ControlRequest) -> io::Result<ControlResponse> {
@@ -241,13 +289,14 @@ fn handle_request_with_capture(
             .switch_pane_to_surf_ace(&pane_id)
             .map(|_| Some(state.status_snapshot()))
             .map_err(|err| err.to_string()),
-        ControlRequest::SetRuntimeMainAppMatchHint { hint } => {
-            if hint.trim().is_empty() {
-                return ControlResponse::err("main app match hint must not be empty");
-            }
-            state.set_runtime_main_app_match_hint(hint);
-            Ok(Some(state.status_snapshot()))
-        }
+        ControlRequest::ToggleShellOverlay => state
+            .toggle_shell_overlay()
+            .map(|_| Some(state.status_snapshot()))
+            .map_err(|err| err.to_string()),
+        ControlRequest::SetMainAppLaunchIntent { intent } => state
+            .select_main_app_launch_intent(intent)
+            .map(|_| Some(state.status_snapshot()))
+            .map_err(|err| err.to_string()),
         ControlRequest::SetRuntimeFocusTarget { target } => {
             state.set_runtime_focus_target(Some(target));
             Ok(Some(state.status_snapshot()))
@@ -276,7 +325,8 @@ fn handle_request_with_capture(
             if matches!(
                 runtime.phase,
                 RuntimePhase::Starting | RuntimePhase::PreflightReady | RuntimePhase::Running
-            ) {
+            ) || runtime.host_start_request_pending
+            {
                 return ControlResponse::err("host runtime is already active");
             }
 
@@ -325,6 +375,9 @@ mod tests {
     use crate::state::CompositorState;
     use smithay::backend::allocator::Fourcc as DrmFourcc;
     use std::collections::BTreeMap;
+    use std::fs;
+    use std::os::unix::net::UnixListener;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[derive(Default)]
     struct NoopProcessController;
@@ -345,6 +398,42 @@ mod tests {
         fn reap_exited(&mut self) -> Vec<ProcessExit> {
             Vec::new()
         }
+    }
+
+    fn unique_socket_path(label: &str) -> std::path::PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be available")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "surf-ace-control-{label}-{}-{suffix}.sock",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn prepare_control_socket_path_rejects_live_socket_owner() {
+        let socket_path = unique_socket_path("live");
+        let _listener = UnixListener::bind(&socket_path).expect("socket bind should succeed");
+
+        let err =
+            prepare_control_socket_path(&socket_path).expect_err("live socket should be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        assert!(socket_path.exists());
+
+        let _ = fs::remove_file(&socket_path);
+    }
+
+    #[test]
+    fn prepare_control_socket_path_removes_stale_socket_file() {
+        let socket_path = unique_socket_path("stale");
+        let listener = UnixListener::bind(&socket_path).expect("socket bind should succeed");
+        drop(listener);
+        assert!(socket_path.exists());
+
+        prepare_control_socket_path(&socket_path)
+            .expect("stale socket file should be removed for fresh bind");
+        assert!(!socket_path.exists());
     }
 
     #[test]
@@ -380,7 +469,21 @@ mod tests {
         );
         assert_eq!(
             response.status.as_ref().map(|status| status.runtime.phase),
-            Some(RuntimePhase::Starting)
+            Some(RuntimePhase::Failed)
+        );
+        assert_eq!(
+            response
+                .status
+                .as_ref()
+                .map(|status| status.runtime.host_start_request_pending),
+            Some(true)
+        );
+        assert_eq!(
+            response
+                .status
+                .as_ref()
+                .and_then(|status| status.runtime.last_error.as_deref()),
+            Some("previous failure")
         );
         assert_eq!(
             rx.recv().ok(),
@@ -466,7 +569,21 @@ mod tests {
         );
         assert_eq!(
             response.status.as_ref().map(|status| status.runtime.phase),
-            Some(RuntimePhase::Starting)
+            Some(RuntimePhase::Failed)
+        );
+        assert_eq!(
+            response
+                .status
+                .as_ref()
+                .map(|status| status.runtime.host_start_request_pending),
+            Some(true)
+        );
+        assert_eq!(
+            response
+                .status
+                .as_ref()
+                .and_then(|status| status.runtime.last_error.as_deref()),
+            Some("host failure")
         );
         assert_eq!(
             response
@@ -504,7 +621,14 @@ mod tests {
         );
         assert_eq!(
             response.status.as_ref().map(|status| status.runtime.phase),
-            Some(RuntimePhase::Starting)
+            Some(RuntimePhase::Inactive)
+        );
+        assert_eq!(
+            response
+                .status
+                .as_ref()
+                .map(|status| status.runtime.host_start_request_pending),
+            Some(true)
         );
         assert_eq!(
             response
@@ -527,7 +651,8 @@ mod tests {
 
         let runtime = state.status_snapshot().runtime;
         assert_eq!(runtime.backend, RuntimeBackend::HostDrm);
-        assert_eq!(runtime.phase, RuntimePhase::Starting);
+        assert_eq!(runtime.phase, RuntimePhase::Inactive);
+        assert!(runtime.host_start_request_pending);
         assert!(!runtime.host_output_ownership);
     }
 
@@ -548,7 +673,14 @@ mod tests {
         assert!(response.ok);
         assert_eq!(
             response.status.as_ref().map(|status| status.runtime.phase),
-            Some(RuntimePhase::Starting)
+            Some(RuntimePhase::Stopped)
+        );
+        assert_eq!(
+            response
+                .status
+                .as_ref()
+                .map(|status| status.runtime.host_start_request_pending),
+            Some(true)
         );
         assert_eq!(
             rx.recv().ok(),
@@ -557,7 +689,8 @@ mod tests {
 
         let runtime = state.status_snapshot().runtime;
         assert_eq!(runtime.backend, RuntimeBackend::HostDrm);
-        assert_eq!(runtime.phase, RuntimePhase::Starting);
+        assert_eq!(runtime.phase, RuntimePhase::Stopped);
+        assert!(runtime.host_start_request_pending);
         assert!(!runtime.host_output_ownership);
         assert_eq!(
             runtime.host_start_attempt_count,
@@ -609,6 +742,24 @@ mod tests {
             runtime.host_last_start_trigger,
             before.host_last_start_trigger
         );
+    }
+
+    #[test]
+    fn start_host_runtime_is_rejected_while_retry_is_already_queued() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.mark_runtime_failed("previous failure");
+        state.mark_host_runtime_start_requested(HostRuntimeStartTrigger::ControlRetry);
+        let before = state.status_snapshot().runtime;
+        let (tx, rx) = std::sync::mpsc::channel::<RuntimeControlCommand>();
+
+        let response = handle_request(&mut state, ControlRequest::StartHostRuntime, Some(&tx));
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_deref(),
+            Some("host runtime is already active")
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(state.status_snapshot().runtime, before);
     }
 
     #[test]
@@ -817,7 +968,21 @@ mod tests {
         );
         assert_eq!(
             response.status.as_ref().map(|status| status.runtime.phase),
-            Some(RuntimePhase::Starting)
+            Some(RuntimePhase::Failed)
+        );
+        assert_eq!(
+            response
+                .status
+                .as_ref()
+                .map(|status| status.runtime.host_start_request_pending),
+            Some(true)
+        );
+        assert_eq!(
+            response
+                .status
+                .as_ref()
+                .and_then(|status| status.runtime.last_error.as_deref()),
+            Some("pre-host bootstrap failure")
         );
         assert_eq!(
             response
@@ -840,7 +1005,8 @@ mod tests {
 
         let runtime = state.status_snapshot().runtime;
         assert_eq!(runtime.backend, RuntimeBackend::HostDrm);
-        assert_eq!(runtime.phase, RuntimePhase::Starting);
+        assert_eq!(runtime.phase, RuntimePhase::Failed);
+        assert!(runtime.host_start_request_pending);
         assert!(!runtime.host_output_ownership);
     }
 

@@ -6,10 +6,11 @@ BIN_DEFAULT="$ROOT_DIR/target/debug/surf-ace-compositor"
 
 SOCKET_PATH="/tmp/surf-ace-compositor.sock"
 BIN_PATH="${SURF_ACE_COMPOSITOR_BIN:-$BIN_DEFAULT}"
+MAIN_APP_LAUNCH_INTENT_JSON=""
 
 usage() {
   cat <<'USAGE'
-Usage: launch-host-seatd.sh [--socket-path <path>] [--bin <path>]
+Usage: launch-host-seatd.sh [--socket-path <path>] [--bin <path>] [--main-app-launch-intent-json <json>]
 
 Starts Surf Ace host runtime with seatd mediation, handling stale-shell
 group inheritance by entering the seatd socket group for this command.
@@ -24,6 +25,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --bin)
       BIN_PATH="${2:-}"
+      shift 2
+      ;;
+    --main-app-launch-intent-json)
+      MAIN_APP_LAUNCH_INTENT_JSON="${2:-}"
       shift 2
       ;;
     -h|--help)
@@ -69,10 +74,14 @@ if [[ -z "$TTY_PATH" || "$TTY_PATH" == "not a tty" || "$TTY_PATH" == /dev/pts/* 
 fi
 
 run_direct() {
+  local cmd=("$BIN_PATH" serve --runtime host --socket-path "$SOCKET_PATH")
+  if [[ -n "$MAIN_APP_LAUNCH_INTENT_JSON" ]]; then
+    cmd+=(--main-app-launch-intent-json "$MAIN_APP_LAUNCH_INTENT_JSON")
+  fi
   exec env \
     XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR_VALUE" \
     LIBSEAT_BACKEND=seatd \
-    "$BIN_PATH" serve --runtime host --socket-path "$SOCKET_PATH"
+    "${cmd[@]}"
 }
 
 if id -nG | tr ' ' '\n' | grep -qx "$SOCKET_GROUP"; then
@@ -81,8 +90,12 @@ fi
 
 if id -nG "$USER" | tr ' ' '\n' | grep -qx "$SOCKET_GROUP"; then
   echo "current shell missing '$SOCKET_GROUP'; entering group for this launch" >&2
-  CMD="$(printf 'XDG_RUNTIME_DIR=%q LIBSEAT_BACKEND=seatd %q serve --runtime host --socket-path %q' \
-    "$XDG_RUNTIME_DIR_VALUE" "$BIN_PATH" "$SOCKET_PATH")"
+  MAIN_APP_ARG=""
+  if [[ -n "$MAIN_APP_LAUNCH_INTENT_JSON" ]]; then
+    printf -v MAIN_APP_ARG ' --main-app-launch-intent-json %q' "$MAIN_APP_LAUNCH_INTENT_JSON"
+  fi
+  CMD="$(printf 'XDG_RUNTIME_DIR=%q LIBSEAT_BACKEND=seatd %q serve --runtime host --socket-path %q%s' \
+    "$XDG_RUNTIME_DIR_VALUE" "$BIN_PATH" "$SOCKET_PATH" "$MAIN_APP_ARG")"
   exec sg "$SOCKET_GROUP" -c "$CMD"
 fi
 

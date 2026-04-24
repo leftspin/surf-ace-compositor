@@ -9,14 +9,16 @@ EVIDENCE_DIR="/tmp/surf-ace-zsh-main-verify-$(date -u +%Y%m%dT%H%M%SZ)"
 TIMEOUT_SECONDS=60
 APP_ID="surf-ace-zsh-demo"
 TERMINAL=""
+MAIN_APP_START_DELAY_SECONDS="${SURF_ACE_MAIN_APP_START_DELAY_SECONDS:-1}"
 
 usage() {
   cat <<'USAGE'
 Usage: verify-zsh-main-host-seatd.sh [--socket-path <path>] [--evidence-dir <dir>] [--timeout-seconds <n>] [--terminal <name>]
 
 Launches the compositor through the seatd host launcher, waits for running state,
-applies 90-degree CCW output rotation, starts a supported Wayland terminal as the
-fullscreen main app, runs zsh inside it, and keeps the session live for operator
+applies 90-degree CCW output rotation, selects a supported Wayland terminal as the
+fullscreen main app through the compositor's explicit launch contract, runs zsh
+inside it, and keeps the session live for operator
 verification.
 
 Supported terminal names: foot, ghostty, kitty, wezterm, alacritty
@@ -92,25 +94,40 @@ select_terminal() {
   esac
 }
 
-terminal_command() {
+terminal_binding_app_id() {
   case "$TERMINAL" in
-    foot)
-      printf '%s\0' foot --app-id "$APP_ID" zsh -i
-      ;;
     ghostty)
-      printf '%s\0' ghostty --class="$APP_ID" -e zsh -i
+      # Observed on the live Wayland socket: Ghostty keeps app_id fixed to
+      # com.mitchellh.ghostty even when launched with --class=<value>.
+      printf '%s\n' 'com.mitchellh.ghostty'
       ;;
-    kitty)
-      printf '%s\0' kitty --class "$APP_ID" zsh -i
-      ;;
-    wezterm)
-      printf '%s\0' wezterm start --class "$APP_ID" -- zsh -i
-      ;;
-    alacritty)
-      printf '%s\0' alacritty --class "$APP_ID","$APP_ID" -e zsh -i
+    *)
+      printf '%s\n' "$APP_ID"
       ;;
   esac
 }
+
+terminal_command() {
+  case "$TERMINAL" in
+    foot)
+      printf '%s\0' foot --app-id "$APP_ID" /bin/sh -lc "sleep $MAIN_APP_START_DELAY_SECONDS; exec zsh -i"
+      ;;
+    ghostty)
+      printf '%s\0' ghostty --class="$APP_ID" -e /bin/sh -lc "sleep $MAIN_APP_START_DELAY_SECONDS; exec zsh -i"
+      ;;
+    kitty)
+      printf '%s\0' kitty --class "$APP_ID" /bin/sh -lc "sleep $MAIN_APP_START_DELAY_SECONDS; exec zsh -i"
+      ;;
+    wezterm)
+      printf '%s\0' wezterm start --class "$APP_ID" -- /bin/sh -lc "sleep $MAIN_APP_START_DELAY_SECONDS; exec zsh -i"
+      ;;
+    alacritty)
+      printf '%s\0' alacritty --class "$APP_ID","$APP_ID" -e /bin/sh -lc "sleep $MAIN_APP_START_DELAY_SECONDS; exec zsh -i"
+      ;;
+  esac
+}
+
+
 
 require_cmd jq
 require_cmd zsh
@@ -128,6 +145,27 @@ fi
 
 select_terminal
 
+BINDING_APP_ID="$(terminal_binding_app_id)"
+mapfile -d '' -t TERMINAL_COMMAND < <(terminal_command)
+MAIN_APP_LAUNCH_INTENT_JSON="$(
+  jq -nc \
+    --arg command "${TERMINAL_COMMAND[0]}" \
+    --arg app_id "$BINDING_APP_ID" \
+    --args "${TERMINAL_COMMAND[@]:1}" '
+      {
+        process: {
+          command: $command,
+          args: $ARGS.positional,
+          env: {}
+        },
+        binding: {
+          kind: "app_id",
+          app_id: $app_id
+        }
+      }
+    '
+)"
+
 other_host_runtime=()
 while IFS='|' read -r pid cmdline; do
   if [[ "$cmdline" == *" serve --runtime host "* && "$cmdline" != *" --socket-path $SOCKET_PATH"* ]]; then
@@ -142,18 +180,18 @@ if (( ${#other_host_runtime[@]} > 0 )); then
 fi
 
 mkdir -p "$EVIDENCE_DIR"
+printf '%s\n' "$MAIN_APP_LAUNCH_INTENT_JSON" >"$EVIDENCE_DIR/main_app_launch_intent.json"
 COMPOSITOR_LOG="$EVIDENCE_DIR/compositor.log"
-TERMINAL_LOG="$EVIDENCE_DIR/terminal.log"
 
 COMPOSITOR_PID=""
-TERMINAL_PID=""
+MAIN_APP_PID=""
 STARTED_COMPOSITOR="false"
 
 cleanup() {
   local rc="$?"
-  if [[ -n "$TERMINAL_PID" ]] && kill -0 "$TERMINAL_PID" >/dev/null 2>&1; then
-    kill "$TERMINAL_PID" >/dev/null 2>&1 || true
-    wait "$TERMINAL_PID" >/dev/null 2>&1 || true
+  if [[ -n "$MAIN_APP_PID" ]] && kill -0 "$MAIN_APP_PID" >/dev/null 2>&1; then
+    kill "$MAIN_APP_PID" >/dev/null 2>&1 || true
+    wait "$MAIN_APP_PID" >/dev/null 2>&1 || true
   fi
   if [[ "$STARTED_COMPOSITOR" == "true" && -n "$COMPOSITOR_PID" ]] && kill -0 "$COMPOSITOR_PID" >/dev/null 2>&1; then
     kill "$COMPOSITOR_PID" >/dev/null 2>&1 || true
@@ -192,7 +230,10 @@ fi
 
 if [[ -z "$wayland_socket" ]]; then
   echo "starting compositor via seatd launcher..."
-  "$LAUNCHER" --socket-path "$SOCKET_PATH" >"$COMPOSITOR_LOG" 2>&1 &
+  "$LAUNCHER" \
+    --socket-path "$SOCKET_PATH" \
+    --main-app-launch-intent-json "$MAIN_APP_LAUNCH_INTENT_JSON" \
+    >"$COMPOSITOR_LOG" 2>&1 &
   COMPOSITOR_PID="$!"
   STARTED_COMPOSITOR="true"
   echo "compositor_pid=$COMPOSITOR_PID"
@@ -229,11 +270,13 @@ if [[ -z "$wayland_socket" ]]; then
   exit 1
 fi
 
-match_response="$($CONTROL_BIN ctl --socket-path "$SOCKET_PATH" --request-json "{\"type\":\"set_runtime_main_app_match_hint\",\"hint\":\"$APP_ID\"}")"
-printf '%s\n' "$match_response" >"$EVIDENCE_DIR/match_hint_response.json"
-if [[ "$(printf '%s\n' "$match_response" | jq -r '.ok // false')" != "true" ]]; then
-  echo "main-app match-hint request failed: $match_response" >&2
-  exit 1
+if [[ "$STARTED_COMPOSITOR" != "true" ]]; then
+  main_app_response="$($CONTROL_BIN ctl --socket-path "$SOCKET_PATH" --request-json "{\"type\":\"set_main_app_launch_intent\",\"intent\":$MAIN_APP_LAUNCH_INTENT_JSON}")"
+  printf '%s\n' "$main_app_response" >"$EVIDENCE_DIR/main_app_launch_response.json"
+  if [[ "$(printf '%s\n' "$main_app_response" | jq -r '.ok // false')" != "true" ]]; then
+    echo "main-app launch-intent request failed: $main_app_response" >&2
+    exit 1
+  fi
 fi
 
 rotation_response="$($CONTROL_BIN ctl --socket-path "$SOCKET_PATH" --request-json '{"type":"set_output_rotation","rotation":"deg90"}')"
@@ -248,38 +291,19 @@ if [[ "$(printf '%s\n' "$rotation_response" | jq -r '.status.output_rotation // 
   exit 1
 fi
 
-UID_VALUE="$(id -u)"
-XDG_RUNTIME_DIR_VALUE="${XDG_RUNTIME_DIR:-/run/user/$UID_VALUE}"
-if [[ ! -d "$XDG_RUNTIME_DIR_VALUE" ]]; then
-  echo "missing XDG runtime dir: $XDG_RUNTIME_DIR_VALUE" >&2
-  exit 1
-fi
-
-mapfile -d '' -t TERMINAL_COMMAND < <(terminal_command)
-
-echo "starting $TERMINAL as compositor main app on WAYLAND_DISPLAY=$wayland_socket"
-env XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR_VALUE" WAYLAND_DISPLAY="$wayland_socket" \
-  "${TERMINAL_COMMAND[@]}" >"$TERMINAL_LOG" 2>&1 &
-TERMINAL_PID="$!"
-echo "terminal_pid=$TERMINAL_PID"
-
 main_bound="false"
 deadline=$((SECONDS + 15))
 while (( SECONDS < deadline )); do
-  if ! kill -0 "$TERMINAL_PID" >/dev/null 2>&1; then
-    echo "terminal exited unexpectedly; see $TERMINAL_LOG" >&2
-    tail -n 40 "$TERMINAL_LOG" >&2 || true
-    exit 1
-  fi
-
   status_json="$($CONTROL_BIN ctl --socket-path "$SOCKET_PATH" --request-json '{"type":"get_status"}')"
   printf '%s\n' "$status_json" >"$EVIDENCE_DIR/status_after_terminal_latest.json"
 
   phase="$(printf '%s\n' "$status_json" | jq -r '.status.runtime.phase // empty')"
   rotation="$(printf '%s\n' "$status_json" | jq -r '.status.output_rotation // empty')"
   main_app_surface_id="$(printf '%s\n' "$status_json" | jq -r '.status.runtime.main_app_surface_id // empty')"
+  main_app_state="$(printf '%s\n' "$status_json" | jq -r '.status.runtime.main_app_launch_state.state // empty')"
+  MAIN_APP_PID="$(printf '%s\n' "$status_json" | jq -r '.status.runtime.main_app_launch_state.pid // empty')"
 
-  if [[ "$phase" == "running" && "$rotation" == "deg90" && -n "$main_app_surface_id" && "$main_app_surface_id" != "null" ]]; then
+  if [[ "$phase" == "running" && "$rotation" == "deg90" && "$main_app_state" == "attached" && -n "$main_app_surface_id" && "$main_app_surface_id" != "null" ]]; then
     printf '%s\n' "$status_json" >"$EVIDENCE_DIR/status_zsh_ready.json"
     main_bound="true"
     break
@@ -297,11 +321,21 @@ cat >"$EVIDENCE_DIR/summary.txt" <<SUMMARY
 phase=running
 output_rotation=deg90
 main_app_terminal=$TERMINAL
-main_app_hint=$APP_ID
-terminal_pid=$TERMINAL_PID
+main_app_binding=app_id:$BINDING_APP_ID
+main_app_pid=$MAIN_APP_PID
 wayland_socket=$wayland_socket
 SUMMARY
 
 echo "zsh main-app verification ready; status evidence in $EVIDENCE_DIR"
 echo "Press Ctrl-C when finished inspecting the rotated zsh session."
-wait "$TERMINAL_PID"
+while true; do
+  if [[ "$STARTED_COMPOSITOR" == "true" && -n "$COMPOSITOR_PID" ]] && ! kill -0 "$COMPOSITOR_PID" >/dev/null 2>&1; then
+    echo "compositor exited; see $COMPOSITOR_LOG" >&2
+    exit 1
+  fi
+  if [[ -n "$MAIN_APP_PID" ]] && ! kill -0 "$MAIN_APP_PID" >/dev/null 2>&1; then
+    echo "main app exited; see latest status under $EVIDENCE_DIR" >&2
+    exit 1
+  fi
+  sleep 1
+done
