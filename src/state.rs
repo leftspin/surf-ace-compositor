@@ -589,6 +589,75 @@ impl CompositorState {
         Ok(())
     }
 
+    pub fn launch_native_pane_hosts(&mut self, pane_ids: Vec<PaneId>) -> Result<(), StateError> {
+        let selected_pane_ids = if pane_ids.is_empty() {
+            let mut ids: Vec<_> = self
+                .panes
+                .iter()
+                .filter_map(|(pane_id, pane)| match pane.render_mode {
+                    PaneRenderMode::ExternalNative { .. } => Some(pane_id.clone()),
+                    PaneRenderMode::SurfAceRendered => None,
+                })
+                .collect();
+            ids.sort();
+            ids
+        } else {
+            pane_ids
+        };
+
+        for pane_id in selected_pane_ids {
+            let (process, should_launch) = {
+                let pane = self
+                    .panes
+                    .get(&pane_id)
+                    .ok_or_else(|| StateError::PaneNotFound(pane_id.clone()))?;
+                let PaneRenderMode::ExternalNative { process, .. } = &pane.render_mode else {
+                    return Err(StateError::PaneNotExternalNative(pane_id.clone()));
+                };
+                let should_launch = matches!(
+                    pane.external_native_state,
+                    ExternalNativeLifecycleState::Absent
+                        | ExternalNativeLifecycleState::Failed { .. }
+                        | ExternalNativeLifecycleState::Exited { .. }
+                );
+                (process.clone(), should_launch)
+            };
+
+            if !should_launch {
+                continue;
+            }
+
+            let mut extra_env = BTreeMap::new();
+            extra_env.insert("SURF_ACE_COMPOSITOR_HOST_MODE".to_string(), "1".to_string());
+            extra_env.insert("SURF_ACE_PANE_ID".to_string(), pane_id.0.clone());
+            if let Some(wayland_socket) = self.runtime.wayland_socket.clone() {
+                extra_env.insert("WAYLAND_DISPLAY".to_string(), wayland_socket);
+            }
+
+            match self.process_controller.spawn(&process, &extra_env) {
+                Ok(pid) => {
+                    let pane = self
+                        .panes
+                        .get_mut(&pane_id)
+                        .ok_or_else(|| StateError::PaneNotFound(pane_id.clone()))?;
+                    pane.external_native_state = ExternalNativeLifecycleState::Launching { pid };
+                }
+                Err(err) => {
+                    let pane = self
+                        .panes
+                        .get_mut(&pane_id)
+                        .ok_or_else(|| StateError::PaneNotFound(pane_id.clone()))?;
+                    pane.external_native_state = ExternalNativeLifecycleState::Failed {
+                        reason: err.clone(),
+                    };
+                    return Err(StateError::Process(err));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn mark_external_surface_attached(&mut self, pane_id: &PaneId) -> Result<(), StateError> {
         let pane = self
             .panes
@@ -1238,6 +1307,90 @@ mod tests {
             PaneRenderMode::SurfAceRendered
         ));
         assert!(status.prototype_policy.active_overlay_pane.is_none());
+    }
+
+    #[test]
+    fn native_pane_hosts_launch_and_report_lifecycle_per_pane() {
+        let process = FakeProcessController::default();
+        let process_view = process.clone();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            1280,
+            720,
+        );
+        state
+            .apply_native_pane_host_plan(vec![
+                NativePaneHostRequest {
+                    id: PaneId::new("left"),
+                    geometry: PaneGeometry {
+                        x: 0,
+                        y: 0,
+                        width: 640,
+                        height: 720,
+                    },
+                    target: NativeTargetClass::Terminal,
+                    process: terminal_process(),
+                },
+                NativePaneHostRequest {
+                    id: PaneId::new("right"),
+                    geometry: PaneGeometry {
+                        x: 640,
+                        y: 0,
+                        width: 640,
+                        height: 720,
+                    },
+                    target: NativeTargetClass::Terminal,
+                    process: ProcessSpec {
+                        command: "ghostty".to_string(),
+                        args: vec!["-e".to_string(), "top".to_string()],
+                        cwd: None,
+                        env: BTreeMap::new(),
+                    },
+                },
+            ])
+            .expect("native pane host plan should apply");
+
+        state
+            .launch_native_pane_hosts(Vec::new())
+            .expect("empty launch set should launch all planned native panes");
+
+        let status = state.status_snapshot();
+        assert_eq!(
+            status.panes[0].external_native_state,
+            ExternalNativeLifecycleState::Launching { pid: 1 }
+        );
+        assert_eq!(
+            status.panes[1].external_native_state,
+            ExternalNativeLifecycleState::Launching { pid: 2 }
+        );
+        assert_eq!(process_view.spawned_env().len(), 2);
+        assert_eq!(
+            process_view.spawned_env()[0].get("SURF_ACE_PANE_ID"),
+            Some(&"left".to_string())
+        );
+        assert_eq!(
+            process_view.spawned_env()[0].get("WAYLAND_DISPLAY"),
+            Some(&"wayland-77".to_string())
+        );
+        assert_eq!(
+            process_view.spawned_env()[1].get("SURF_ACE_PANE_ID"),
+            Some(&"right".to_string())
+        );
+
+        state
+            .mark_external_surface_attached(&PaneId::new("left"))
+            .expect("left pane should attach independently");
+        let status = state.status_snapshot();
+        assert_eq!(
+            status.panes[0].external_native_state,
+            ExternalNativeLifecycleState::Attached { pid: 1 }
+        );
+        assert_eq!(
+            status.panes[1].external_native_state,
+            ExternalNativeLifecycleState::Launching { pid: 2 }
+        );
     }
 
     #[test]

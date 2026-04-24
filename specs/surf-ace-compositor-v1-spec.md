@@ -206,6 +206,13 @@ compositor records and later realizes those native surface slots. The compositor
 must not derive new panes or reinterpret provider geometry as its own layout
 model.
 
+Launching native pane hosts is a separate lifecycle transition from recording the
+plan. Surf Ace can ask the compositor to launch a selected set of recorded native
+pane hosts, or all recorded native pane hosts, and each pane reports its own
+`absent`/`launching`/`attached`/`failed`/`exited` lifecycle. Launching a native
+pane host must carry the Surf Ace pane identity into the process environment so
+later surface binding and status reconciliation can stay pane-scoped.
+
 V1 does not need a generalized external-app schema beyond that minimum contract.
 
 ## Recommended Stack

@@ -27,6 +27,10 @@ pub enum ControlRequest {
     ApplyNativePaneHostPlan {
         panes: Vec<NativePaneHostRequest>,
     },
+    LaunchNativePaneHosts {
+        #[serde(default)]
+        pane_ids: Vec<PaneId>,
+    },
     SwitchPaneToExternalNative {
         pane_id: PaneId,
         target: NativeTargetClass,
@@ -280,6 +284,10 @@ fn handle_request_with_capture(
             .apply_native_pane_host_plan(panes)
             .map(|_| Some(state.status_snapshot()))
             .map_err(|err| err.to_string()),
+        ControlRequest::LaunchNativePaneHosts { pane_ids } => state
+            .launch_native_pane_hosts(pane_ids)
+            .map(|_| Some(state.status_snapshot()))
+            .map_err(|err| err.to_string()),
         ControlRequest::SwitchPaneToExternalNative {
             pane_id,
             target,
@@ -374,9 +382,9 @@ fn handle_request_with_capture(
 mod tests {
     use super::*;
     use crate::model::{
-        HostRuntimeStartTrigger, NativePaneHostRequest, PaneGeometry, PaneRenderMode, ProcessSpec,
-        RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeHostPresentOwnership,
-        RuntimeHostQueuedPresentSource,
+        ExternalNativeLifecycleState, HostRuntimeStartTrigger, NativePaneHostRequest, PaneGeometry,
+        PaneRenderMode, ProcessSpec, RuntimeBackend, RuntimeDmabufFormatStatus,
+        RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource,
     };
     use crate::process_manager::{ProcessController, ProcessExit};
     use crate::screen_capture::ScreenCaptureStore;
@@ -504,6 +512,51 @@ mod tests {
             status.panes[1].render_mode,
             PaneRenderMode::ExternalNative { .. }
         ));
+        assert!(status.prototype_policy.active_overlay_pane.is_none());
+    }
+
+    #[test]
+    fn launch_native_pane_hosts_starts_recorded_panes_without_layout_authority() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let plan_response = handle_request(
+            &mut state,
+            ControlRequest::ApplyNativePaneHostPlan {
+                panes: vec![NativePaneHostRequest {
+                    id: PaneId::new("pane-a"),
+                    geometry: PaneGeometry {
+                        x: 10,
+                        y: 20,
+                        width: 300,
+                        height: 200,
+                    },
+                    target: NativeTargetClass::Terminal,
+                    process: ProcessSpec {
+                        command: "foot".to_string(),
+                        args: vec!["top".to_string()],
+                        cwd: None,
+                        env: BTreeMap::new(),
+                    },
+                }],
+            },
+            None,
+        );
+        assert!(plan_response.ok);
+
+        let launch_response = handle_request(
+            &mut state,
+            ControlRequest::LaunchNativePaneHosts {
+                pane_ids: vec![PaneId::new("pane-a")],
+            },
+            None,
+        );
+
+        assert!(launch_response.ok);
+        let status = launch_response.status.expect("status should be returned");
+        assert_eq!(status.panes[0].geometry.x, 10);
+        assert_eq!(
+            status.panes[0].external_native_state,
+            ExternalNativeLifecycleState::Launching { pid: 42 }
+        );
         assert!(status.prototype_policy.active_overlay_pane.is_none());
     }
 
