@@ -941,6 +941,24 @@ mod tests {
     }
 
     #[test]
+    fn ghostty_launch_shorthand_keeps_generic_binding_contract() {
+        let parsed =
+            parse_main_app_launch_shorthand("ghostty").expect("ghostty shorthand should parse");
+
+        assert_eq!(
+            parsed.binding,
+            MainAppSurfaceBinding::AppId {
+                app_id: "surf-ace-main-app".to_string()
+            }
+        );
+        assert_eq!(parsed.process.command, "ghostty");
+        assert_eq!(
+            parsed.process.args,
+            vec!["--class=surf-ace-main-app".to_string()]
+        );
+    }
+
+    #[test]
     fn launch_shorthand_is_mutually_exclusive_with_json_intent() {
         let err = resolve_main_app_launch_intent(
             Some("{\"process\":{\"command\":\"foot\"},\"binding\":{\"kind\":\"app_id\",\"app_id\":\"surf-ace\"}}"),

@@ -4,7 +4,7 @@ use crate::model::{
     NativeTargetClass, OutputRotation, PaneId, PaneRenderMode, PaneStatus, ProcessSpec,
     ProviderPaneSnapshot, RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeFocusTarget,
     RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource, RuntimeHostSelectionState,
-    RuntimePhase, RuntimeSelectionMode, RuntimeStatus, StatusSnapshot,
+    RuntimePhase, RuntimeSelectionMode, RuntimeStatus, StatusSnapshot, SurfaceBindingEvidence,
 };
 use crate::policy::{PrototypeOverlayPolicy, PrototypePolicyError};
 use crate::process_manager::ProcessController;
@@ -18,6 +18,7 @@ struct PaneRuntimeState {
     geometry: crate::model::PaneGeometry,
     render_mode: PaneRenderMode,
     external_native_state: ExternalNativeLifecycleState,
+    external_native_binding_evidence: Option<SurfaceBindingEvidence>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -58,6 +59,7 @@ impl CompositorState {
         self.runtime.window_width = None;
         self.runtime.window_height = None;
         self.runtime.main_app_surface_id = None;
+        self.runtime.main_app_binding_evidence = None;
         self.runtime.overlay_surface_id = None;
         self.runtime.overlay_bound_pane_id = None;
         self.runtime.active_focus_target = None;
@@ -125,6 +127,7 @@ impl CompositorState {
 
         self.terminate_running_main_app_process();
         self.runtime.main_app_surface_id = None;
+        self.runtime.main_app_binding_evidence = None;
         self.runtime.main_app_launch_intent = Some(intent);
         self.runtime.main_app_launch_state = MainAppLaunchState::WaitingForRuntime;
         self.launch_configured_main_app_if_runtime_ready();
@@ -173,6 +176,7 @@ impl CompositorState {
         self.runtime.window_width = None;
         self.runtime.window_height = None;
         self.runtime.main_app_surface_id = None;
+        self.runtime.main_app_binding_evidence = None;
         self.runtime.overlay_surface_id = None;
         self.runtime.overlay_bound_pane_id = None;
         self.runtime.active_focus_target = None;
@@ -393,12 +397,26 @@ impl CompositorState {
     }
 
     pub fn runtime_mark_main_app_surface_attached_for_pid(&mut self, client_pid: u32) -> bool {
+        self.runtime_mark_main_app_surface_attached_for_pid_with_evidence(client_pid, None)
+    }
+
+    pub fn runtime_mark_main_app_surface_attached_for_pid_with_evidence(
+        &mut self,
+        client_pid: u32,
+        evidence: Option<SurfaceBindingEvidence>,
+    ) -> bool {
         match self.runtime.main_app_launch_state {
             MainAppLaunchState::Launching { pid } if pid == client_pid => {
                 self.runtime.main_app_launch_state = MainAppLaunchState::Attached { pid };
+                self.runtime.main_app_binding_evidence = evidence;
                 true
             }
-            MainAppLaunchState::Attached { pid } if pid == client_pid => true,
+            MainAppLaunchState::Attached { pid } if pid == client_pid => {
+                if evidence.is_some() {
+                    self.runtime.main_app_binding_evidence = evidence;
+                }
+                true
+            }
             MainAppLaunchState::NotRequested
             | MainAppLaunchState::WaitingForRuntime
             | MainAppLaunchState::Launching { .. }
@@ -412,6 +430,7 @@ impl CompositorState {
         match self.runtime.main_app_launch_state {
             MainAppLaunchState::Attached { pid } if pid == client_pid => {
                 self.runtime.main_app_launch_state = MainAppLaunchState::Launching { pid };
+                self.runtime.main_app_binding_evidence = None;
                 true
             }
             MainAppLaunchState::Launching { pid } if pid == client_pid => true,
@@ -466,11 +485,13 @@ impl CompositorState {
                     geometry: pane.geometry,
                     render_mode: prev.render_mode.clone(),
                     external_native_state: prev.external_native_state.clone(),
+                    external_native_binding_evidence: prev.external_native_binding_evidence.clone(),
                 },
                 None => PaneRuntimeState {
                     geometry: pane.geometry,
                     render_mode: PaneRenderMode::SurfAceRendered,
                     external_native_state: ExternalNativeLifecycleState::Absent,
+                    external_native_binding_evidence: None,
                 },
             };
             incoming.insert(pane.id, runtime);
@@ -569,6 +590,7 @@ impl CompositorState {
                     geometry: request.geometry,
                     render_mode: PaneRenderMode::SurfAceRendered,
                     external_native_state: ExternalNativeLifecycleState::Absent,
+                    external_native_binding_evidence: None,
                 });
             let next_mode = PaneRenderMode::ExternalNative {
                 target: request.target,
@@ -582,6 +604,7 @@ impl CompositorState {
                         .map_err(StateError::Process)?;
                 }
                 pane.external_native_state = ExternalNativeLifecycleState::Absent;
+                pane.external_native_binding_evidence = None;
             }
             pane.render_mode = next_mode;
         }
@@ -641,6 +664,7 @@ impl CompositorState {
                         .get_mut(&pane_id)
                         .ok_or_else(|| StateError::PaneNotFound(pane_id.clone()))?;
                     pane.external_native_state = ExternalNativeLifecycleState::Launching { pid };
+                    pane.external_native_binding_evidence = None;
                 }
                 Err(err) => {
                     let pane = self
@@ -659,6 +683,14 @@ impl CompositorState {
     }
 
     pub fn mark_external_surface_attached(&mut self, pane_id: &PaneId) -> Result<(), StateError> {
+        self.mark_external_surface_attached_with_evidence(pane_id, None)
+    }
+
+    pub fn mark_external_surface_attached_with_evidence(
+        &mut self,
+        pane_id: &PaneId,
+        evidence: Option<SurfaceBindingEvidence>,
+    ) -> Result<(), StateError> {
         let pane = self
             .panes
             .get_mut(pane_id)
@@ -669,7 +701,36 @@ impl CompositorState {
         };
 
         pane.external_native_state = ExternalNativeLifecycleState::Attached { pid };
+        pane.external_native_binding_evidence = evidence;
         Ok(())
+    }
+
+    pub fn runtime_mark_native_pane_surface_attached_for_pid(
+        &mut self,
+        client_pid: u32,
+        evidence: Option<SurfaceBindingEvidence>,
+    ) -> Option<PaneId> {
+        for (pane_id, pane) in &mut self.panes {
+            if !matches!(pane.render_mode, PaneRenderMode::ExternalNative { .. }) {
+                continue;
+            }
+            match pane.external_native_state {
+                ExternalNativeLifecycleState::Launching { pid }
+                | ExternalNativeLifecycleState::Attached { pid }
+                    if pid == client_pid =>
+                {
+                    pane.external_native_state = ExternalNativeLifecycleState::Attached { pid };
+                    pane.external_native_binding_evidence = evidence;
+                    return Some(pane_id.clone());
+                }
+                ExternalNativeLifecycleState::Absent
+                | ExternalNativeLifecycleState::Launching { .. }
+                | ExternalNativeLifecycleState::Attached { .. }
+                | ExternalNativeLifecycleState::Failed { .. }
+                | ExternalNativeLifecycleState::Exited { .. } => {}
+            }
+        }
+        None
     }
 
     pub fn switch_pane_to_surf_ace(&mut self, pane_id: &PaneId) -> Result<(), StateError> {
@@ -686,6 +747,7 @@ impl CompositorState {
 
         pane.render_mode = PaneRenderMode::SurfAceRendered;
         pane.external_native_state = ExternalNativeLifecycleState::Absent;
+        pane.external_native_binding_evidence = None;
         self.prototype_overlay_policy.release_if_matches(pane_id);
         Ok(())
     }
@@ -760,6 +822,7 @@ impl CompositorState {
         match pane.external_native_state {
             ExternalNativeLifecycleState::Launching { pid } if pid == client_pid => {
                 pane.external_native_state = ExternalNativeLifecycleState::Attached { pid };
+                pane.external_native_binding_evidence = None;
                 true
             }
             ExternalNativeLifecycleState::Attached { pid } if pid == client_pid => true,
@@ -799,6 +862,7 @@ impl CompositorState {
         match pane.external_native_state {
             ExternalNativeLifecycleState::Attached { pid } if pid == client_pid => {
                 pane.external_native_state = ExternalNativeLifecycleState::Launching { pid };
+                pane.external_native_binding_evidence = None;
                 true
             }
             ExternalNativeLifecycleState::Launching { pid } if pid == client_pid => true,
@@ -824,6 +888,7 @@ impl CompositorState {
             {
                 self.runtime.main_app_launch_state = MainAppLaunchState::Exited { pid, exit_code };
                 self.runtime.main_app_surface_id = None;
+                self.runtime.main_app_binding_evidence = None;
                 if self.runtime.active_focus_target == Some(RuntimeFocusTarget::MainApp) {
                     self.runtime.active_focus_target = None;
                 }
@@ -843,6 +908,7 @@ impl CompositorState {
             if running_pid(&pane.external_native_state) == Some(pid) {
                 pane.external_native_state =
                     ExternalNativeLifecycleState::Exited { pid, exit_code };
+                pane.external_native_binding_evidence = None;
             }
         }
     }
@@ -864,6 +930,7 @@ impl CompositorState {
                 geometry: state.geometry,
                 render_mode: state.render_mode.clone(),
                 external_native_state: state.external_native_state.clone(),
+                external_native_binding_evidence: state.external_native_binding_evidence.clone(),
                 external_native_event_contract: match state.render_mode {
                     PaneRenderMode::ExternalNative { .. } => {
                         Some(ExternalNativeEventContract::terminal_v1())
@@ -971,12 +1038,14 @@ impl CompositorState {
             Ok(pid) => {
                 self.runtime.main_app_launch_state = MainAppLaunchState::Launching { pid };
                 self.runtime.main_app_surface_id = None;
+                self.runtime.main_app_binding_evidence = None;
             }
             Err(err) => {
                 self.runtime.main_app_launch_state = MainAppLaunchState::Failed {
                     reason: err.clone(),
                 };
                 self.runtime.main_app_surface_id = None;
+                self.runtime.main_app_binding_evidence = None;
             }
         }
     }
@@ -984,6 +1053,7 @@ impl CompositorState {
     fn prepare_main_app_for_runtime_reset(&mut self) {
         self.terminate_running_main_app_process();
         self.runtime.main_app_surface_id = None;
+        self.runtime.main_app_binding_evidence = None;
         self.runtime.main_app_launch_state = if self.runtime.main_app_launch_intent.is_some() {
             MainAppLaunchState::WaitingForRuntime
         } else {
@@ -1031,7 +1101,7 @@ mod tests {
     use super::*;
     use crate::model::{
         MainAppLaunchIntent, MainAppLaunchState, MainAppSurfaceBinding, PaneGeometry,
-        ProviderPaneSnapshot,
+        ProviderPaneSnapshot, SurfaceBindingEvidence, SurfaceBindingEvidenceOutcome,
     };
     use crate::process_manager::{ProcessController, ProcessExit};
     use std::collections::{BTreeMap, HashSet};
@@ -1394,6 +1464,59 @@ mod tests {
     }
 
     #[test]
+    fn native_pane_surface_reconciles_by_launched_pid_and_reports_evidence() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            1280,
+            720,
+        );
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: PaneId::new("left"),
+                geometry: PaneGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 640,
+                    height: 720,
+                },
+                target: NativeTargetClass::Terminal,
+                process: terminal_process(),
+            }])
+            .expect("native pane host plan should apply");
+        state
+            .launch_native_pane_hosts(Vec::new())
+            .expect("native pane should launch");
+
+        let evidence = SurfaceBindingEvidence {
+            app_id: Some("unexpected-terminal-id".to_string()),
+            title: None,
+            outcome: SurfaceBindingEvidenceOutcome::NotRequired,
+        };
+        assert_eq!(
+            state.runtime_mark_native_pane_surface_attached_for_pid(1, Some(evidence.clone())),
+            Some(PaneId::new("left"))
+        );
+
+        let status = state.status_snapshot();
+        assert_eq!(
+            status.panes[0].external_native_state,
+            ExternalNativeLifecycleState::Attached { pid: 1 }
+        );
+        assert_eq!(
+            status.panes[0].external_native_binding_evidence,
+            Some(evidence)
+        );
+        assert!(
+            state
+                .runtime_mark_native_pane_surface_attached_for_pid(99, None)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn external_native_mode_is_explicit_not_html() {
         let process = FakeProcessController::default();
         let mut state = CompositorState::new(true, Box::new(process));
@@ -1717,6 +1840,40 @@ mod tests {
                 exit_code: Some(0)
             }
         );
+    }
+
+    #[test]
+    fn launched_main_app_records_binding_evidence_without_making_app_id_authority() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state
+            .select_main_app_launch_intent(main_app_intent())
+            .expect("main app intent should be accepted");
+        state.mark_runtime_running(
+            RuntimeBackend::Winit,
+            Some("wayland-55".to_string()),
+            1280,
+            800,
+        );
+
+        let evidence = SurfaceBindingEvidence {
+            app_id: Some("com.mitchellh.ghostty".to_string()),
+            title: Some("top".to_string()),
+            outcome: SurfaceBindingEvidenceOutcome::MismatchesIntent,
+        };
+
+        assert!(
+            state.runtime_mark_main_app_surface_attached_for_pid_with_evidence(
+                1,
+                Some(evidence.clone())
+            )
+        );
+        let runtime = state.status_snapshot().runtime;
+        assert_eq!(
+            runtime.main_app_launch_state,
+            MainAppLaunchState::Attached { pid: 1 }
+        );
+        assert_eq!(runtime.main_app_binding_evidence, Some(evidence));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::model::{
-    MainAppSurfaceBindingMatch, OutputRotation, RuntimeBackend, RuntimeDmabufFormatStatus,
-    RuntimeFocusTarget, RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource,
-    RuntimeHostSelectionState, RuntimeSelectionMode,
+    OutputRotation, RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeFocusTarget,
+    RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource, RuntimeHostSelectionState,
+    RuntimeSelectionMode, SurfaceBindingEvidence, SurfaceBindingEvidenceOutcome,
 };
 use crate::output_rotation_model::OutputRotationModel;
 use crate::screen_capture::ScreenCaptureStore;
@@ -4445,6 +4445,18 @@ fn toplevel_surface_source_rect(surface: &ToplevelSurface) -> Rectangle<i32, Log
     })
 }
 
+fn toplevel_identity(surface: &ToplevelSurface) -> (Option<String>, Option<String>) {
+    smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
+        let attrs = states
+            .data_map
+            .get::<XdgToplevelSurfaceData>()
+            .and_then(|data| data.lock().ok());
+        let app_id = attrs.as_ref().and_then(|attrs| attrs.app_id.clone());
+        let title = attrs.as_ref().and_then(|attrs| attrs.title.clone());
+        (app_id, title)
+    })
+}
+
 impl RoleSurfaceMapping {
     fn new(source_bbox: Rectangle<i32, Logical>, target_rect: Rectangle<i32, Logical>) -> Self {
         if source_bbox.size.w <= 0
@@ -4977,9 +4989,10 @@ impl RuntimeWaylandState {
                 state.increment_runtime_denied_toplevel();
                 return;
             };
+            let evidence = self.main_app_binding_evidence_for_surface(&surface);
             self.configure_toplevel_for_role(&surface, RuntimeSurfaceRole::MainApp);
             self.main_toplevel = Some(surface);
-            self.bridge_main_app_surface_attached(client_pid);
+            self.bridge_main_app_surface_attached(client_pid, evidence);
             self.promote_pending_toplevels();
             self.sync_runtime_status_with_roles();
             self.apply_focus_route();
@@ -5042,40 +5055,35 @@ impl RuntimeWaylandState {
         }
     }
 
+    fn main_app_binding_evidence_for_surface(
+        &self,
+        surface: &ToplevelSurface,
+    ) -> Option<SurfaceBindingEvidence> {
+        let binding = self.expected_main_app_surface_binding()?;
+        let (app_id, title) = toplevel_identity(surface);
+        let outcome = SurfaceBindingEvidenceOutcome::from(
+            binding.match_identity(app_id.as_deref(), title.as_deref()),
+        );
+        Some(SurfaceBindingEvidence {
+            app_id,
+            title,
+            outcome,
+        })
+    }
+
     fn classify_toplevel(&self, surface: &ToplevelSurface) -> SurfaceClassification {
-        let (app_id, title) =
-            smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
-                let attrs = states
-                    .data_map
-                    .get::<XdgToplevelSurfaceData>()
-                    .and_then(|data| data.lock().ok());
-                let app_id = attrs.as_ref().and_then(|attrs| attrs.app_id.clone());
-                let title = attrs.as_ref().and_then(|attrs| attrs.title.clone());
-                (app_id, title)
-            });
-
-        if app_id.is_none() && title.is_none() {
-            return SurfaceClassification::PendingIdentity;
-        }
-
-        if let (Some(expected_pid), Some(binding)) = (
-            self.expected_main_app_client_pid(),
-            self.expected_main_app_surface_binding(),
-        ) {
+        if let Some(expected_pid) = self.expected_main_app_client_pid() {
             match self.client_pid_for_toplevel(surface) {
                 Some(client_pid) if client_pid == expected_pid => {
-                    return match binding.match_identity(app_id.as_deref(), title.as_deref()) {
-                        MainAppSurfaceBindingMatch::Match => SurfaceClassification::MainApp,
-                        MainAppSurfaceBindingMatch::Pending => {
-                            SurfaceClassification::PendingIdentity
-                        }
-                        MainAppSurfaceBindingMatch::Mismatch => {
-                            SurfaceClassification::OverlayCandidate
-                        }
-                    };
+                    return SurfaceClassification::MainApp;
                 }
                 Some(_) | None => {}
             }
+        }
+
+        let (app_id, title) = toplevel_identity(surface);
+        if app_id.is_none() && title.is_none() {
+            return SurfaceClassification::PendingIdentity;
         }
 
         SurfaceClassification::OverlayCandidate
@@ -5085,30 +5093,10 @@ impl RuntimeWaylandState {
         let Some(expected_pid) = self.expected_main_app_client_pid() else {
             return false;
         };
-        let Some(binding) = self.expected_main_app_surface_binding() else {
-            return false;
-        };
         let Some(client_pid) = self.client_pid_for_toplevel(surface) else {
             return false;
         };
-        if client_pid != expected_pid {
-            return false;
-        }
-
-        let (app_id, title) =
-            smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
-                let attrs = states
-                    .data_map
-                    .get::<XdgToplevelSurfaceData>()
-                    .and_then(|data| data.lock().ok());
-                let app_id = attrs.as_ref().and_then(|attrs| attrs.app_id.clone());
-                let title = attrs.as_ref().and_then(|attrs| attrs.title.clone());
-                (app_id, title)
-            });
-        matches!(
-            binding.match_identity(app_id.as_deref(), title.as_deref()),
-            MainAppSurfaceBindingMatch::Match
-        )
+        client_pid == expected_pid
     }
 
     fn enforce_main_app_binding_policy(&mut self) {
@@ -5292,6 +5280,17 @@ impl RuntimeWaylandState {
             )
         {
             self.assign_main_role(surface.clone());
+        }
+        if self
+            .main_toplevel
+            .as_ref()
+            .map(|main| same_surface(main.wl_surface(), surface.wl_surface()))
+            .unwrap_or(false)
+        {
+            if let Some(pid) = self.client_pid_for_toplevel(surface) {
+                let evidence = self.main_app_binding_evidence_for_surface(surface);
+                self.bridge_main_app_surface_attached(pid, evidence);
+            }
         }
         self.enforce_main_app_binding_policy();
     }
@@ -5640,9 +5639,14 @@ impl RuntimeWaylandState {
         let _ = state.runtime_mark_overlay_surface_attached_for_pid(client_pid);
     }
 
-    fn bridge_main_app_surface_attached(&self, client_pid: u32) {
+    fn bridge_main_app_surface_attached(
+        &self,
+        client_pid: u32,
+        evidence: Option<SurfaceBindingEvidence>,
+    ) {
         let mut state = lock_state(&self.shared_state);
-        let _ = state.runtime_mark_main_app_surface_attached_for_pid(client_pid);
+        let _ = state
+            .runtime_mark_main_app_surface_attached_for_pid_with_evidence(client_pid, evidence);
     }
 
     fn bridge_overlay_surface_detached(&self, client_pid: u32) {

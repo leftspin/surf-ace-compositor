@@ -118,6 +118,34 @@ pub enum MainAppSurfaceBindingMatch {
     Mismatch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceBindingEvidenceOutcome {
+    MatchesIntent,
+    MismatchesIntent,
+    PendingIdentity,
+    NotRequired,
+}
+
+impl From<MainAppSurfaceBindingMatch> for SurfaceBindingEvidenceOutcome {
+    fn from(value: MainAppSurfaceBindingMatch) -> Self {
+        match value {
+            MainAppSurfaceBindingMatch::Match => Self::MatchesIntent,
+            MainAppSurfaceBindingMatch::Pending => Self::PendingIdentity,
+            MainAppSurfaceBindingMatch::Mismatch => Self::MismatchesIntent,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceBindingEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub outcome: SurfaceBindingEvidenceOutcome,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MainAppLaunchIntent {
     pub process: ProcessSpec,
@@ -221,6 +249,8 @@ pub struct PaneStatus {
     pub geometry: PaneGeometry,
     pub render_mode: PaneRenderMode,
     pub external_native_state: ExternalNativeLifecycleState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_native_binding_evidence: Option<SurfaceBindingEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_native_event_contract: Option<ExternalNativeEventContract>,
 }
@@ -373,6 +403,8 @@ pub struct RuntimeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub main_app_surface_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_app_binding_evidence: Option<SurfaceBindingEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_surface_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_bound_pane_id: Option<PaneId>,
@@ -428,6 +460,7 @@ impl Default for RuntimeStatus {
             dmabuf_protocol_enabled: false,
             dmabuf_protocol_formats: Vec::new(),
             main_app_surface_id: None,
+            main_app_binding_evidence: None,
             overlay_surface_id: None,
             overlay_bound_pane_id: None,
             active_focus_target: None,
