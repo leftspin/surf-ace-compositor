@@ -4457,6 +4457,36 @@ fn toplevel_identity(surface: &ToplevelSurface) -> (Option<String>, Option<Strin
     })
 }
 
+fn pid_matches_or_descends_from(pid: u32, expected_ancestor: u32) -> bool {
+    if pid == expected_ancestor {
+        return true;
+    }
+
+    let mut current = pid;
+    for _ in 0..64 {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{current}/stat")) else {
+            return false;
+        };
+        let Some(close_paren) = stat.rfind(')') else {
+            return false;
+        };
+        let mut fields = stat[close_paren + 1..].split_whitespace();
+        let _state = fields.next();
+        let Some(ppid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+            return false;
+        };
+        if ppid == expected_ancestor {
+            return true;
+        }
+        if ppid <= 1 || ppid == current {
+            return false;
+        }
+        current = ppid;
+    }
+
+    false
+}
+
 impl RoleSurfaceMapping {
     fn new(source_bbox: Rectangle<i32, Logical>, target_rect: Rectangle<i32, Logical>) -> Self {
         if source_bbox.size.w <= 0
@@ -4990,9 +5020,10 @@ impl RuntimeWaylandState {
                 return;
             };
             let evidence = self.main_app_binding_evidence_for_surface(&surface);
+            let launch_pid = self.expected_main_app_client_pid().unwrap_or(client_pid);
             self.configure_toplevel_for_role(&surface, RuntimeSurfaceRole::MainApp);
             self.main_toplevel = Some(surface);
-            self.bridge_main_app_surface_attached(client_pid, evidence);
+            self.bridge_main_app_surface_attached(launch_pid, client_pid, evidence);
             self.promote_pending_toplevels();
             self.sync_runtime_status_with_roles();
             self.apply_focus_route();
@@ -5074,7 +5105,7 @@ impl RuntimeWaylandState {
     fn classify_toplevel(&self, surface: &ToplevelSurface) -> SurfaceClassification {
         if let Some(expected_pid) = self.expected_main_app_client_pid() {
             match self.client_pid_for_toplevel(surface) {
-                Some(client_pid) if client_pid == expected_pid => {
+                Some(client_pid) if pid_matches_or_descends_from(client_pid, expected_pid) => {
                     return SurfaceClassification::MainApp;
                 }
                 Some(_) | None => {}
@@ -5096,7 +5127,7 @@ impl RuntimeWaylandState {
         let Some(client_pid) = self.client_pid_for_toplevel(surface) else {
             return false;
         };
-        client_pid == expected_pid
+        pid_matches_or_descends_from(client_pid, expected_pid)
     }
 
     fn enforce_main_app_binding_policy(&mut self) {
@@ -5289,7 +5320,7 @@ impl RuntimeWaylandState {
         {
             if let Some(pid) = self.client_pid_for_toplevel(surface) {
                 let evidence = self.main_app_binding_evidence_for_surface(surface);
-                self.bridge_main_app_surface_attached(pid, evidence);
+                self.bridge_main_app_surface_attached(pid, pid, evidence);
             }
         }
         self.enforce_main_app_binding_policy();
@@ -5641,12 +5672,14 @@ impl RuntimeWaylandState {
 
     fn bridge_main_app_surface_attached(
         &self,
+        launch_pid: u32,
         client_pid: u32,
         evidence: Option<SurfaceBindingEvidence>,
     ) {
         let mut state = lock_state(&self.shared_state);
-        let _ = state
-            .runtime_mark_main_app_surface_attached_for_pid_with_evidence(client_pid, evidence);
+        let _ = state.runtime_mark_main_app_surface_attached_for_launch_pid_with_evidence(
+            launch_pid, client_pid, evidence,
+        );
     }
 
     fn bridge_overlay_surface_detached(&self, client_pid: u32) {
@@ -6332,10 +6365,10 @@ mod tests {
         GLES_INTERMEDIATE_RENDER_FORMAT, PlaneSelection, RoleSurfaceMapping, RuntimeWaylandState,
         ShellOverlayToggleShortcut, copy_renderer_pixels_to_dumb,
         direct_present_supported_for_rotation, overlay_scanout_format_supports_alpha,
-        parse_shell_overlay_toggle_shortcut, render_output_size_before_transform,
-        scene_texture_transform, screen_capture_src_flipped, select_atomic_plane_zpos_values,
-        select_preferred_scanout_format, select_primary_path, source_rect_from_bbox_and_geometry,
-        transform_from_rotation,
+        parse_shell_overlay_toggle_shortcut, pid_matches_or_descends_from,
+        render_output_size_before_transform, scene_texture_transform, screen_capture_src_flipped,
+        select_atomic_plane_zpos_values, select_preferred_scanout_format, select_primary_path,
+        source_rect_from_bbox_and_geometry, transform_from_rotation,
     };
     use crate::model::{OutputRotation, ProcessSpec};
     use crate::process_manager::{ProcessController, ProcessExit};
@@ -6397,6 +6430,12 @@ mod tests {
             &[Keysym::new(keysyms::KEY_grave)]
         ));
         assert!(!shortcut.matches(&modifiers, &[Keysym::new(keysyms::KEY_F12)]));
+    }
+
+    #[test]
+    fn process_lineage_match_accepts_exact_pid() {
+        let pid = std::process::id();
+        assert!(pid_matches_or_descends_from(pid, pid));
     }
 
     #[test]

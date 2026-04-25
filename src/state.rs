@@ -410,9 +410,21 @@ impl CompositorState {
         client_pid: u32,
         evidence: Option<SurfaceBindingEvidence>,
     ) -> bool {
+        self.runtime_mark_main_app_surface_attached_for_launch_pid_with_evidence(
+            client_pid, client_pid, evidence,
+        )
+    }
+
+    pub fn runtime_mark_main_app_surface_attached_for_launch_pid_with_evidence(
+        &mut self,
+        launch_pid: u32,
+        client_pid: u32,
+        evidence: Option<SurfaceBindingEvidence>,
+    ) -> bool {
         match self.runtime.main_app_launch_state {
-            MainAppLaunchState::Launching { pid } if pid == client_pid => {
-                self.runtime.main_app_launch_state = MainAppLaunchState::Attached { pid };
+            MainAppLaunchState::Launching { pid } if pid == launch_pid => {
+                self.runtime.main_app_launch_state =
+                    MainAppLaunchState::Attached { pid: client_pid };
                 self.runtime.main_app_binding_evidence = evidence;
                 true
             }
@@ -1932,6 +1944,46 @@ mod tests {
                 pid: 1,
                 exit_code: Some(0)
             }
+        );
+    }
+
+    #[test]
+    fn main_app_surface_binding_accepts_launched_descendant_client_pid() {
+        let process = FakeProcessController::default();
+        let process_view = process.clone();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state
+            .select_main_app_launch_intent(main_app_intent())
+            .expect("main app intent should be accepted");
+        state.mark_runtime_running(
+            RuntimeBackend::Winit,
+            Some("wayland-55".to_string()),
+            1280,
+            800,
+        );
+
+        assert!(
+            state.runtime_mark_main_app_surface_attached_for_launch_pid_with_evidence(1, 77, None,)
+        );
+        assert_eq!(
+            state.status_snapshot().runtime.main_app_launch_state,
+            MainAppLaunchState::Attached { pid: 77 }
+        );
+        assert_eq!(
+            state.runtime_expected_main_app_binding(),
+            Some((
+                77,
+                MainAppSurfaceBinding::AppId {
+                    app_id: "surf-ace-main".to_string()
+                }
+            ))
+        );
+
+        process_view.queue_exit(1, Some(0));
+        state.poll_processes();
+        assert_eq!(
+            state.status_snapshot().runtime.main_app_launch_state,
+            MainAppLaunchState::Attached { pid: 77 }
         );
     }
 
