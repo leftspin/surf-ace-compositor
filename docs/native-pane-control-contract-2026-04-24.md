@@ -68,6 +68,25 @@ Bind an arriving native surface to its launched pane:
 
 The compositor reconciles by launched client PID. `app_id` and title are evidence, not authority.
 
+## Launch Token Handshake
+
+For compositor-spawned main apps and native pane hosts, the compositor injects an opaque `SURF_ACE_COMPOSITOR_LAUNCH_TOKEN` into the child environment. Native pane launches also receive:
+
+- `SURF_ACE_PANE_ID`
+- `SURF_ACE_NATIVE_PANE_CONTENT_ID` when present
+- `SURF_ACE_NATIVE_PANE_BINDING_ID` when present
+- `SURF_ACE_NATIVE_PANE_REVISION`
+
+The raw token is not part of the control request and is not serialized in status. It is a compositor-generated binding proof that may be inherited by a daemonized or detached Wayland client.
+
+Binding order is:
+
+1. Exact launched PID or descendant PID.
+2. Matching `SURF_ACE_COMPOSITOR_LAUNCH_TOKEN` read from `/proc/<client-pid>/environ`.
+3. Otherwise deny/queue according to the normal role policy.
+
+`app_id` and title remain status evidence only. The token path is limited to clients whose environment is readable by the compositor through procfs; Wayland core does not expose arbitrary client environment variables.
+
 ## Status Shape
 
 Every response that returns status includes `status.panes[]`. Native-hosted panes include `nativeHost`:
@@ -86,7 +105,7 @@ Every response that returns status includes `status.panes[]`. Native-hosted pane
     "surfaceId": 44,
     "lifecycle": { "state": "attached", "pid": 12345 },
     "process": { "command": "ghostty", "args": ["-e", "top"] },
-    "bindingEvidence": { "app_id": "com.mitchellh.ghostty", "title": "top", "outcome": "not_required" }
+    "bindingEvidence": { "app_id": "com.mitchellh.ghostty", "title": "top", "launchToken": "matched", "outcome": "not_required" }
   }
 }
 ```

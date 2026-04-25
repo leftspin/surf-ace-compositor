@@ -1,12 +1,12 @@
 use crate::model::{
-    ExternalNativeLifecycleState, OutputRotation, PaneGeometry, PaneId, PaneRenderMode,
-    RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeFocusTarget, RuntimeHostPresentOwnership,
+    LaunchTokenEvidence, OutputRotation, PaneGeometry, PaneId, RuntimeBackend,
+    RuntimeDmabufFormatStatus, RuntimeFocusTarget, RuntimeHostPresentOwnership,
     RuntimeHostQueuedPresentSource, RuntimeHostSelectionState, RuntimeSelectionMode,
     SurfaceBindingEvidence, SurfaceBindingEvidenceOutcome,
 };
 use crate::output_rotation_model::OutputRotationModel;
 use crate::screen_capture::ScreenCaptureStore;
-use crate::state::CompositorState;
+use crate::state::{CompositorState, LAUNCH_TOKEN_ENV};
 use input::Libinput;
 use rustix::fs::OFlags;
 use rustix::io::dup;
@@ -4497,6 +4497,41 @@ fn pid_matches_or_descends_from(pid: u32, expected_ancestor: u32) -> bool {
     false
 }
 
+fn process_env_value(pid: u32, key: &str) -> Result<Option<String>, std::io::Error> {
+    let bytes = std::fs::read(format!("/proc/{pid}/environ"))?;
+    for entry in bytes.split(|byte| *byte == 0) {
+        let Some(separator) = entry.iter().position(|byte| *byte == b'=') else {
+            continue;
+        };
+        let (name, value_with_separator) = entry.split_at(separator);
+        let value = &value_with_separator[1..];
+        if name == key.as_bytes() {
+            return Ok(Some(String::from_utf8_lossy(value).into_owned()));
+        }
+    }
+    Ok(None)
+}
+
+fn process_launch_token_matches(pid: u32, expected_token: &str) -> bool {
+    matches!(
+        process_env_value(pid, LAUNCH_TOKEN_ENV),
+        Ok(Some(actual)) if actual == expected_token
+    )
+}
+
+fn launch_token_evidence_for_pid(
+    pid: u32,
+    expected_token: Option<&str>,
+) -> Option<LaunchTokenEvidence> {
+    let expected_token = expected_token?;
+    Some(match process_env_value(pid, LAUNCH_TOKEN_ENV) {
+        Ok(Some(actual)) if actual == expected_token => LaunchTokenEvidence::Matched,
+        Ok(Some(_)) => LaunchTokenEvidence::Mismatched,
+        Ok(None) => LaunchTokenEvidence::Missing,
+        Err(_) => LaunchTokenEvidence::Unavailable,
+    })
+}
+
 fn rectangle_from_pane_geometry(geometry: PaneGeometry) -> Rectangle<i32, Logical> {
     Rectangle::new(
         (geometry.x, geometry.y).into(),
@@ -5091,8 +5126,7 @@ impl RuntimeWaylandState {
             return;
         }
 
-        let evidence =
-            self.surface_identity_evidence(&surface, SurfaceBindingEvidenceOutcome::NotRequired);
+        let evidence = self.native_pane_binding_evidence_for_surface(&surface, launch_pid);
         self.configure_toplevel_for_role(&surface, RuntimeSurfaceRole::NativePane(pane_id.clone()));
         let surface_id = surface_id(surface.wl_surface());
         self.native_pane_toplevels.insert(pane_id, surface);
@@ -5160,35 +5194,59 @@ impl RuntimeWaylandState {
         &self,
         surface: &ToplevelSurface,
     ) -> Option<SurfaceBindingEvidence> {
-        let binding = self.expected_main_app_surface_binding()?;
+        let expectation =
+            lock_state(&self.shared_state).runtime_expected_main_app_binding_with_token()?;
         let (app_id, title) = toplevel_identity(surface);
         let outcome = SurfaceBindingEvidenceOutcome::from(
-            binding.match_identity(app_id.as_deref(), title.as_deref()),
+            expectation
+                .binding
+                .match_identity(app_id.as_deref(), title.as_deref()),
         );
+        let launch_token = self.client_pid_for_toplevel(surface).and_then(|pid| {
+            launch_token_evidence_for_pid(pid, expectation.launch_token.as_deref())
+        });
         Some(SurfaceBindingEvidence {
             app_id,
             title,
+            launch_token,
             outcome,
         })
     }
 
-    fn surface_identity_evidence(
+    fn native_pane_binding_evidence_for_surface(
         &self,
         surface: &ToplevelSurface,
-        outcome: SurfaceBindingEvidenceOutcome,
+        launch_pid: u32,
     ) -> Option<SurfaceBindingEvidence> {
+        let expected_token = lock_state(&self.shared_state)
+            .runtime_expected_native_pane_bindings()
+            .into_iter()
+            .find(|expectation| expectation.pid == launch_pid)
+            .and_then(|expectation| expectation.launch_token);
         let (app_id, title) = toplevel_identity(surface);
+        let launch_token = self
+            .client_pid_for_toplevel(surface)
+            .and_then(|pid| launch_token_evidence_for_pid(pid, expected_token.as_deref()));
         Some(SurfaceBindingEvidence {
             app_id,
             title,
-            outcome,
+            launch_token,
+            outcome: SurfaceBindingEvidenceOutcome::NotRequired,
         })
     }
 
     fn classify_toplevel(&self, surface: &ToplevelSurface) -> SurfaceClassification {
-        if let Some(expected_pid) = self.expected_main_app_client_pid() {
+        if let Some(expectation) = self.expected_main_app_binding() {
             match self.client_pid_for_toplevel(surface) {
-                Some(client_pid) if pid_matches_or_descends_from(client_pid, expected_pid) => {
+                Some(client_pid) if pid_matches_or_descends_from(client_pid, expectation.pid) => {
+                    return SurfaceClassification::MainApp;
+                }
+                Some(client_pid)
+                    if expectation
+                        .launch_token
+                        .as_deref()
+                        .is_some_and(|token| process_launch_token_matches(client_pid, token)) =>
+                {
                     return SurfaceClassification::MainApp;
                 }
                 Some(_) | None => {}
@@ -5210,13 +5268,17 @@ impl RuntimeWaylandState {
     }
 
     fn main_surface_matches_current_contract(&self, surface: &ToplevelSurface) -> bool {
-        let Some(expected_pid) = self.expected_main_app_client_pid() else {
+        let Some(expectation) = self.expected_main_app_binding() else {
             return false;
         };
         let Some(client_pid) = self.client_pid_for_toplevel(surface) else {
             return false;
         };
-        pid_matches_or_descends_from(client_pid, expected_pid)
+        pid_matches_or_descends_from(client_pid, expectation.pid)
+            || expectation
+                .launch_token
+                .as_deref()
+                .is_some_and(|token| process_launch_token_matches(client_pid, token))
     }
 
     fn enforce_main_app_binding_policy(&mut self) {
@@ -5861,16 +5923,13 @@ impl RuntimeWaylandState {
         lock_state(&self.shared_state).runtime_overlay_binding_expected()
     }
 
-    fn expected_main_app_surface_binding(&self) -> Option<crate::model::MainAppSurfaceBinding> {
-        lock_state(&self.shared_state)
-            .runtime_expected_main_app_binding()
-            .map(|(_pid, binding)| binding)
+    fn expected_main_app_binding(&self) -> Option<crate::state::MainAppBindingExpectation> {
+        lock_state(&self.shared_state).runtime_expected_main_app_binding_with_token()
     }
 
     fn expected_main_app_client_pid(&self) -> Option<u32> {
-        lock_state(&self.shared_state)
-            .runtime_expected_main_app_binding()
-            .map(|(pid, _binding)| pid)
+        self.expected_main_app_binding()
+            .map(|expectation| expectation.pid)
     }
 
     fn expected_overlay_client_pid(&self) -> Option<u32> {
@@ -5884,20 +5943,22 @@ impl RuntimeWaylandState {
         surface: &ToplevelSurface,
     ) -> Option<(PaneId, u32)> {
         let client_pid = self.client_pid_for_toplevel(surface)?;
-        let state = lock_state(&self.shared_state).status_snapshot();
-        state.panes.into_iter().find_map(|pane| {
-            if !matches!(pane.render_mode, PaneRenderMode::ExternalNative { .. }) {
-                return None;
-            }
-            let launch_pid = match pane.external_native_state {
-                ExternalNativeLifecycleState::Launching { pid }
-                | ExternalNativeLifecycleState::Attached { pid } => pid,
-                ExternalNativeLifecycleState::Absent
-                | ExternalNativeLifecycleState::Failed { .. }
-                | ExternalNativeLifecycleState::Exited { .. } => return None,
-            };
-            pid_matches_or_descends_from(client_pid, launch_pid).then_some((pane.id, launch_pid))
-        })
+        let expectations = lock_state(&self.shared_state).runtime_expected_native_pane_bindings();
+        expectations
+            .iter()
+            .find_map(|expectation| {
+                pid_matches_or_descends_from(client_pid, expectation.pid)
+                    .then_some((expectation.pane_id.clone(), expectation.pid))
+            })
+            .or_else(|| {
+                expectations.into_iter().find_map(|expectation| {
+                    expectation
+                        .launch_token
+                        .as_deref()
+                        .is_some_and(|token| process_launch_token_matches(client_pid, token))
+                        .then_some((expectation.pane_id, expectation.pid))
+                })
+            })
     }
 
     fn client_pid_for_toplevel(&self, surface: &ToplevelSurface) -> Option<u32> {

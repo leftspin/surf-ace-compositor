@@ -6,7 +6,9 @@ For compositor-launched main apps and native pane hosts, surface binding is reco
 
 The launch-intent contract remains a process spec plus binding identity. For shorthand launches, the compositor still injects a generic Surf Ace class/app-id where supported so cooperative clients can identify themselves. Non-cooperative clients such as Ghostty may expose their own Wayland app id instead; that mismatch is reported as evidence, not treated as a denial when process lineage matches.
 
-Current limitation: this slice proves direct spawned-process PID reconciliation. It does not yet prove descendant process lineage for launchers that fork/exec a separate Wayland client and exit. Those cases must remain explicit in status as launching/exited/failed until a process-tree or token-based attestation path is added.
+Detached launchers are covered when the eventual Wayland client inherits the compositor-generated `SURF_ACE_COMPOSITOR_LAUNCH_TOKEN` and the compositor can read that client's `/proc/<pid>/environ`. PID/descendant lineage remains the first authority; token evidence only augments the launched request when ancestry is gone. `app_id` and title remain evidence and cannot attach a surface by themselves.
+
+Current limitation: no Wayland core protocol exposes arbitrary client environment variables. If procfs environment reads are unavailable, or the launched program scrubs the token before creating the Wayland client, detached clients fall back to the existing PID/descendant policy and may remain `exited`/unattached until relaunched with a cooperative wrapper.
 
 ## Native Pane Host Binding
 

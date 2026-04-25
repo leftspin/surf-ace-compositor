@@ -10,9 +10,15 @@ use crate::model::{
 use crate::policy::{PrototypeOverlayPolicy, PrototypePolicyError};
 use crate::process_manager::ProcessController;
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const SHELL_OVERLAY_PANE_ID: &str = "shell-overlay";
+pub const LAUNCH_TOKEN_ENV: &str = "SURF_ACE_COMPOSITOR_LAUNCH_TOKEN";
+pub const NATIVE_PANE_CONTENT_ID_ENV: &str = "SURF_ACE_NATIVE_PANE_CONTENT_ID";
+pub const NATIVE_PANE_BINDING_ID_ENV: &str = "SURF_ACE_NATIVE_PANE_BINDING_ID";
+pub const NATIVE_PANE_REVISION_ENV: &str = "SURF_ACE_NATIVE_PANE_REVISION";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PaneRuntimeState {
@@ -24,6 +30,21 @@ struct PaneRuntimeState {
     native_host_revision: u64,
     external_native_surface_id: Option<u32>,
     external_native_binding_evidence: Option<SurfaceBindingEvidence>,
+    external_native_launch_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MainAppBindingExpectation {
+    pub pid: u32,
+    pub binding: MainAppSurfaceBinding,
+    pub launch_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativePaneBindingExpectation {
+    pub pane_id: PaneId,
+    pub pid: u32,
+    pub launch_token: Option<String>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -56,9 +77,28 @@ pub struct CompositorState {
     prototype_overlay_policy: PrototypeOverlayPolicy,
     runtime: RuntimeStatus,
     process_controller: Box<dyn ProcessController>,
+    launch_token_counter: u64,
 }
 
 impl CompositorState {
+    fn next_launch_token(&mut self, scope: &str) -> String {
+        self.launch_token_counter = self.launch_token_counter.saturating_add(1);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::process::id().hash(&mut hasher);
+        self.launch_token_counter.hash(&mut hasher);
+        now.hash(&mut hasher);
+        scope.hash(&mut hasher);
+        format!(
+            "sa-launch-{:016x}-{:016x}",
+            self.launch_token_counter,
+            hasher.finish()
+        )
+    }
+
     fn clear_runtime_session_status(&mut self) {
         self.runtime.wayland_socket = None;
         self.runtime.window_width = None;
@@ -103,6 +143,7 @@ impl CompositorState {
             prototype_overlay_policy: PrototypeOverlayPolicy::default(),
             runtime: RuntimeStatus::default(),
             process_controller,
+            launch_token_counter: 0,
         }
     }
 
@@ -133,6 +174,7 @@ impl CompositorState {
         self.terminate_running_main_app_process();
         self.runtime.main_app_surface_id = None;
         self.runtime.main_app_binding_evidence = None;
+        self.runtime.main_app_launch_token = None;
         self.runtime.main_app_launch_intent = Some(intent);
         self.runtime.main_app_launch_state = MainAppLaunchState::WaitingForRuntime;
         self.launch_configured_main_app_if_runtime_ready();
@@ -385,6 +427,13 @@ impl CompositorState {
     }
 
     pub fn runtime_expected_main_app_binding(&self) -> Option<(u32, MainAppSurfaceBinding)> {
+        self.runtime_expected_main_app_binding_with_token()
+            .map(|expectation| (expectation.pid, expectation.binding))
+    }
+
+    pub fn runtime_expected_main_app_binding_with_token(
+        &self,
+    ) -> Option<MainAppBindingExpectation> {
         let binding = self
             .runtime
             .main_app_launch_intent
@@ -392,13 +441,59 @@ impl CompositorState {
             .map(|intent| intent.binding.clone())?;
         match self.runtime.main_app_launch_state {
             MainAppLaunchState::Launching { pid } | MainAppLaunchState::Attached { pid } => {
-                Some((pid, binding))
+                Some(MainAppBindingExpectation {
+                    pid,
+                    binding,
+                    launch_token: self.runtime.main_app_launch_token.clone(),
+                })
+            }
+            MainAppLaunchState::Exited { pid, .. }
+                if self.runtime.main_app_launch_token.is_some() =>
+            {
+                Some(MainAppBindingExpectation {
+                    pid,
+                    binding,
+                    launch_token: self.runtime.main_app_launch_token.clone(),
+                })
             }
             MainAppLaunchState::NotRequested
             | MainAppLaunchState::WaitingForRuntime
             | MainAppLaunchState::Failed { .. }
             | MainAppLaunchState::Exited { .. } => None,
         }
+    }
+
+    pub fn runtime_expected_native_pane_bindings(&self) -> Vec<NativePaneBindingExpectation> {
+        self.panes
+            .iter()
+            .filter_map(|(pane_id, pane)| {
+                if !matches!(pane.render_mode, PaneRenderMode::ExternalNative { .. }) {
+                    return None;
+                }
+                match pane.external_native_state {
+                    ExternalNativeLifecycleState::Launching { pid }
+                    | ExternalNativeLifecycleState::Attached { pid } => {
+                        Some(NativePaneBindingExpectation {
+                            pane_id: pane_id.clone(),
+                            pid,
+                            launch_token: pane.external_native_launch_token.clone(),
+                        })
+                    }
+                    ExternalNativeLifecycleState::Exited { pid, .. }
+                        if pane.external_native_launch_token.is_some() =>
+                    {
+                        Some(NativePaneBindingExpectation {
+                            pane_id: pane_id.clone(),
+                            pid,
+                            launch_token: pane.external_native_launch_token.clone(),
+                        })
+                    }
+                    ExternalNativeLifecycleState::Absent
+                    | ExternalNativeLifecycleState::Failed { .. }
+                    | ExternalNativeLifecycleState::Exited { .. } => None,
+                }
+            })
+            .collect()
     }
 
     pub fn runtime_mark_main_app_surface_attached_for_pid(&mut self, client_pid: u32) -> bool {
@@ -423,6 +518,14 @@ impl CompositorState {
     ) -> bool {
         match self.runtime.main_app_launch_state {
             MainAppLaunchState::Launching { pid } if pid == launch_pid => {
+                self.runtime.main_app_launch_state =
+                    MainAppLaunchState::Attached { pid: client_pid };
+                self.runtime.main_app_binding_evidence = evidence;
+                true
+            }
+            MainAppLaunchState::Exited { pid, .. }
+                if pid == launch_pid && self.runtime.main_app_launch_token.is_some() =>
+            {
                 self.runtime.main_app_launch_state =
                     MainAppLaunchState::Attached { pid: client_pid };
                 self.runtime.main_app_binding_evidence = evidence;
@@ -507,6 +610,7 @@ impl CompositorState {
                     native_host_revision: prev.native_host_revision,
                     external_native_surface_id: prev.external_native_surface_id,
                     external_native_binding_evidence: prev.external_native_binding_evidence.clone(),
+                    external_native_launch_token: prev.external_native_launch_token.clone(),
                 },
                 None => PaneRuntimeState {
                     geometry: pane.geometry,
@@ -517,6 +621,7 @@ impl CompositorState {
                     native_host_revision: 0,
                     external_native_surface_id: None,
                     external_native_binding_evidence: None,
+                    external_native_launch_token: None,
                 },
             };
             incoming.insert(pane.id, runtime);
@@ -566,32 +671,42 @@ impl CompositorState {
 
         self.prototype_overlay_policy.reserve_for(pane_id)?;
 
-        let pane = self
-            .panes
-            .get_mut(pane_id)
-            .ok_or_else(|| StateError::PaneNotFound(pane_id.clone()))?;
-
-        pane.render_mode = PaneRenderMode::ExternalNative {
-            target,
-            process: process.clone(),
-        };
-
+        let launch_token = self.next_launch_token(&format!("native:{}", pane_id.0));
         let mut extra_env = BTreeMap::new();
         extra_env.insert("SURF_ACE_COMPOSITOR_HOST_MODE".to_string(), "1".to_string());
         extra_env.insert("SURF_ACE_PANE_ID".to_string(), pane_id.0.clone());
+        extra_env.insert(LAUNCH_TOKEN_ENV.to_string(), launch_token.clone());
         if let Some(wayland_socket) = self.runtime.wayland_socket.clone() {
             extra_env.insert("WAYLAND_DISPLAY".to_string(), wayland_socket);
         }
 
         match self.process_controller.spawn(&process, &extra_env) {
             Ok(pid) => {
+                let pane = self
+                    .panes
+                    .get_mut(pane_id)
+                    .ok_or_else(|| StateError::PaneNotFound(pane_id.clone()))?;
+                pane.render_mode = PaneRenderMode::ExternalNative {
+                    target,
+                    process: process.clone(),
+                };
                 pane.external_native_state = ExternalNativeLifecycleState::Launching { pid };
+                pane.external_native_launch_token = Some(launch_token);
                 Ok(())
             }
             Err(err) => {
+                let pane = self
+                    .panes
+                    .get_mut(pane_id)
+                    .ok_or_else(|| StateError::PaneNotFound(pane_id.clone()))?;
+                pane.render_mode = PaneRenderMode::ExternalNative {
+                    target,
+                    process: process.clone(),
+                };
                 pane.external_native_state = ExternalNativeLifecycleState::Failed {
                     reason: err.clone(),
                 };
+                pane.external_native_launch_token = None;
                 Err(StateError::Process(err))
             }
         }
@@ -620,6 +735,7 @@ impl CompositorState {
                     native_host_revision: 0,
                     external_native_surface_id: None,
                     external_native_binding_evidence: None,
+                    external_native_launch_token: None,
                 });
             let next_mode = PaneRenderMode::ExternalNative {
                 target: request.target,
@@ -638,6 +754,7 @@ impl CompositorState {
                 pane.external_native_state = ExternalNativeLifecycleState::Absent;
                 pane.external_native_surface_id = None;
                 pane.external_native_binding_evidence = None;
+                pane.external_native_launch_token = None;
             }
             pane.render_mode = next_mode;
             pane.native_host_content_id = request.content_id;
@@ -686,9 +803,36 @@ impl CompositorState {
                 continue;
             }
 
+            let (content_id, binding_id, revision) = {
+                let pane = self
+                    .panes
+                    .get(&pane_id)
+                    .ok_or_else(|| StateError::PaneNotFound(pane_id.clone()))?;
+                (
+                    pane.native_host_content_id.clone(),
+                    pane.native_host_binding_id.clone(),
+                    pane.native_host_revision,
+                )
+            };
+            let token_scope = format!(
+                "native:{}:{}:{}:{}",
+                pane_id.0,
+                content_id.as_deref().unwrap_or(""),
+                binding_id.as_deref().unwrap_or(""),
+                revision
+            );
+            let launch_token = self.next_launch_token(&token_scope);
             let mut extra_env = BTreeMap::new();
             extra_env.insert("SURF_ACE_COMPOSITOR_HOST_MODE".to_string(), "1".to_string());
             extra_env.insert("SURF_ACE_PANE_ID".to_string(), pane_id.0.clone());
+            extra_env.insert(LAUNCH_TOKEN_ENV.to_string(), launch_token.clone());
+            if let Some(content_id) = &content_id {
+                extra_env.insert(NATIVE_PANE_CONTENT_ID_ENV.to_string(), content_id.clone());
+            }
+            if let Some(binding_id) = &binding_id {
+                extra_env.insert(NATIVE_PANE_BINDING_ID_ENV.to_string(), binding_id.clone());
+            }
+            extra_env.insert(NATIVE_PANE_REVISION_ENV.to_string(), revision.to_string());
             if let Some(wayland_socket) = self.runtime.wayland_socket.clone() {
                 extra_env.insert("WAYLAND_DISPLAY".to_string(), wayland_socket);
             }
@@ -702,6 +846,7 @@ impl CompositorState {
                     pane.external_native_state = ExternalNativeLifecycleState::Launching { pid };
                     pane.external_native_surface_id = None;
                     pane.external_native_binding_evidence = None;
+                    pane.external_native_launch_token = Some(launch_token);
                 }
                 Err(err) => {
                     let pane = self
@@ -711,6 +856,7 @@ impl CompositorState {
                     pane.external_native_state = ExternalNativeLifecycleState::Failed {
                         reason: err.clone(),
                     };
+                    pane.external_native_launch_token = None;
                     return Err(StateError::Process(err));
                 }
             }
@@ -766,6 +912,15 @@ impl CompositorState {
             }
             match pane.external_native_state {
                 ExternalNativeLifecycleState::Launching { pid } if pid == launch_pid => {
+                    pane.external_native_state =
+                        ExternalNativeLifecycleState::Attached { pid: client_pid };
+                    pane.external_native_surface_id = surface_id;
+                    pane.external_native_binding_evidence = evidence;
+                    return Some(pane_id.clone());
+                }
+                ExternalNativeLifecycleState::Exited { pid, .. }
+                    if pid == launch_pid && pane.external_native_launch_token.is_some() =>
+                {
                     pane.external_native_state =
                         ExternalNativeLifecycleState::Attached { pid: client_pid };
                     pane.external_native_surface_id = surface_id;
@@ -830,6 +985,7 @@ impl CompositorState {
         pane.native_host_revision = 0;
         pane.external_native_surface_id = None;
         pane.external_native_binding_evidence = None;
+        pane.external_native_launch_token = None;
         self.prototype_overlay_policy.release_if_matches(pane_id);
         Ok(())
     }
@@ -1141,8 +1297,10 @@ impl CompositorState {
             return;
         }
 
+        let launch_token = self.next_launch_token("main");
         let mut extra_env = BTreeMap::new();
         extra_env.insert("SURF_ACE_COMPOSITOR_MAIN_APP".to_string(), "1".to_string());
+        extra_env.insert(LAUNCH_TOKEN_ENV.to_string(), launch_token.clone());
         if self.host_mode_active {
             extra_env.insert("SURF_ACE_COMPOSITOR_HOST_MODE".to_string(), "1".to_string());
         }
@@ -1155,6 +1313,7 @@ impl CompositorState {
                 self.runtime.main_app_launch_state = MainAppLaunchState::Launching { pid };
                 self.runtime.main_app_surface_id = None;
                 self.runtime.main_app_binding_evidence = None;
+                self.runtime.main_app_launch_token = Some(launch_token);
             }
             Err(err) => {
                 self.runtime.main_app_launch_state = MainAppLaunchState::Failed {
@@ -1162,6 +1321,7 @@ impl CompositorState {
                 };
                 self.runtime.main_app_surface_id = None;
                 self.runtime.main_app_binding_evidence = None;
+                self.runtime.main_app_launch_token = None;
             }
         }
     }
@@ -1170,6 +1330,7 @@ impl CompositorState {
         self.terminate_running_main_app_process();
         self.runtime.main_app_surface_id = None;
         self.runtime.main_app_binding_evidence = None;
+        self.runtime.main_app_launch_token = None;
         self.runtime.main_app_launch_state = if self.runtime.main_app_launch_intent.is_some() {
             MainAppLaunchState::WaitingForRuntime
         } else {
@@ -1572,9 +1733,30 @@ mod tests {
             process_view.spawned_env()[0].get("WAYLAND_DISPLAY"),
             Some(&"wayland-77".to_string())
         );
+        assert!(
+            process_view.spawned_env()[0]
+                .get(LAUNCH_TOKEN_ENV)
+                .is_some_and(|token| token.starts_with("sa-launch-"))
+        );
+        assert_eq!(
+            process_view.spawned_env()[0].get(NATIVE_PANE_CONTENT_ID_ENV),
+            Some(&"content-left".to_string())
+        );
+        assert_eq!(
+            process_view.spawned_env()[0].get(NATIVE_PANE_BINDING_ID_ENV),
+            Some(&"binding-left".to_string())
+        );
+        assert_eq!(
+            process_view.spawned_env()[0].get(NATIVE_PANE_REVISION_ENV),
+            Some(&"1".to_string())
+        );
         assert_eq!(
             process_view.spawned_env()[1].get("SURF_ACE_PANE_ID"),
             Some(&"right".to_string())
+        );
+        assert_ne!(
+            process_view.spawned_env()[0].get(LAUNCH_TOKEN_ENV),
+            process_view.spawned_env()[1].get(LAUNCH_TOKEN_ENV)
         );
 
         state
@@ -1624,6 +1806,7 @@ mod tests {
         let evidence = SurfaceBindingEvidence {
             app_id: Some("unexpected-terminal-id".to_string()),
             title: None,
+            launch_token: None,
             outcome: SurfaceBindingEvidenceOutcome::NotRequired,
         };
         assert_eq!(
@@ -1705,6 +1888,75 @@ mod tests {
                 .expect("native host status should be present")
                 .surface_id,
             Some(303)
+        );
+    }
+
+    #[test]
+    fn native_pane_launch_token_allows_late_detached_client_after_launcher_exit() {
+        let process = FakeProcessController::default();
+        let process_view = process.clone();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: PaneId::new("surface:2"),
+                content_id: Some("ct_top".to_string()),
+                binding_id: Some("surface:2:ct_top:7".to_string()),
+                revision: 7,
+                geometry: PaneGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 640,
+                    height: 480,
+                },
+                target: NativeTargetClass::Terminal,
+                process: terminal_process(),
+            }])
+            .expect("native pane host plan should apply");
+        state
+            .launch_native_pane_hosts(Vec::new())
+            .expect("native pane host should launch");
+
+        let token = process_view.spawned_env()[0]
+            .get(LAUNCH_TOKEN_ENV)
+            .expect("native pane launch token should be emitted")
+            .clone();
+        process_view.queue_exit(1, Some(0));
+        state.poll_processes();
+        assert_eq!(
+            state.status_snapshot().panes[0].external_native_state,
+            ExternalNativeLifecycleState::Exited {
+                pid: 1,
+                exit_code: Some(0)
+            }
+        );
+        assert_eq!(
+            state.runtime_expected_native_pane_bindings()[0].launch_token,
+            Some(token)
+        );
+
+        let evidence = SurfaceBindingEvidence {
+            app_id: Some("detached-terminal".to_string()),
+            title: Some("top".to_string()),
+            launch_token: Some(crate::model::LaunchTokenEvidence::Matched),
+            outcome: SurfaceBindingEvidenceOutcome::NotRequired,
+        };
+        assert_eq!(
+            state.runtime_mark_native_pane_surface_attached_for_launch_pid_with_evidence(
+                1,
+                77,
+                Some(303),
+                Some(evidence.clone()),
+            ),
+            Some(PaneId::new("surface:2"))
+        );
+        let status = state.status_snapshot();
+        assert_eq!(
+            status.panes[0].external_native_state,
+            ExternalNativeLifecycleState::Attached { pid: 77 }
+        );
+        assert_eq!(
+            status.panes[0].external_native_binding_evidence,
+            Some(evidence)
         );
     }
 
@@ -2025,13 +2277,23 @@ mod tests {
             MainAppLaunchState::Launching { pid: 1 }
         );
         assert_eq!(runtime.main_app_surface_id, None);
+        assert_eq!(process_view.spawned_env().len(), 1);
         assert_eq!(
-            process_view.spawned_env(),
-            vec![BTreeMap::from([
-                ("SURF_ACE_COMPOSITOR_HOST_MODE".to_string(), "1".to_string()),
-                ("SURF_ACE_COMPOSITOR_MAIN_APP".to_string(), "1".to_string()),
-                ("WAYLAND_DISPLAY".to_string(), "wayland-77".to_string()),
-            ])]
+            process_view.spawned_env()[0].get("SURF_ACE_COMPOSITOR_HOST_MODE"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            process_view.spawned_env()[0].get("SURF_ACE_COMPOSITOR_MAIN_APP"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            process_view.spawned_env()[0].get("WAYLAND_DISPLAY"),
+            Some(&"wayland-77".to_string())
+        );
+        assert!(
+            process_view.spawned_env()[0]
+                .get(LAUNCH_TOKEN_ENV)
+                .is_some_and(|token| token.starts_with("sa-launch-"))
         );
         assert_eq!(
             state.runtime_expected_main_app_binding(),
@@ -2123,6 +2385,63 @@ mod tests {
     }
 
     #[test]
+    fn main_app_launch_token_allows_late_detached_client_after_launcher_exit() {
+        let process = FakeProcessController::default();
+        let process_view = process.clone();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state
+            .select_main_app_launch_intent(main_app_intent())
+            .expect("main app intent should be accepted");
+        state.mark_runtime_running(
+            RuntimeBackend::Winit,
+            Some("wayland-55".to_string()),
+            1280,
+            800,
+        );
+
+        let token = process_view.spawned_env()[0]
+            .get(LAUNCH_TOKEN_ENV)
+            .expect("main app launch token should be emitted")
+            .clone();
+        process_view.queue_exit(1, Some(0));
+        state.poll_processes();
+        assert_eq!(
+            state.status_snapshot().runtime.main_app_launch_state,
+            MainAppLaunchState::Exited {
+                pid: 1,
+                exit_code: Some(0)
+            }
+        );
+        assert_eq!(
+            state
+                .runtime_expected_main_app_binding_with_token()
+                .expect("exited launcher should keep token expectation")
+                .launch_token,
+            Some(token)
+        );
+
+        let evidence = SurfaceBindingEvidence {
+            app_id: Some("detached.app".to_string()),
+            title: Some("Detached".to_string()),
+            launch_token: Some(crate::model::LaunchTokenEvidence::Matched),
+            outcome: SurfaceBindingEvidenceOutcome::MismatchesIntent,
+        };
+        assert!(
+            state.runtime_mark_main_app_surface_attached_for_launch_pid_with_evidence(
+                1,
+                77,
+                Some(evidence.clone()),
+            )
+        );
+        let runtime = state.status_snapshot().runtime;
+        assert_eq!(
+            runtime.main_app_launch_state,
+            MainAppLaunchState::Attached { pid: 77 }
+        );
+        assert_eq!(runtime.main_app_binding_evidence, Some(evidence));
+    }
+
+    #[test]
     fn launched_main_app_records_binding_evidence_without_making_app_id_authority() {
         let process = FakeProcessController::default();
         let mut state = CompositorState::new(true, Box::new(process));
@@ -2139,6 +2458,7 @@ mod tests {
         let evidence = SurfaceBindingEvidence {
             app_id: Some("com.mitchellh.ghostty".to_string()),
             title: Some("top".to_string()),
+            launch_token: None,
             outcome: SurfaceBindingEvidenceOutcome::MismatchesIntent,
         };
 

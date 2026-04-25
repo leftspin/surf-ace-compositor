@@ -137,12 +137,27 @@ impl From<MainAppSurfaceBindingMatch> for SurfaceBindingEvidenceOutcome {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchTokenEvidence {
+    Matched,
+    Mismatched,
+    Missing,
+    Unavailable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SurfaceBindingEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(
+        rename = "launchToken",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub launch_token: Option<LaunchTokenEvidence>,
     pub outcome: SurfaceBindingEvidenceOutcome,
 }
 
@@ -382,6 +397,8 @@ pub struct RuntimeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub main_app_launch_intent: Option<MainAppLaunchIntent>,
     pub main_app_launch_state: MainAppLaunchState,
+    #[serde(skip)]
+    pub main_app_launch_token: Option<String>,
     pub shell_overlay_toggle_shortcut: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wayland_socket: Option<String>,
@@ -456,6 +473,7 @@ impl Default for RuntimeStatus {
             runtime_last_selection_result: None,
             main_app_launch_intent: None,
             main_app_launch_state: MainAppLaunchState::NotRequested,
+            main_app_launch_token: None,
             shell_overlay_toggle_shortcut: "Super+`".to_string(),
             wayland_socket: None,
             window_width: None,

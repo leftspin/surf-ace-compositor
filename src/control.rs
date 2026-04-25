@@ -665,6 +665,7 @@ mod tests {
         let evidence = SurfaceBindingEvidence {
             app_id: Some("com.mitchellh.ghostty".to_string()),
             title: Some("top".to_string()),
+            launch_token: None,
             outcome: SurfaceBindingEvidenceOutcome::NotRequired,
         };
         let bind_response = handle_request(
