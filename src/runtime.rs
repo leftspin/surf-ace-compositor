@@ -1,7 +1,8 @@
 use crate::model::{
-    OutputRotation, RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeFocusTarget,
-    RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource, RuntimeHostSelectionState,
-    RuntimeSelectionMode, SurfaceBindingEvidence, SurfaceBindingEvidenceOutcome,
+    ExternalNativeLifecycleState, OutputRotation, PaneGeometry, PaneId, PaneRenderMode,
+    RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeFocusTarget, RuntimeHostPresentOwnership,
+    RuntimeHostQueuedPresentSource, RuntimeHostSelectionState, RuntimeSelectionMode,
+    SurfaceBindingEvidence, SurfaceBindingEvidenceOutcome,
 };
 use crate::output_rotation_model::OutputRotationModel;
 use crate::screen_capture::ScreenCaptureStore;
@@ -4261,15 +4262,17 @@ struct RuntimeLoopData {
     wayland_state: RuntimeWaylandState,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RuntimeSurfaceRole {
     MainApp,
     OverlayNative,
+    NativePane(PaneId),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SurfaceClassification {
     MainApp,
+    NativePane { pane_id: PaneId, launch_pid: u32 },
     OverlayCandidate,
     PendingIdentity,
 }
@@ -4291,6 +4294,7 @@ struct RuntimeWaylandState {
     seat: Seat<Self>,
     main_toplevel: Option<ToplevelSurface>,
     overlay_toplevel: Option<ToplevelSurface>,
+    native_pane_toplevels: HashMap<PaneId, ToplevelSurface>,
     pending_toplevels: Vec<ToplevelSurface>,
     popups: Vec<ManagedPopup>,
     pointer_location: Point<f64, Logical>,
@@ -4305,6 +4309,8 @@ struct RuntimeWaylandState {
 enum RenderElementSource {
     Main,
     MainPopup,
+    NativePane,
+    NativePanePopup,
     Overlay,
     OverlayPopup,
 }
@@ -4329,6 +4335,8 @@ impl RenderElementCapture {
         match source {
             RenderElementSource::Main => self.counts.main += added,
             RenderElementSource::MainPopup => self.counts.main_popups += added,
+            RenderElementSource::NativePane => self.counts.native_panes += added,
+            RenderElementSource::NativePanePopup => self.counts.native_pane_popups += added,
             RenderElementSource::Overlay => self.counts.overlay += added,
             RenderElementSource::OverlayPopup => self.counts.overlay_popups += added,
         }
@@ -4345,6 +4353,8 @@ impl RenderElementCapture {
 struct RenderElementCounts {
     main: usize,
     main_popups: usize,
+    native_panes: usize,
+    native_pane_popups: usize,
     overlay: usize,
     overlay_popups: usize,
 }
@@ -4485,6 +4495,17 @@ fn pid_matches_or_descends_from(pid: u32, expected_ancestor: u32) -> bool {
     }
 
     false
+}
+
+fn rectangle_from_pane_geometry(geometry: PaneGeometry) -> Rectangle<i32, Logical> {
+    Rectangle::new(
+        (geometry.x, geometry.y).into(),
+        (
+            i32::try_from(geometry.width).unwrap_or(i32::MAX).max(1),
+            i32::try_from(geometry.height).unwrap_or(i32::MAX).max(1),
+        )
+            .into(),
+    )
 }
 
 impl RoleSurfaceMapping {
@@ -4633,6 +4654,7 @@ impl RuntimeWaylandState {
             seat,
             main_toplevel: None,
             overlay_toplevel: None,
+            native_pane_toplevels: HashMap::new(),
             pending_toplevels: Vec::new(),
             popups: Vec::new(),
             pointer_location: (0.0, 0.0).into(),
@@ -5006,6 +5028,10 @@ impl RuntimeWaylandState {
         self.enforce_main_app_binding_policy();
         match self.classify_toplevel(&surface) {
             SurfaceClassification::MainApp => self.assign_main_role(surface),
+            SurfaceClassification::NativePane {
+                pane_id,
+                launch_pid,
+            } => self.assign_native_pane_role(surface, pane_id, launch_pid),
             SurfaceClassification::OverlayCandidate => self.assign_overlay_role_or_queue(surface),
             SurfaceClassification::PendingIdentity => self.pending_toplevels.push(surface),
         }
@@ -5039,6 +5065,46 @@ impl RuntimeWaylandState {
                 state.increment_runtime_denied_toplevel();
             }
         }
+    }
+
+    fn assign_native_pane_role(
+        &mut self,
+        surface: ToplevelSurface,
+        pane_id: PaneId,
+        launch_pid: u32,
+    ) {
+        let Some(client_pid) = self.client_pid_for_toplevel(&surface) else {
+            surface.send_close();
+            let mut state = lock_state(&self.shared_state);
+            state.increment_runtime_denied_toplevel();
+            return;
+        };
+        if self
+            .native_pane_toplevels
+            .get(&pane_id)
+            .map(|existing| !same_surface(existing.wl_surface(), surface.wl_surface()))
+            .unwrap_or(false)
+        {
+            surface.send_close();
+            let mut state = lock_state(&self.shared_state);
+            state.increment_runtime_denied_toplevel();
+            return;
+        }
+
+        let evidence =
+            self.surface_identity_evidence(&surface, SurfaceBindingEvidenceOutcome::NotRequired);
+        self.configure_toplevel_for_role(&surface, RuntimeSurfaceRole::NativePane(pane_id.clone()));
+        let surface_id = surface_id(surface.wl_surface());
+        self.native_pane_toplevels.insert(pane_id, surface);
+        self.bridge_native_pane_surface_attached(
+            launch_pid,
+            client_pid,
+            Some(surface_id),
+            evidence,
+        );
+        self.promote_pending_toplevels();
+        self.sync_runtime_status_with_roles();
+        self.apply_focus_route();
     }
 
     fn assign_overlay_role_or_queue(&mut self, surface: ToplevelSurface) {
@@ -5078,6 +5144,10 @@ impl RuntimeWaylandState {
         for surface in pending.drain(..) {
             match self.classify_toplevel(&surface) {
                 SurfaceClassification::MainApp => self.assign_main_role(surface),
+                SurfaceClassification::NativePane {
+                    pane_id,
+                    launch_pid,
+                } => self.assign_native_pane_role(surface, pane_id, launch_pid),
                 SurfaceClassification::OverlayCandidate => {
                     self.assign_overlay_role_or_queue(surface)
                 }
@@ -5102,6 +5172,19 @@ impl RuntimeWaylandState {
         })
     }
 
+    fn surface_identity_evidence(
+        &self,
+        surface: &ToplevelSurface,
+        outcome: SurfaceBindingEvidenceOutcome,
+    ) -> Option<SurfaceBindingEvidence> {
+        let (app_id, title) = toplevel_identity(surface);
+        Some(SurfaceBindingEvidence {
+            app_id,
+            title,
+            outcome,
+        })
+    }
+
     fn classify_toplevel(&self, surface: &ToplevelSurface) -> SurfaceClassification {
         if let Some(expected_pid) = self.expected_main_app_client_pid() {
             match self.client_pid_for_toplevel(surface) {
@@ -5110,6 +5193,12 @@ impl RuntimeWaylandState {
                 }
                 Some(_) | None => {}
             }
+        }
+        if let Some((pane_id, launch_pid)) = self.expected_native_pane_for_toplevel(surface) {
+            return SurfaceClassification::NativePane {
+                pane_id,
+                launch_pid,
+            };
         }
 
         let (app_id, title) = toplevel_identity(surface);
@@ -5174,6 +5263,16 @@ impl RuntimeWaylandState {
         Rectangle::new((overlay_x, overlay_y).into(), (overlay_w, overlay_h).into())
     }
 
+    fn native_pane_rect(&self, pane_id: &PaneId) -> Option<Rectangle<i32, Logical>> {
+        let geometry = lock_state(&self.shared_state)
+            .status_snapshot()
+            .panes
+            .into_iter()
+            .find(|pane| &pane.id == pane_id)
+            .map(|pane| pane.geometry)?;
+        Some(rectangle_from_pane_geometry(geometry))
+    }
+
     fn surface_under_point(
         &self,
         pos: Point<f64, Logical>,
@@ -5207,6 +5306,19 @@ impl RuntimeWaylandState {
                 )
                     .into();
                 return Some((overlay.wl_surface().clone(), local_pos));
+            }
+        }
+        for (pane_id, native) in &self.native_pane_toplevels {
+            let Some(rect) = self.native_pane_rect(pane_id) else {
+                continue;
+            };
+            let hit = pos.x >= rect.loc.x as f64
+                && pos.x < (rect.loc.x + rect.size.w) as f64
+                && pos.y >= rect.loc.y as f64
+                && pos.y < (rect.loc.y + rect.size.h) as f64;
+            if hit {
+                let local_pos = (pos.x - rect.loc.x as f64, pos.y - rect.loc.y as f64).into();
+                return Some((native.wl_surface().clone(), local_pos));
             }
         }
         self.main_toplevel
@@ -5249,6 +5361,15 @@ impl RuntimeWaylandState {
                     .unwrap_or_else(|| self.overlay_rect().size);
                 Rectangle::new((0, 0).into(), overlay_size)
             }
+            RuntimeSurfaceRole::NativePane(ref pane_id) => {
+                let size = self
+                    .native_pane_toplevels
+                    .get(pane_id)
+                    .and_then(|surface| surface.current_state().size)
+                    .or_else(|| self.native_pane_rect(pane_id).map(|rect| rect.size))
+                    .unwrap_or_else(|| Size::from((1, 1)));
+                Rectangle::new((0, 0).into(), size)
+            }
         }
     }
 
@@ -5268,6 +5389,10 @@ impl RuntimeWaylandState {
         let base = match popup.owner_role {
             RuntimeSurfaceRole::MainApp => Point::from((0, 0)),
             RuntimeSurfaceRole::OverlayNative => self.overlay_rect().loc,
+            RuntimeSurfaceRole::NativePane(ref pane_id) => self
+                .native_pane_rect(pane_id)
+                .map(|rect| rect.loc)
+                .unwrap_or_else(|| Point::from((0, 0))),
         };
         Rectangle::new(
             (base.x + local.loc.x, base.y + local.loc.y).into(),
@@ -5288,6 +5413,10 @@ impl RuntimeWaylandState {
             RuntimeSurfaceRole::OverlayNative => self
                 .overlay_toplevel
                 .as_ref()
+                .map(toplevel_surface_source_rect),
+            RuntimeSurfaceRole::NativePane(ref pane_id) => self
+                .native_pane_toplevels
+                .get(pane_id)
                 .map(toplevel_surface_source_rect),
         }?;
         Some(RoleSurfaceMapping::new(source_rect, target_rect))
@@ -5311,6 +5440,11 @@ impl RuntimeWaylandState {
             )
         {
             self.assign_main_role(surface.clone());
+        }
+        if let Some((pane_id, launch_pid)) = self.expected_native_pane_for_toplevel(surface) {
+            if !self.native_pane_toplevels.contains_key(&pane_id) {
+                self.assign_native_pane_role(surface.clone(), pane_id, launch_pid);
+            }
         }
         if self
             .main_toplevel
@@ -5343,9 +5477,14 @@ impl RuntimeWaylandState {
         {
             return Some(RuntimeSurfaceRole::OverlayNative);
         }
+        for (pane_id, toplevel) in &self.native_pane_toplevels {
+            if same_surface(toplevel.wl_surface(), surface) {
+                return Some(RuntimeSurfaceRole::NativePane(pane_id.clone()));
+            }
+        }
         for popup in &self.popups {
             if same_surface(popup.surface.wl_surface(), surface) {
-                return Some(popup.owner_role);
+                return Some(popup.owner_role.clone());
             }
         }
         None
@@ -5367,6 +5506,11 @@ impl RuntimeWaylandState {
                     let overlay_rect = self.overlay_rect();
                     pending.size = Some((overlay_rect.size.w, overlay_rect.size.h).into());
                 }
+                RuntimeSurfaceRole::NativePane(ref pane_id) => {
+                    if let Some(rect) = self.native_pane_rect(pane_id) {
+                        pending.size = Some((rect.size.w, rect.size.h).into());
+                    }
+                }
             }
         });
         let _ = surface.send_pending_configure();
@@ -5384,6 +5528,12 @@ impl RuntimeWaylandState {
         }
         if let Some(overlay) = &self.overlay_toplevel {
             self.configure_toplevel_for_role(overlay, RuntimeSurfaceRole::OverlayNative);
+        }
+        for (pane_id, native) in &self.native_pane_toplevels {
+            self.configure_toplevel_for_role(
+                native,
+                RuntimeSurfaceRole::NativePane(pane_id.clone()),
+            );
         }
     }
 
@@ -5450,6 +5600,8 @@ impl RuntimeWaylandState {
             }
             self.overlay_toplevel = None;
         }
+        self.native_pane_toplevels
+            .retain(|_, surface| surface.alive());
         self.popups.retain(|popup| popup.surface.alive());
         self.promote_pending_toplevels();
         self.sync_runtime_status_with_roles();
@@ -5464,6 +5616,8 @@ impl RuntimeWaylandState {
         let mut capture = RenderElementCapture::default();
         let mut main_elements = Vec::new();
         let mut main_popup_elements = Vec::new();
+        let mut native_pane_elements = Vec::new();
+        let mut native_pane_popup_elements = Vec::new();
         let mut overlay_elements = Vec::new();
         let mut overlay_popup_elements = Vec::new();
         let output_rect = Rectangle::new(
@@ -5538,6 +5692,37 @@ impl RuntimeWaylandState {
             }
         }
 
+        let mut native_pane_ids: Vec<_> = self.native_pane_toplevels.keys().cloned().collect();
+        native_pane_ids.sort();
+        for pane_id in native_pane_ids {
+            let Some(native) = self.native_pane_toplevels.get(&pane_id) else {
+                continue;
+            };
+            let Some(rect) = self.native_pane_rect(&pane_id) else {
+                continue;
+            };
+            let Some(mapping) =
+                self.role_surface_mapping(RuntimeSurfaceRole::NativePane(pane_id.clone()), rect)
+            else {
+                continue;
+            };
+            if let Err(err) = import_surface_tree(renderer, native.wl_surface()) {
+                eprintln!(
+                    "host renderer could not import native pane surface tree: {err:#?}",
+                    err = err
+                );
+            }
+            let elements = render_elements_from_surface_tree(
+                renderer,
+                native.wl_surface(),
+                mapping.render_element_location(),
+                mapping.render_element_scale(),
+                1.0,
+                Kind::Unspecified,
+            );
+            native_pane_elements.extend(elements);
+        }
+
         for popup in &self.popups {
             if popup.owner_role != RuntimeSurfaceRole::OverlayNative {
                 continue;
@@ -5562,10 +5747,44 @@ impl RuntimeWaylandState {
             }
         }
 
+        for popup in &self.popups {
+            let RuntimeSurfaceRole::NativePane(ref pane_id) = popup.owner_role else {
+                continue;
+            };
+            let Some(rect) = self.native_pane_rect(pane_id) else {
+                continue;
+            };
+            if let Some(mapping) =
+                self.role_surface_mapping(RuntimeSurfaceRole::NativePane(pane_id.clone()), rect)
+            {
+                if let Err(err) = import_surface_tree(renderer, popup.surface.wl_surface()) {
+                    eprintln!(
+                        "host renderer could not import native pane popup surface tree: {err:#?}",
+                        err = err
+                    );
+                }
+                let popup_geo = self.popup_geometry_local(&popup.surface);
+                let elements = render_elements_from_surface_tree(
+                    renderer,
+                    popup.surface.wl_surface(),
+                    mapping.map_render_element_location(popup_geo.loc),
+                    mapping.render_element_scale(),
+                    1.0,
+                    Kind::Unspecified,
+                );
+                native_pane_popup_elements.extend(elements);
+            }
+        }
+
         // Smithay expects top-to-bottom order; otherwise an opaque main surface
         // can cull the overlay before it is drawn.
         capture.push(RenderElementSource::OverlayPopup, overlay_popup_elements);
         capture.push(RenderElementSource::Overlay, overlay_elements);
+        capture.push(
+            RenderElementSource::NativePanePopup,
+            native_pane_popup_elements,
+        );
+        capture.push(RenderElementSource::NativePane, native_pane_elements);
         capture.push(RenderElementSource::MainPopup, main_popup_elements);
         capture.push(RenderElementSource::Main, main_elements);
 
@@ -5657,6 +5876,27 @@ impl RuntimeWaylandState {
             .map(|(_pane_id, pid)| pid)
     }
 
+    fn expected_native_pane_for_toplevel(
+        &self,
+        surface: &ToplevelSurface,
+    ) -> Option<(PaneId, u32)> {
+        let client_pid = self.client_pid_for_toplevel(surface)?;
+        let state = lock_state(&self.shared_state).status_snapshot();
+        state.panes.into_iter().find_map(|pane| {
+            if !matches!(pane.render_mode, PaneRenderMode::ExternalNative { .. }) {
+                return None;
+            }
+            let launch_pid = match pane.external_native_state {
+                ExternalNativeLifecycleState::Launching { pid }
+                | ExternalNativeLifecycleState::Attached { pid } => pid,
+                ExternalNativeLifecycleState::Absent
+                | ExternalNativeLifecycleState::Failed { .. }
+                | ExternalNativeLifecycleState::Exited { .. } => return None,
+            };
+            pid_matches_or_descends_from(client_pid, launch_pid).then_some((pane.id, launch_pid))
+        })
+    }
+
     fn client_pid_for_toplevel(&self, surface: &ToplevelSurface) -> Option<u32> {
         let client = surface.wl_surface().client()?;
         let credentials = client.get_credentials(&self.display_handle).ok()?;
@@ -5679,6 +5919,19 @@ impl RuntimeWaylandState {
         let mut state = lock_state(&self.shared_state);
         let _ = state.runtime_mark_main_app_surface_attached_for_launch_pid_with_evidence(
             launch_pid, client_pid, evidence,
+        );
+    }
+
+    fn bridge_native_pane_surface_attached(
+        &self,
+        launch_pid: u32,
+        client_pid: u32,
+        surface_id: Option<u32>,
+        evidence: Option<SurfaceBindingEvidence>,
+    ) {
+        let mut state = lock_state(&self.shared_state);
+        let _ = state.runtime_mark_native_pane_surface_attached_for_launch_pid_with_evidence(
+            launch_pid, client_pid, surface_id, evidence,
         );
     }
 
@@ -5801,14 +6054,38 @@ impl RuntimeWaylandState {
             }
         }
 
+        let mut native_pane_ids: Vec<_> = self.native_pane_toplevels.keys().cloned().collect();
+        native_pane_ids.sort();
+        for pane_id in native_pane_ids {
+            let Some(native) = self.native_pane_toplevels.get(&pane_id) else {
+                continue;
+            };
+            let Some(rect) = self.native_pane_rect(&pane_id) else {
+                continue;
+            };
+            if let Some(mapping) =
+                self.role_surface_mapping(RuntimeSurfaceRole::NativePane(pane_id), rect)
+            {
+                self.collect_surface_tree_surfaces(
+                    native.wl_surface(),
+                    (0, 0).into(),
+                    mapping,
+                    &mut surfaces,
+                );
+            }
+        }
+
         for popup in &self.popups {
             if let Some(snapshot) = self
                 .host_surface_buffers
                 .get(&surface_key(popup.surface.wl_surface()))
             {
-                let mapping = match popup.owner_role {
+                let mapping = match &popup.owner_role {
                     RuntimeSurfaceRole::MainApp => main_mapping,
                     RuntimeSurfaceRole::OverlayNative => overlay_mapping,
+                    RuntimeSurfaceRole::NativePane(pane_id) => self
+                        .native_pane_rect(pane_id)
+                        .and_then(|rect| self.role_surface_mapping(popup.owner_role.clone(), rect)),
                 };
                 let Some(mapping) = mapping else {
                     continue;
@@ -5964,7 +6241,7 @@ impl XdgShellHandler for RuntimeWaylandState {
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
         if let Some(owner_role) = self.popup_owner_role(&surface) {
-            let target = self.popup_target_rect(owner_role);
+            let target = self.popup_target_rect(owner_role.clone());
             surface.with_pending_state(|pending| {
                 pending.geometry = pending.positioner.get_unconstrained_geometry(target);
             });
@@ -5987,6 +6264,14 @@ impl XdgShellHandler for RuntimeWaylandState {
         if let Some(overlay) = &self.overlay_toplevel {
             if overlay.wl_surface() == &surface {
                 self.configure_toplevel_for_role(overlay, RuntimeSurfaceRole::OverlayNative);
+            }
+        }
+        for (pane_id, native) in &self.native_pane_toplevels {
+            if native.wl_surface() == &surface {
+                self.configure_toplevel_for_role(
+                    native,
+                    RuntimeSurfaceRole::NativePane(pane_id.clone()),
+                );
             }
         }
     }
@@ -6035,6 +6320,8 @@ impl XdgShellHandler for RuntimeWaylandState {
             }
             self.overlay_toplevel = None;
         }
+        self.native_pane_toplevels
+            .retain(|_, item| surface_key(item.wl_surface()) != destroyed_id);
         let mut removed_popup_ids = Vec::new();
         self.popups.retain(|popup| {
             let keep = popup.surface.get_parent_surface().as_ref().map(surface_key)
@@ -6120,6 +6407,7 @@ impl SeatHandler for RuntimeWaylandState {
             .map(|role| match role {
                 RuntimeSurfaceRole::MainApp => RuntimeFocusTarget::MainApp,
                 RuntimeSurfaceRole::OverlayNative => RuntimeFocusTarget::OverlayNative,
+                RuntimeSurfaceRole::NativePane(_) => RuntimeFocusTarget::OverlayNative,
             });
         let mut state = lock_state(&self.shared_state);
         state.set_runtime_focus_target(target);

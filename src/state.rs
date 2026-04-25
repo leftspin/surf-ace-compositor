@@ -748,16 +748,31 @@ impl CompositorState {
         surface_id: Option<u32>,
         evidence: Option<SurfaceBindingEvidence>,
     ) -> Option<PaneId> {
+        self.runtime_mark_native_pane_surface_attached_for_launch_pid_with_evidence(
+            client_pid, client_pid, surface_id, evidence,
+        )
+    }
+
+    pub fn runtime_mark_native_pane_surface_attached_for_launch_pid_with_evidence(
+        &mut self,
+        launch_pid: u32,
+        client_pid: u32,
+        surface_id: Option<u32>,
+        evidence: Option<SurfaceBindingEvidence>,
+    ) -> Option<PaneId> {
         for (pane_id, pane) in &mut self.panes {
             if !matches!(pane.render_mode, PaneRenderMode::ExternalNative { .. }) {
                 continue;
             }
             match pane.external_native_state {
-                ExternalNativeLifecycleState::Launching { pid }
-                | ExternalNativeLifecycleState::Attached { pid }
-                    if pid == client_pid =>
-                {
-                    pane.external_native_state = ExternalNativeLifecycleState::Attached { pid };
+                ExternalNativeLifecycleState::Launching { pid } if pid == launch_pid => {
+                    pane.external_native_state =
+                        ExternalNativeLifecycleState::Attached { pid: client_pid };
+                    pane.external_native_surface_id = surface_id;
+                    pane.external_native_binding_evidence = evidence;
+                    return Some(pane_id.clone());
+                }
+                ExternalNativeLifecycleState::Attached { pid } if pid == client_pid => {
                     pane.external_native_surface_id = surface_id;
                     pane.external_native_binding_evidence = evidence;
                     return Some(pane_id.clone());
@@ -1618,6 +1633,54 @@ mod tests {
             state
                 .runtime_mark_native_pane_surface_attached_for_pid(99, None, None)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn native_pane_surface_tracks_descendant_client_pid() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: PaneId::new("surface:2"),
+                content_id: Some("ct_top".to_string()),
+                binding_id: Some("surface:2:ct_top".to_string()),
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 640,
+                    height: 480,
+                },
+                target: NativeTargetClass::Terminal,
+                process: terminal_process(),
+            }])
+            .expect("native pane host plan should apply");
+        state
+            .launch_native_pane_hosts(Vec::new())
+            .expect("native pane host should launch");
+
+        assert_eq!(
+            state.runtime_mark_native_pane_surface_attached_for_launch_pid_with_evidence(
+                1,
+                77,
+                Some(303),
+                None,
+            ),
+            Some(PaneId::new("surface:2"))
+        );
+        let status = state.status_snapshot();
+        assert_eq!(
+            status.panes[0].external_native_state,
+            ExternalNativeLifecycleState::Attached { pid: 77 }
+        );
+        assert_eq!(
+            status.panes[0]
+                .native_host
+                .as_ref()
+                .expect("native host status should be present")
+                .surface_id,
+            Some(303)
         );
     }
 
