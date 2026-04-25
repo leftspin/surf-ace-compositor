@@ -5849,6 +5849,9 @@ impl RuntimeWaylandState {
         if let Some(overlay) = &self.overlay_toplevel {
             send_frames_surface_tree(overlay.wl_surface(), elapsed_ms);
         }
+        for native in self.native_pane_toplevels.values() {
+            send_frames_surface_tree(native.wl_surface(), elapsed_ms);
+        }
         for popup in &self.popups {
             send_frames_surface_tree(popup.surface.wl_surface(), elapsed_ms);
         }
@@ -7120,9 +7123,9 @@ mod tests {
     #[test]
     fn screen_capture_flip_policy_matches_verified_rotation_contract() {
         assert!(!screen_capture_src_flipped(true, OutputRotation::Deg0));
-        assert!(screen_capture_src_flipped(true, OutputRotation::Deg90));
+        assert!(!screen_capture_src_flipped(true, OutputRotation::Deg90));
         assert!(!screen_capture_src_flipped(true, OutputRotation::Deg180));
-        assert!(screen_capture_src_flipped(true, OutputRotation::Deg270));
+        assert!(!screen_capture_src_flipped(true, OutputRotation::Deg270));
         assert!(!screen_capture_src_flipped(false, OutputRotation::Deg0));
         assert!(!screen_capture_src_flipped(false, OutputRotation::Deg180));
         assert!(!screen_capture_src_flipped(false, OutputRotation::Deg90));

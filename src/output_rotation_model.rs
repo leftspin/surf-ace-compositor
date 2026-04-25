@@ -58,8 +58,13 @@ impl OutputRotationModel {
 
     pub const fn capture_src_flipped(self, mapping_flipped: bool) -> bool {
         match self.rotation {
-            OutputRotation::Deg90 | OutputRotation::Deg270 => mapping_flipped,
-            OutputRotation::Deg0 | OutputRotation::Deg180 => false,
+            OutputRotation::Deg0
+            | OutputRotation::Deg90
+            | OutputRotation::Deg180
+            | OutputRotation::Deg270 => {
+                let _ = mapping_flipped;
+                false
+            }
         }
     }
 
@@ -112,7 +117,7 @@ mod tests {
             deg90.capture_pixel_rotation(),
             CapturePixelRotation::Rotate90Clockwise
         );
-        assert!(deg90.capture_src_flipped(true));
+        assert!(!deg90.capture_src_flipped(true));
 
         let deg180 = OutputRotationModel::new(OutputRotation::Deg180);
         assert!(!deg180.swaps_axes());
@@ -136,15 +141,15 @@ mod tests {
             deg270.capture_pixel_rotation(),
             CapturePixelRotation::Rotate90Counterclockwise
         );
-        assert!(deg270.capture_src_flipped(true));
+        assert!(!deg270.capture_src_flipped(true));
     }
 
     #[test]
     fn capture_src_flip_uses_verified_rotation_policy() {
         assert!(!OutputRotationModel::new(OutputRotation::Deg0).capture_src_flipped(true));
-        assert!(OutputRotationModel::new(OutputRotation::Deg90).capture_src_flipped(true));
+        assert!(!OutputRotationModel::new(OutputRotation::Deg90).capture_src_flipped(true));
         assert!(!OutputRotationModel::new(OutputRotation::Deg180).capture_src_flipped(true));
-        assert!(OutputRotationModel::new(OutputRotation::Deg270).capture_src_flipped(true));
+        assert!(!OutputRotationModel::new(OutputRotation::Deg270).capture_src_flipped(true));
 
         for rotation in [
             OutputRotation::Deg0,

@@ -292,13 +292,14 @@ mod tests {
     }
 
     #[test]
-    fn deg90_capture_honors_flipped_mapping_before_rotation() {
+    fn deg90_capture_ignores_renderer_row_flip_before_rotation() {
         let store = ScreenCaptureStore::default();
         let src = vec![
             0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, //
             0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
         ];
-        store.update_from_scanout_xrgb8888(&src, 8, 2, 2, true, OutputRotation::Deg90);
+        let src_flipped = OutputRotationModel::new(OutputRotation::Deg90).capture_src_flipped(true);
+        store.update_from_scanout_xrgb8888(&src, 8, 2, 2, src_flipped, OutputRotation::Deg90);
 
         let frame = store
             .inner
@@ -311,8 +312,8 @@ mod tests {
         assert_eq!(
             xrgb8888,
             vec![
-                0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, //
-                0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+                0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, //
+                0x04, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
             ]
         );
     }
