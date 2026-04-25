@@ -5935,6 +5935,11 @@ impl RuntimeWaylandState {
         );
     }
 
+    fn bridge_native_pane_surface_detached(&self, client_pid: u32) {
+        let mut state = lock_state(&self.shared_state);
+        let _ = state.runtime_mark_native_pane_surface_detached_for_pid(client_pid);
+    }
+
     fn bridge_overlay_surface_detached(&self, client_pid: u32) {
         let mut state = lock_state(&self.shared_state);
         let _ = state.runtime_mark_overlay_surface_detached_for_pid(client_pid);
@@ -6320,8 +6325,19 @@ impl XdgShellHandler for RuntimeWaylandState {
             }
             self.overlay_toplevel = None;
         }
-        self.native_pane_toplevels
-            .retain(|_, item| surface_key(item.wl_surface()) != destroyed_id);
+        let destroyed_native_pane =
+            self.native_pane_toplevels
+                .iter()
+                .find_map(|(pane_id, item)| {
+                    (surface_key(item.wl_surface()) == destroyed_id).then(|| pane_id.clone())
+                });
+        if let Some(pane_id) = destroyed_native_pane {
+            if let Some(native) = self.native_pane_toplevels.remove(&pane_id) {
+                if let Some(pid) = self.client_pid_for_toplevel(&native) {
+                    self.bridge_native_pane_surface_detached(pid);
+                }
+            }
+        }
         let mut removed_popup_ids = Vec::new();
         self.popups.retain(|popup| {
             let keep = popup.surface.get_parent_surface().as_ref().map(surface_key)

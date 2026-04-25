@@ -787,6 +787,30 @@ impl CompositorState {
         None
     }
 
+    pub fn runtime_mark_native_pane_surface_detached_for_pid(&mut self, client_pid: u32) -> bool {
+        for pane in self.panes.values_mut() {
+            match pane.external_native_state {
+                ExternalNativeLifecycleState::Attached { pid } if pid == client_pid => {
+                    pane.external_native_state = ExternalNativeLifecycleState::Launching { pid };
+                    pane.external_native_surface_id = None;
+                    pane.external_native_binding_evidence = None;
+                    return true;
+                }
+                ExternalNativeLifecycleState::Launching { pid } if pid == client_pid => {
+                    pane.external_native_surface_id = None;
+                    pane.external_native_binding_evidence = None;
+                    return true;
+                }
+                ExternalNativeLifecycleState::Absent
+                | ExternalNativeLifecycleState::Launching { .. }
+                | ExternalNativeLifecycleState::Attached { .. }
+                | ExternalNativeLifecycleState::Failed { .. }
+                | ExternalNativeLifecycleState::Exited { .. } => {}
+            }
+        }
+        false
+    }
+
     pub fn switch_pane_to_surf_ace(&mut self, pane_id: &PaneId) -> Result<(), StateError> {
         let pane = self
             .panes
@@ -1682,6 +1706,54 @@ mod tests {
                 .surface_id,
             Some(303)
         );
+    }
+
+    #[test]
+    fn native_pane_surface_detach_clears_surface_truth_without_releasing_pane_plan() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: PaneId::new("surface:2"),
+                content_id: Some("ct_top".to_string()),
+                binding_id: Some("surface:2:ct_top".to_string()),
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 640,
+                    height: 480,
+                },
+                target: NativeTargetClass::Terminal,
+                process: terminal_process(),
+            }])
+            .expect("native pane host plan should apply");
+        state
+            .launch_native_pane_hosts(Vec::new())
+            .expect("native pane host should launch");
+        assert_eq!(
+            state.runtime_mark_native_pane_surface_attached_for_launch_pid_with_evidence(
+                1,
+                77,
+                Some(303),
+                None,
+            ),
+            Some(PaneId::new("surface:2"))
+        );
+
+        assert!(state.runtime_mark_native_pane_surface_detached_for_pid(77));
+        let status = state.status_snapshot();
+        assert_eq!(
+            status.panes[0].external_native_state,
+            ExternalNativeLifecycleState::Launching { pid: 77 }
+        );
+        let native_host = status.panes[0]
+            .native_host
+            .as_ref()
+            .expect("native host status remains present for reattach/rehost");
+        assert_eq!(native_host.surface_id, None);
+        assert_eq!(native_host.content_id.as_deref(), Some("ct_top"));
+        assert_eq!(native_host.binding_id.as_deref(), Some("surface:2:ct_top"));
     }
 
     #[test]
