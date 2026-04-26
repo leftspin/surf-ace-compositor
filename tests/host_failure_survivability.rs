@@ -64,7 +64,12 @@ where
     );
 }
 
-fn spawn_server(socket_path: &Path, runtime: &str, extra_env: &[(&str, &str)]) -> Child {
+fn spawn_server_with_args(
+    socket_path: &Path,
+    runtime: &str,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Child {
     let bin = env!("CARGO_BIN_EXE_surf-ace-compositor");
     let mut command = Command::new(bin);
     command.args([
@@ -76,6 +81,7 @@ fn spawn_server(socket_path: &Path, runtime: &str, extra_env: &[(&str, &str)]) -
             .to_str()
             .expect("socket path should be representable"),
     ]);
+    command.args(extra_args);
     for (key, value) in extra_env {
         command.env(key, value);
     }
@@ -87,12 +93,75 @@ fn spawn_server(socket_path: &Path, runtime: &str, extra_env: &[(&str, &str)]) -
         .expect("server should start")
 }
 
+fn spawn_server(socket_path: &Path, runtime: &str, extra_env: &[(&str, &str)]) -> Child {
+    spawn_server_with_args(socket_path, runtime, &[], extra_env)
+}
+
 fn spawn_forced_host_failure_server(socket_path: &Path) -> Child {
     spawn_server(
         socket_path,
         "host",
         &[("SURF_ACE_HOST_RUNTIME_FORCE_FAIL", "1")],
     )
+}
+
+#[test]
+fn host_start_with_launch_intent_and_overlay_debug_keeps_control_socket_reachable() {
+    let unique_suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be monotonic enough for test")
+        .as_nanos();
+    let socket_path = PathBuf::from(format!(
+        "/tmp/surf-ace-host-launch-debug-startup-{}-{}.sock",
+        std::process::id(),
+        unique_suffix
+    ));
+    let _ = fs::remove_file(&socket_path);
+
+    let launch_intent = r#"{"process":{"command":"/bin/true","args":[],"env":{}},"binding":{"kind":"app_id","app_id":"surf-ace-main-app"}}"#;
+    let mut child = spawn_server_with_args(
+        &socket_path,
+        "host",
+        &[
+            "--main-app-launch-intent-json",
+            launch_intent,
+            "--overlay-region-debug-borders",
+        ],
+        &[
+            (
+                "SURF_ACE_HOST_RUNTIME_TEST_SCRIPTED_FAILURE_PHASE",
+                "running",
+            ),
+            ("SURF_ACE_HOST_RUNTIME_TEST_SCRIPTED_HOLD_MS", "500"),
+        ],
+    );
+    wait_for_socket(&socket_path);
+
+    let status = wait_for_status_where(&socket_path, "scripted host runtime status", |status| {
+        status["status"]["runtime"]["backend"] == Value::String("host_drm".to_string())
+            && status["status"]["runtime"]["wayland_socket"]
+                == Value::String("wayland-test-running".to_string())
+    });
+    assert_eq!(status["ok"], Value::Bool(true));
+    assert_eq!(
+        status["status"]["runtime"]["overlay_region_debug_borders"],
+        Value::Bool(true)
+    );
+    assert_eq!(
+        status["status"]["runtime"]["main_app_launch_intent"]["binding"]["app_id"],
+        Value::String("surf-ace-main-app".to_string())
+    );
+    assert!(
+        child
+            .try_wait()
+            .expect("child wait should succeed")
+            .is_none(),
+        "host serve must remain alive while the control socket is reachable"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_file(&socket_path);
 }
 
 #[test]
