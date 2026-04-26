@@ -3690,20 +3690,27 @@ fn render_host_scene_with_gles_direct(
         gles_state.overlay_scanout = None;
         None
     };
-    let primary_elements = if overlay_framebuffer.is_some() {
-        capture.primary_plane_slice()
-    } else {
-        &capture.elements
-    };
     if matches!(rotation, OutputRotation::Deg90 | OutputRotation::Deg270) {
-        render_elements_to_texture(
-            &mut gles_state.renderer,
-            device_path,
-            &mut gles_state.target_texture,
-            scene_render_size,
-            primary_elements,
-            "quarter-turn scene texture",
-        )?;
+        if overlay_framebuffer.is_some() {
+            let primary_elements = capture.primary_plane_elements();
+            render_elements_to_texture(
+                &mut gles_state.renderer,
+                device_path,
+                &mut gles_state.target_texture,
+                scene_render_size,
+                &primary_elements,
+                "quarter-turn scene texture",
+            )?;
+        } else {
+            render_elements_to_texture(
+                &mut gles_state.renderer,
+                device_path,
+                &mut gles_state.target_texture,
+                scene_render_size,
+                &capture.elements,
+                "quarter-turn scene texture",
+            )?;
+        }
 
         let mut render_target = gles_state
             .renderer
@@ -3757,12 +3764,22 @@ fn render_host_scene_with_gles_direct(
             path: device_path.display().to_string(),
             error: format!("failed to clear direct scanout render target: {err}"),
         })?;
-    draw_render_elements(&mut frame, 1.0, primary_elements, &[damage]).map_err(|err| {
-        RuntimeError::HostOutputClaim {
-            path: device_path.display().to_string(),
-            error: format!("failed to draw scene elements into direct scanout buffer: {err}"),
-        }
-    })?;
+    if overlay_framebuffer.is_some() {
+        let primary_elements = capture.primary_plane_elements();
+        draw_render_elements(&mut frame, 1.0, &primary_elements, &[damage]).map_err(|err| {
+            RuntimeError::HostOutputClaim {
+                path: device_path.display().to_string(),
+                error: format!("failed to draw scene elements into direct scanout buffer: {err}"),
+            }
+        })?;
+    } else {
+        draw_render_elements(&mut frame, 1.0, &capture.elements, &[damage]).map_err(|err| {
+            RuntimeError::HostOutputClaim {
+                path: device_path.display().to_string(),
+                error: format!("failed to draw scene elements into direct scanout buffer: {err}"),
+            }
+        })?;
+    }
     let _ = frame
         .finish()
         .map_err(|err| RuntimeError::HostOutputClaim {
@@ -4309,6 +4326,7 @@ struct RuntimeWaylandState {
 
 #[derive(Debug, Clone, Copy)]
 enum RenderElementSource {
+    Cursor,
     Main,
     MainPopup,
     NativePane,
@@ -4356,6 +4374,7 @@ impl RenderElementCapture {
         }
         self.elements.extend(new_elements);
         match source {
+            RenderElementSource::Cursor => self.counts.cursor += added,
             RenderElementSource::Main => self.counts.main += added,
             RenderElementSource::MainPopup => self.counts.main_popups += added,
             RenderElementSource::NativePane => self.counts.native_panes += added,
@@ -4366,15 +4385,20 @@ impl RenderElementCapture {
         }
     }
 
-    fn primary_plane_slice(&self) -> &[SurfAceRenderElement] {
-        // Render elements are stored top-to-bottom for Smithay's occlusion pass.
-        let start = self.counts.overlay_popups + self.counts.overlay;
-        &self.elements[start..]
+    fn primary_plane_elements(&self) -> Vec<&SurfAceRenderElement> {
+        let cursor_end = self.counts.cursor.min(self.elements.len());
+        let primary_start = (self.counts.cursor + self.counts.overlay_popups + self.counts.overlay)
+            .min(self.elements.len());
+        let mut elements = Vec::with_capacity(cursor_end + self.elements.len() - primary_start);
+        elements.extend(self.elements[..cursor_end].iter());
+        elements.extend(self.elements[primary_start..].iter());
+        elements
     }
 }
 
 #[derive(Default, Debug, Clone, Copy)]
 struct RenderElementCounts {
+    cursor: usize,
     main: usize,
     main_popups: usize,
     native_panes: usize,
@@ -5909,6 +5933,10 @@ impl RuntimeWaylandState {
         };
         // Smithay expects top-to-bottom order; otherwise an opaque main surface
         // can cull the overlay before it is drawn.
+        capture.push_elements(
+            RenderElementSource::Cursor,
+            software_cursor_elements(self.pointer_location, _output_width, _output_height),
+        );
         capture.push(RenderElementSource::OverlayPopup, overlay_popup_elements);
         capture.push(RenderElementSource::Overlay, overlay_elements);
         if let Some(regions) = debug_border_regions {
@@ -6358,6 +6386,13 @@ impl RuntimeWaylandState {
                 output_h,
             );
         }
+        draw_software_cursor(
+            self.pointer_location,
+            target,
+            target_stride,
+            output_w,
+            output_h,
+        );
         stats
     }
 }
@@ -6844,6 +6879,109 @@ fn draw_overlay_region_debug_borders(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SoftwareCursorColor {
+    White,
+    Black,
+}
+
+fn software_cursor_elements(
+    location: Point<f64, Logical>,
+    output_w: i32,
+    output_h: i32,
+) -> Vec<SurfAceRenderElement> {
+    software_cursor_rects(location, output_w, output_h)
+        .into_iter()
+        .map(|(rect, color)| {
+            SolidColorRenderElement::new(
+                Id::new(),
+                Rectangle::<i32, Physical>::new(
+                    (rect.loc.x, rect.loc.y).into(),
+                    (rect.size.w, rect.size.h).into(),
+                ),
+                CommitCounter::default(),
+                match color {
+                    SoftwareCursorColor::White => Color32F::new(1.0, 1.0, 1.0, 1.0),
+                    SoftwareCursorColor::Black => Color32F::new(0.0, 0.0, 0.0, 1.0),
+                },
+                Kind::Unspecified,
+            )
+            .into()
+        })
+        .collect()
+}
+
+fn software_cursor_rects(
+    location: Point<f64, Logical>,
+    output_w: i32,
+    output_h: i32,
+) -> Vec<(Rectangle<i32, Logical>, SoftwareCursorColor)> {
+    let bounds = Rectangle::new((0, 0).into(), (output_w.max(0), output_h.max(0)).into());
+    if bounds.size.w == 0 || bounds.size.h == 0 {
+        return Vec::new();
+    }
+
+    let x = location.x.round() as i32;
+    let y = location.y.round() as i32;
+    let shape = [
+        Rectangle::new((x, y).into(), (2, 22).into()),
+        Rectangle::new((x, y).into(), (12, 2).into()),
+        Rectangle::new((x + 2, y + 2).into(), (4, 4).into()),
+        Rectangle::new((x + 4, y + 6).into(), (4, 4).into()),
+        Rectangle::new((x + 6, y + 10).into(), (4, 4).into()),
+        Rectangle::new((x + 8, y + 14).into(), (4, 4).into()),
+        Rectangle::new((x + 5, y + 16).into(), (5, 2).into()),
+    ];
+
+    let mut rects = Vec::new();
+    for rect in shape {
+        let shadow = Rectangle::new(
+            (rect.loc.x + 1, rect.loc.y + 1).into(),
+            (rect.size.w, rect.size.h).into(),
+        );
+        if let Some(clipped) = shadow.intersection(bounds) {
+            if clipped.size.w > 0 && clipped.size.h > 0 {
+                rects.push((clipped, SoftwareCursorColor::Black));
+            }
+        }
+    }
+    for rect in shape {
+        if let Some(clipped) = rect.intersection(bounds) {
+            if clipped.size.w > 0 && clipped.size.h > 0 {
+                rects.push((clipped, SoftwareCursorColor::White));
+            }
+        }
+    }
+    rects
+}
+
+fn draw_software_cursor(
+    location: Point<f64, Logical>,
+    target: &mut [u8],
+    target_stride: usize,
+    output_w: i32,
+    output_h: i32,
+) {
+    for (rect, color) in software_cursor_rects(location, output_w, output_h) {
+        let (b, g, r) = match color {
+            SoftwareCursorColor::White => (0xFF, 0xFF, 0xFF),
+            SoftwareCursorColor::Black => (0x00, 0x00, 0x00),
+        };
+        for y in rect.loc.y.max(0)..(rect.loc.y + rect.size.h).min(output_h) {
+            let row_start = (y as usize).saturating_mul(target_stride);
+            for x in rect.loc.x.max(0)..(rect.loc.x + rect.size.w).min(output_w) {
+                let idx = row_start.saturating_add((x as usize).saturating_mul(4));
+                if idx.saturating_add(4) <= target.len() {
+                    target[idx] = b;
+                    target[idx + 1] = g;
+                    target[idx + 2] = r;
+                    target[idx + 3] = 0x00;
+                }
+            }
+        }
+    }
+}
+
 fn lock_state(
     shared_state: &Arc<Mutex<CompositorState>>,
 ) -> std::sync::MutexGuard<'_, CompositorState> {
@@ -7085,6 +7223,82 @@ mod tests {
         assert!(rects.contains(&Rectangle::new((10, 68).into(), (100, 2).into())));
         assert!(rects.contains(&Rectangle::new((10, 20).into(), (2, 50).into())));
         assert!(rects.contains(&Rectangle::new((108, 20).into(), (2, 50).into())));
+    }
+
+    #[test]
+    fn software_cursor_uses_non_magenta_visible_rectangles_at_pointer_location() {
+        let rects = super::software_cursor_rects((10.0, 10.0).into(), 160, 100);
+
+        assert!(rects.iter().any(|(rect, color)| {
+            *color == super::SoftwareCursorColor::White
+                && *rect == Rectangle::new((10, 10).into(), (2, 22).into())
+        }));
+        assert!(rects.iter().any(|(rect, color)| {
+            *color == super::SoftwareCursorColor::Black
+                && *rect == Rectangle::new((11, 11).into(), (2, 22).into())
+        }));
+        assert!(
+            rects
+                .iter()
+                .any(|(_, color)| *color == super::SoftwareCursorColor::White)
+        );
+        assert!(
+            rects
+                .iter()
+                .any(|(_, color)| *color == super::SoftwareCursorColor::Black)
+        );
+    }
+
+    #[test]
+    fn software_cursor_rects_clip_to_output_bounds() {
+        let rects = super::software_cursor_rects((-4.0, -4.0).into(), 12, 12);
+
+        assert!(!rects.is_empty());
+        assert!(rects.iter().all(|(rect, _)| {
+            rect.loc.x >= 0
+                && rect.loc.y >= 0
+                && rect.loc.x + rect.size.w <= 12
+                && rect.loc.y + rect.size.h <= 12
+        }));
+    }
+
+    #[test]
+    fn primary_plane_elements_keep_cursor_when_overlay_plane_is_split() {
+        let mut capture = super::RenderElementCapture::default();
+        capture.push_elements(
+            super::RenderElementSource::Cursor,
+            super::software_cursor_elements((10.0, 10.0).into(), 160, 100),
+        );
+        let cursor_count = capture.counts.cursor;
+        capture.push_elements(
+            super::RenderElementSource::Overlay,
+            super::overlay_region_debug_border_elements(
+                &[test_overlay_region(
+                    "overlay",
+                    vec![OverlayCaptureCapability::PointerHover],
+                )],
+                160,
+                100,
+            ),
+        );
+        capture.push_elements(
+            super::RenderElementSource::OverlayRegionDebug,
+            super::overlay_region_debug_border_elements(
+                &[test_overlay_region(
+                    "chrome",
+                    vec![OverlayCaptureCapability::PointerHover],
+                )],
+                160,
+                100,
+            ),
+        );
+        let debug_count = capture.counts.overlay_region_debug;
+
+        let primary = capture.primary_plane_elements();
+
+        assert_eq!(primary.len(), cursor_count + debug_count);
+        assert!(cursor_count > 0);
+        assert!(debug_count > 0);
     }
 
     #[test]
