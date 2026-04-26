@@ -581,6 +581,10 @@ impl CompositorState {
         self.runtime.active_focus_target = target;
     }
 
+    pub fn set_overlay_region_debug_borders(&mut self, enabled: bool) {
+        self.runtime.overlay_region_debug_borders = enabled;
+    }
+
     pub fn runtime_expected_main_app_binding(&self) -> Option<(u32, MainAppSurfaceBinding)> {
         self.runtime_expected_main_app_binding_with_token()
             .map(|expectation| (expectation.pid, expectation.binding))

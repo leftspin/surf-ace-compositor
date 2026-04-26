@@ -1,8 +1,8 @@
 use crate::model::{
-    LaunchTokenEvidence, OutputRotation, PaneGeometry, PaneId, RuntimeBackend,
-    RuntimeDmabufFormatStatus, RuntimeFocusTarget, RuntimeHostPresentOwnership,
-    RuntimeHostQueuedPresentSource, RuntimeHostSelectionState, RuntimeSelectionMode,
-    SurfaceBindingEvidence, SurfaceBindingEvidenceOutcome,
+    LaunchTokenEvidence, OutputRotation, OverlayCaptureCapability, OverlayRegionStatus,
+    PaneGeometry, PaneId, RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeFocusTarget,
+    RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource, RuntimeHostSelectionState,
+    RuntimeSelectionMode, SurfaceBindingEvidence, SurfaceBindingEvidenceOutcome,
 };
 use crate::output_rotation_model::OutputRotationModel;
 use crate::screen_capture::ScreenCaptureStore;
@@ -23,13 +23,15 @@ use smithay::backend::input::{
     KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
 };
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
-use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::surface::{
     WaylandSurfaceRenderElement, render_elements_from_surface_tree,
 };
+use smithay::backend::renderer::element::{
+    Id, Kind, render_elements, solid::SolidColorRenderElement,
+};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{
-    RendererSurfaceStateUserData, draw_render_elements, import_surface_tree,
+    CommitCounter, RendererSurfaceStateUserData, draw_render_elements, import_surface_tree,
     on_commit_buffer_handler,
 };
 use smithay::backend::renderer::{
@@ -4311,13 +4313,20 @@ enum RenderElementSource {
     MainPopup,
     NativePane,
     NativePanePopup,
+    OverlayRegionDebug,
     Overlay,
     OverlayPopup,
 }
 
+render_elements! {
+    SurfAceRenderElement<=GlesRenderer>;
+    Wayland=WaylandSurfaceRenderElement<GlesRenderer>,
+    Solid=SolidColorRenderElement,
+}
+
 #[derive(Default)]
 struct RenderElementCapture {
-    elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
+    elements: Vec<SurfAceRenderElement>,
     counts: RenderElementCounts,
 }
 
@@ -4326,6 +4335,20 @@ impl RenderElementCapture {
         &mut self,
         source: RenderElementSource,
         new_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
+    ) {
+        self.push_elements(
+            source,
+            new_elements
+                .into_iter()
+                .map(SurfAceRenderElement::from)
+                .collect(),
+        );
+    }
+
+    fn push_elements(
+        &mut self,
+        source: RenderElementSource,
+        new_elements: Vec<SurfAceRenderElement>,
     ) {
         let added = new_elements.len();
         if added == 0 {
@@ -4337,12 +4360,13 @@ impl RenderElementCapture {
             RenderElementSource::MainPopup => self.counts.main_popups += added,
             RenderElementSource::NativePane => self.counts.native_panes += added,
             RenderElementSource::NativePanePopup => self.counts.native_pane_popups += added,
+            RenderElementSource::OverlayRegionDebug => self.counts.overlay_region_debug += added,
             RenderElementSource::Overlay => self.counts.overlay += added,
             RenderElementSource::OverlayPopup => self.counts.overlay_popups += added,
         }
     }
 
-    fn primary_plane_slice(&self) -> &[WaylandSurfaceRenderElement<GlesRenderer>] {
+    fn primary_plane_slice(&self) -> &[SurfAceRenderElement] {
         // Render elements are stored top-to-bottom for Smithay's occlusion pass.
         let start = self.counts.overlay_popups + self.counts.overlay;
         &self.elements[start..]
@@ -4355,6 +4379,7 @@ struct RenderElementCounts {
     main_popups: usize,
     native_panes: usize,
     native_pane_popups: usize,
+    overlay_region_debug: usize,
     overlay: usize,
     overlay_popups: usize,
 }
@@ -4882,7 +4907,8 @@ impl RuntimeWaylandState {
                 self.pointer_location = pos;
                 let serial = SERIAL_COUNTER.next_serial();
 
-                let under = self.surface_under_point(pos);
+                let under = self
+                    .surface_under_point_for_capture(pos, OverlayCaptureCapability::PointerHover);
                 if let Some(pointer) = self.seat.get_pointer() {
                     pointer.motion(
                         self,
@@ -4900,7 +4926,10 @@ impl RuntimeWaylandState {
                 if let Some(pointer) = self.seat.get_pointer() {
                     let serial = SERIAL_COUNTER.next_serial();
                     if event.state() == ButtonState::Pressed && !pointer.is_grabbed() {
-                        let surface_under = self.surface_under_point(self.pointer_location);
+                        let surface_under = self.surface_under_point_for_capture(
+                            self.pointer_location,
+                            OverlayCaptureCapability::PointerButton,
+                        );
                         let focus_target =
                             surface_under.as_ref().map(|(surface, _)| surface.clone());
                         if let Some(keyboard) = self.seat.get_keyboard() {
@@ -4921,6 +4950,20 @@ impl RuntimeWaylandState {
             }
             InputEvent::PointerAxis { event, .. } => {
                 if let Some(pointer) = self.seat.get_pointer() {
+                    let serial = SERIAL_COUNTER.next_serial();
+                    let under = self.surface_under_point_for_capture(
+                        self.pointer_location,
+                        OverlayCaptureCapability::PointerAxis,
+                    );
+                    pointer.motion(
+                        self,
+                        under,
+                        &MotionEvent {
+                            location: self.pointer_location,
+                            serial,
+                            time: event.time_msec(),
+                        },
+                    );
                     let source = event.source();
                     let horizontal_amount = event.amount(Axis::Horizontal).unwrap_or_else(|| {
                         event.amount_v120(Axis::Horizontal).unwrap_or(0.0) * 15.0 / 120.0
@@ -4970,7 +5013,7 @@ impl RuntimeWaylandState {
                 })
             })
             .flatten()
-            .or_else(|| match requested_target {
+            .or_else(|| match requested_target.clone() {
                 Some(RuntimeFocusTarget::MainApp) => self
                     .main_toplevel
                     .as_ref()
@@ -4979,6 +5022,14 @@ impl RuntimeWaylandState {
                     self.overlay_toplevel.as_ref().map(|surface| {
                         (
                             RuntimeFocusTarget::OverlayNative,
+                            surface.wl_surface().clone(),
+                        )
+                    })
+                }
+                Some(RuntimeFocusTarget::NativePane { pane_id }) => {
+                    self.native_pane_toplevels.get(&pane_id).map(|surface| {
+                        (
+                            RuntimeFocusTarget::NativePane { pane_id },
                             surface.wl_surface().clone(),
                         )
                     })
@@ -5335,9 +5386,10 @@ impl RuntimeWaylandState {
         Some(rectangle_from_pane_geometry(geometry))
     }
 
-    fn surface_under_point(
+    fn surface_under_point_for_capture(
         &self,
         pos: Point<f64, Logical>,
+        capture: OverlayCaptureCapability,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
         for popup in self.popups.iter().rev() {
             let popup_geometry = self.popup_absolute_geometry(popup);
@@ -5370,6 +5422,16 @@ impl RuntimeWaylandState {
                 return Some((overlay.wl_surface().clone(), local_pos));
             }
         }
+
+        let overlay_regions = lock_state(&self.shared_state)
+            .status_snapshot()
+            .overlay_regions;
+        if overlay_region_capture_contains(&overlay_regions.regions, pos, capture) {
+            if let Some(main) = &self.main_toplevel {
+                return Some((main.wl_surface().clone(), pos));
+            }
+        }
+
         for (pane_id, native) in &self.native_pane_toplevels {
             let Some(rect) = self.native_pane_rect(pane_id) else {
                 continue;
@@ -5838,10 +5900,23 @@ impl RuntimeWaylandState {
             }
         }
 
+        let debug_border_regions = {
+            let status = lock_state(&self.shared_state).status_snapshot();
+            status
+                .runtime
+                .overlay_region_debug_borders
+                .then_some(status.overlay_regions.regions)
+        };
         // Smithay expects top-to-bottom order; otherwise an opaque main surface
         // can cull the overlay before it is drawn.
         capture.push(RenderElementSource::OverlayPopup, overlay_popup_elements);
         capture.push(RenderElementSource::Overlay, overlay_elements);
+        if let Some(regions) = debug_border_regions {
+            capture.push_elements(
+                RenderElementSource::OverlayRegionDebug,
+                overlay_region_debug_border_elements(&regions, _output_width, _output_height),
+            );
+        }
         capture.push(
             RenderElementSource::NativePanePopup,
             native_pane_popup_elements,
@@ -6273,6 +6348,16 @@ impl RuntimeWaylandState {
                 }
             }
         }
+        let status = lock_state(&self.shared_state).status_snapshot();
+        if status.runtime.overlay_region_debug_borders {
+            draw_overlay_region_debug_borders(
+                &status.overlay_regions.regions,
+                target,
+                target_stride,
+                output_w,
+                output_h,
+            );
+        }
         stats
     }
 }
@@ -6484,11 +6569,7 @@ impl SeatHandler for RuntimeWaylandState {
         );
         let target = focused
             .and_then(|surface| self.role_for_surface(surface))
-            .map(|role| match role {
-                RuntimeSurfaceRole::MainApp => RuntimeFocusTarget::MainApp,
-                RuntimeSurfaceRole::OverlayNative => RuntimeFocusTarget::OverlayNative,
-                RuntimeSurfaceRole::NativePane(_) => RuntimeFocusTarget::OverlayNative,
-            });
+            .map(runtime_focus_target_for_role);
         let mut state = lock_state(&self.shared_state);
         state.set_runtime_focus_target(target);
     }
@@ -6498,6 +6579,14 @@ impl SeatHandler for RuntimeWaylandState {
         _seat: &Seat<Self>,
         _image: smithay::input::pointer::CursorImageStatus,
     ) {
+    }
+}
+
+fn runtime_focus_target_for_role(role: RuntimeSurfaceRole) -> RuntimeFocusTarget {
+    match role {
+        RuntimeSurfaceRole::MainApp => RuntimeFocusTarget::MainApp,
+        RuntimeSurfaceRole::OverlayNative => RuntimeFocusTarget::OverlayNative,
+        RuntimeSurfaceRole::NativePane(pane_id) => RuntimeFocusTarget::NativePane { pane_id },
     }
 }
 
@@ -6662,6 +6751,99 @@ fn blit_shm_surface(
     }
 }
 
+fn overlay_region_capture_contains(
+    regions: &[OverlayRegionStatus],
+    pos: Point<f64, Logical>,
+    capture: OverlayCaptureCapability,
+) -> bool {
+    regions.iter().any(|region| {
+        region.captures.contains(&capture)
+            && pos.x >= region.rect.x
+            && pos.x < region.rect.x + region.rect.width
+            && pos.y >= region.rect.y
+            && pos.y < region.rect.y + region.rect.height
+    })
+}
+
+fn overlay_region_debug_border_elements(
+    regions: &[OverlayRegionStatus],
+    output_w: i32,
+    output_h: i32,
+) -> Vec<SurfAceRenderElement> {
+    overlay_region_debug_border_rects(regions, output_w, output_h)
+        .into_iter()
+        .map(|rect| {
+            SolidColorRenderElement::new(
+                Id::new(),
+                Rectangle::<i32, Physical>::new(
+                    (rect.loc.x, rect.loc.y).into(),
+                    (rect.size.w, rect.size.h).into(),
+                ),
+                CommitCounter::default(),
+                Color32F::new(1.0, 0.0, 0.85, 1.0),
+                Kind::Unspecified,
+            )
+            .into()
+        })
+        .collect()
+}
+
+fn overlay_region_debug_border_rects(
+    regions: &[OverlayRegionStatus],
+    output_w: i32,
+    output_h: i32,
+) -> Vec<Rectangle<i32, Logical>> {
+    let bounds = Rectangle::new((0, 0).into(), (output_w.max(0), output_h.max(0)).into());
+    if bounds.size.w == 0 || bounds.size.h == 0 {
+        return Vec::new();
+    }
+
+    let mut rects = Vec::new();
+    for region in regions {
+        let x = region.rect.x.floor() as i32;
+        let y = region.rect.y.floor() as i32;
+        let w = region.rect.width.ceil().max(1.0) as i32;
+        let h = region.rect.height.ceil().max(1.0) as i32;
+        let border = 2.min(w).min(h).max(1);
+        let candidates = [
+            Rectangle::new((x, y).into(), (w, border).into()),
+            Rectangle::new((x, y + h - border).into(), (w, border).into()),
+            Rectangle::new((x, y).into(), (border, h).into()),
+            Rectangle::new((x + w - border, y).into(), (border, h).into()),
+        ];
+        rects.extend(
+            candidates
+                .into_iter()
+                .filter_map(|rect| rect.intersection(bounds))
+                .filter(|rect| rect.size.w > 0 && rect.size.h > 0),
+        );
+    }
+    rects
+}
+
+fn draw_overlay_region_debug_borders(
+    regions: &[OverlayRegionStatus],
+    target: &mut [u8],
+    target_stride: usize,
+    output_w: i32,
+    output_h: i32,
+) {
+    for rect in overlay_region_debug_border_rects(regions, output_w, output_h) {
+        for y in rect.loc.y.max(0)..(rect.loc.y + rect.size.h).min(output_h) {
+            let row_start = (y as usize).saturating_mul(target_stride);
+            for x in rect.loc.x.max(0)..(rect.loc.x + rect.size.w).min(output_w) {
+                let idx = row_start.saturating_add((x as usize).saturating_mul(4));
+                if idx.saturating_add(4) <= target.len() {
+                    target[idx] = 0xD9;
+                    target[idx + 1] = 0x00;
+                    target[idx + 2] = 0xFF;
+                    target[idx + 3] = 0x00;
+                }
+            }
+        }
+    }
+}
+
 fn lock_state(
     shared_state: &Arc<Mutex<CompositorState>>,
 ) -> std::sync::MutexGuard<'_, CompositorState> {
@@ -6738,7 +6920,10 @@ mod tests {
         select_atomic_plane_zpos_values, select_preferred_scanout_format, select_primary_path,
         source_rect_from_bbox_and_geometry, transform_from_rotation,
     };
-    use crate::model::{OutputRotation, ProcessSpec};
+    use crate::model::{
+        CompositorOverlayKind, OutputRotation, OverlayCaptureCapability, OverlayRect,
+        OverlayRegionStatus, PaneId, ProcessSpec, RuntimeFocusTarget,
+    };
     use crate::process_manager::{ProcessController, ProcessExit};
     use crate::state::CompositorState;
     use smithay::input::keyboard::{Keysym, ModifiersState, keysyms};
@@ -6817,6 +7002,89 @@ mod tests {
     #[test]
     fn gles_intermediate_render_targets_stay_on_stable_xrgb8888() {
         assert_eq!(GLES_INTERMEDIATE_RENDER_FORMAT, DrmFourcc::Xrgb8888);
+    }
+
+    fn test_overlay_region(
+        region_id: &str,
+        captures: Vec<OverlayCaptureCapability>,
+    ) -> OverlayRegionStatus {
+        OverlayRegionStatus {
+            region_id: region_id.to_string(),
+            pane_id: PaneId::new("pane-a"),
+            pane_instance_id: "instance-a".to_string(),
+            kind: CompositorOverlayKind::PaneBadge,
+            rect: OverlayRect {
+                x: 10.0,
+                y: 20.0,
+                width: 100.0,
+                height: 50.0,
+            },
+            z_index: Some(1),
+            captures,
+            clamped: false,
+        }
+    }
+
+    #[test]
+    fn overlay_region_capture_hit_test_is_data_only_per_input_class() {
+        let regions = vec![test_overlay_region(
+            "chrome",
+            vec![
+                OverlayCaptureCapability::PointerHover,
+                OverlayCaptureCapability::PointerButton,
+            ],
+        )];
+        let inside = (20.0, 30.0).into();
+        let outside = (200.0, 30.0).into();
+
+        assert!(super::overlay_region_capture_contains(
+            &regions,
+            inside,
+            OverlayCaptureCapability::PointerHover
+        ));
+        assert!(super::overlay_region_capture_contains(
+            &regions,
+            inside,
+            OverlayCaptureCapability::PointerButton
+        ));
+        assert!(!super::overlay_region_capture_contains(
+            &regions,
+            inside,
+            OverlayCaptureCapability::PointerAxis
+        ));
+        assert!(!super::overlay_region_capture_contains(
+            &regions,
+            outside,
+            OverlayCaptureCapability::PointerHover
+        ));
+    }
+
+    #[test]
+    fn native_pane_focus_target_preserves_pane_identity() {
+        assert_eq!(
+            super::runtime_focus_target_for_role(super::RuntimeSurfaceRole::NativePane(
+                PaneId::new("pane-a")
+            )),
+            RuntimeFocusTarget::NativePane {
+                pane_id: PaneId::new("pane-a")
+            }
+        );
+    }
+
+    #[test]
+    fn overlay_region_debug_borders_are_two_pixel_clipped_rectangles() {
+        let regions = vec![test_overlay_region(
+            "chrome",
+            vec![OverlayCaptureCapability::PointerHover],
+        )];
+
+        let rects = super::overlay_region_debug_border_rects(&regions, 160, 100);
+
+        assert_eq!(rects.len(), 4);
+        assert!(rects.contains(&Rectangle::new((10, 20).into(), (100, 2).into())));
+        assert!(rects.contains(&Rectangle::new((10, 68).into(), (100, 2).into())));
+        assert!(rects.contains(&Rectangle::new((10, 20).into(), (2, 50).into())));
+        assert!(rects.contains(&Rectangle::new((108, 20).into(), (2, 50).into())));
     }
 
     #[test]

@@ -80,6 +80,8 @@ enum Command {
             default_value = "Super+`"
         )]
         shell_overlay_toggle_shortcut: String,
+        #[arg(long, env = "SURF_ACE_OVERLAY_REGION_DEBUG_BORDERS")]
+        overlay_region_debug_borders: bool,
     },
     #[command(
         about = "Send a raw JSON control request over the local Unix socket.",
@@ -176,6 +178,7 @@ fn main() {
                 None,
                 Some(launch),
                 "Super+`",
+                false,
             )
         }
         Some(Command::Serve {
@@ -186,6 +189,7 @@ fn main() {
             main_app_launch_intent_json,
             launch: serve_launch,
             shell_overlay_toggle_shortcut,
+            overlay_region_debug_borders,
         }) => run_server(
             socket_path,
             &runtime,
@@ -196,6 +200,7 @@ fn main() {
             main_app_launch_intent_json.as_deref(),
             serve_launch.as_deref().or(launch.as_deref()),
             &shell_overlay_toggle_shortcut,
+            overlay_region_debug_borders,
         ),
         Some(Command::Ctl {
             socket_path,
@@ -247,6 +252,7 @@ fn run_server(
     main_app_launch_intent_json: Option<&str>,
     launch: Option<&str>,
     shell_overlay_toggle_shortcut: &str,
+    overlay_region_debug_borders: bool,
 ) {
     let launch_plan = resolve_runtime_launch_plan(runtime, detect_host_runtime_capable());
     let shell_overlay_toggle_shortcut =
@@ -276,6 +282,7 @@ fn run_server(
             Err(poisoned) => poisoned.into_inner(),
         };
         state.set_shell_overlay_toggle_shortcut(shell_overlay_toggle_shortcut.display_string());
+        state.set_overlay_region_debug_borders(overlay_region_debug_borders);
         state.configure_shell_overlay_process(resolve_default_shell_overlay_process());
         if let Some(intent) = main_app_launch_intent {
             if let Err(err) = state.select_main_app_launch_intent(intent) {

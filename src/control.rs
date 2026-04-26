@@ -69,6 +69,10 @@ pub enum ControlRequest {
     },
     #[serde(rename = "overlay_regions.status")]
     OverlayRegionsStatus,
+    #[serde(rename = "overlay_regions.debug_borders")]
+    OverlayRegionsDebugBorders {
+        enabled: bool,
+    },
     LaunchNativePaneHosts {
         #[serde(default)]
         pane_ids: Vec<PaneId>,
@@ -377,6 +381,10 @@ fn handle_request_with_capture(
             .map(|_| Some(state.status_snapshot()))
             .map_err(|err| err.to_string()),
         ControlRequest::OverlayRegionsStatus => Ok(Some(state.status_snapshot())),
+        ControlRequest::OverlayRegionsDebugBorders { enabled } => {
+            state.set_overlay_region_debug_borders(enabled);
+            Ok(Some(state.status_snapshot()))
+        }
         ControlRequest::LaunchNativePaneHosts { pane_ids } => state
             .launch_native_pane_hosts(pane_ids)
             .map(|_| Some(state.status_snapshot()))
@@ -755,6 +763,38 @@ mod tests {
                 .overlay_regions
                 .regions
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn overlay_regions_debug_borders_control_updates_runtime_status_only() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+
+        let response = handle_request(
+            &mut state,
+            ControlRequest::OverlayRegionsDebugBorders { enabled: true },
+            None,
+        );
+
+        assert!(response.ok);
+        let status = response.status.expect("status should be returned");
+        assert!(status.runtime.overlay_region_debug_borders);
+        assert!(status.overlay_regions.regions.is_empty());
+        assert!(status.runtime.active_focus_target.is_none());
+
+        let response = handle_request(
+            &mut state,
+            ControlRequest::OverlayRegionsDebugBorders { enabled: false },
+            None,
+        );
+
+        assert!(response.ok);
+        assert!(
+            !response
+                .status
+                .expect("status should be returned")
+                .runtime
+                .overlay_region_debug_borders
         );
     }
 

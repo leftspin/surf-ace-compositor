@@ -436,11 +436,12 @@ pub enum RuntimePhase {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeFocusTarget {
     MainApp,
     OverlayNative,
+    NativePane { pane_id: PaneId },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -566,6 +567,8 @@ pub struct RuntimeStatus {
     pub overlay_bound_pane_id: Option<PaneId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_focus_target: Option<RuntimeFocusTarget>,
+    #[serde(default)]
+    pub overlay_region_debug_borders: bool,
     pub denied_toplevel_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
@@ -621,6 +624,7 @@ impl Default for RuntimeStatus {
             overlay_surface_id: None,
             overlay_bound_pane_id: None,
             active_focus_target: None,
+            overlay_region_debug_borders: false,
             denied_toplevel_count: 0,
             last_error: None,
         }
