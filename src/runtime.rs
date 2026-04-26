@@ -20,7 +20,7 @@ use smithay::backend::drm::{DrmDeviceFd, DrmNode, NodeType};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-    KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+    KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
 };
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::element::surface::{
@@ -4317,6 +4317,7 @@ struct RuntimeWaylandState {
     pending_toplevels: Vec<ToplevelSurface>,
     popups: Vec<ManagedPopup>,
     pointer_location: Point<f64, Logical>,
+    pointer_location_initialized: bool,
     start_time: std::time::Instant,
     host_surface_buffers: HashMap<ObjectId, SurfaceBufferSnapshot>,
     backend_output_size: Size<i32, Physical>,
@@ -4741,7 +4742,11 @@ impl RuntimeWaylandState {
             native_pane_toplevels: HashMap::new(),
             pending_toplevels: Vec::new(),
             popups: Vec::new(),
-            pointer_location: (0.0, 0.0).into(),
+            pointer_location: software_cursor_default_location(Size::<i32, Logical>::from((
+                backend_output_size.w,
+                backend_output_size.h,
+            ))),
+            pointer_location_initialized: false,
             start_time: std::time::Instant::now(),
             host_surface_buffers: HashMap::new(),
             backend_output_size,
@@ -4924,11 +4929,38 @@ impl RuntimeWaylandState {
                     }
                 }
             }
+            InputEvent::PointerMotion { event, .. } => {
+                let delta = event.delta();
+                let pos = self.update_pointer_location(
+                    (
+                        self.pointer_location.x + delta.x,
+                        self.pointer_location.y + delta.y,
+                    )
+                        .into(),
+                );
+                let serial = SERIAL_COUNTER.next_serial();
+
+                let under = self
+                    .surface_under_point_for_capture(pos, OverlayCaptureCapability::PointerHover);
+                if let Some(pointer) = self.seat.get_pointer() {
+                    pointer.motion(
+                        self,
+                        under,
+                        &MotionEvent {
+                            location: pos,
+                            serial,
+                            time: event.time_msec(),
+                        },
+                    );
+                    pointer.frame(self);
+                }
+            }
             InputEvent::PointerMotionAbsolute { event, .. } => {
                 let output_w = self.runtime_output_width();
                 let output_h = self.runtime_output_height();
-                let pos = event.position_transformed((output_w, output_h).into());
-                self.pointer_location = pos;
+                let pos = self.update_pointer_location(
+                    event.position_transformed((output_w, output_h).into()),
+                );
                 let serial = SERIAL_COUNTER.next_serial();
 
                 let under = self
@@ -5384,6 +5416,21 @@ impl RuntimeWaylandState {
 
     fn runtime_output_height(&self) -> i32 {
         self.runtime_output_size().h
+    }
+
+    fn update_pointer_location(&mut self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
+        let pos = clamp_pointer_location(pos, self.runtime_output_size());
+        self.pointer_location = pos;
+        self.pointer_location_initialized = true;
+        pos
+    }
+
+    fn cursor_render_location(&self) -> Point<f64, Logical> {
+        if self.pointer_location_initialized {
+            clamp_pointer_location(self.pointer_location, self.runtime_output_size())
+        } else {
+            software_cursor_default_location(self.runtime_output_size())
+        }
     }
 
     fn overlay_rect(&self) -> Rectangle<i32, Logical> {
@@ -5935,7 +5982,7 @@ impl RuntimeWaylandState {
         // can cull the overlay before it is drawn.
         capture.push_elements(
             RenderElementSource::Cursor,
-            software_cursor_elements(self.pointer_location, _output_width, _output_height),
+            software_cursor_elements(self.cursor_render_location(), _output_width, _output_height),
         );
         capture.push(RenderElementSource::OverlayPopup, overlay_popup_elements);
         capture.push(RenderElementSource::Overlay, overlay_elements);
@@ -6387,7 +6434,7 @@ impl RuntimeWaylandState {
             );
         }
         draw_software_cursor(
-            self.pointer_location,
+            self.cursor_render_location(),
             target,
             target_stride,
             output_w,
@@ -6885,6 +6932,23 @@ enum SoftwareCursorColor {
     Black,
 }
 
+fn software_cursor_default_location(output_size: Size<i32, Logical>) -> Point<f64, Logical> {
+    (
+        (output_size.w.max(1) as f64 / 2.0).floor(),
+        (output_size.h.max(1) as f64 / 2.0).floor(),
+    )
+        .into()
+}
+
+fn clamp_pointer_location(
+    location: Point<f64, Logical>,
+    output_size: Size<i32, Logical>,
+) -> Point<f64, Logical> {
+    let max_x = (output_size.w.max(1) - 1) as f64;
+    let max_y = (output_size.h.max(1) - 1) as f64;
+    (location.x.clamp(0.0, max_x), location.y.clamp(0.0, max_y)).into()
+}
+
 fn software_cursor_elements(
     location: Point<f64, Logical>,
     output_w: i32,
@@ -6921,31 +6985,38 @@ fn software_cursor_rects(
         return Vec::new();
     }
 
+    let location =
+        clamp_pointer_location(location, Size::<i32, Logical>::from((output_w, output_h)));
     let x = location.x.round() as i32;
     let y = location.y.round() as i32;
-    let shape = [
-        Rectangle::new((x, y).into(), (2, 22).into()),
-        Rectangle::new((x, y).into(), (12, 2).into()),
-        Rectangle::new((x + 2, y + 2).into(), (4, 4).into()),
-        Rectangle::new((x + 4, y + 6).into(), (4, 4).into()),
-        Rectangle::new((x + 6, y + 10).into(), (4, 4).into()),
-        Rectangle::new((x + 8, y + 14).into(), (4, 4).into()),
-        Rectangle::new((x + 5, y + 16).into(), (5, 2).into()),
+    let outline = [
+        Rectangle::new((x, y).into(), (5, 54).into()),
+        Rectangle::new((x, y).into(), (26, 5).into()),
+        Rectangle::new((x + 5, y + 5).into(), (8, 8).into()),
+        Rectangle::new((x + 10, y + 13).into(), (8, 8).into()),
+        Rectangle::new((x + 15, y + 21).into(), (8, 8).into()),
+        Rectangle::new((x + 20, y + 29).into(), (8, 8).into()),
+        Rectangle::new((x + 25, y + 37).into(), (8, 8).into()),
+        Rectangle::new((x + 11, y + 39).into(), (17, 5).into()),
     ];
-
+    let fill = [
+        Rectangle::new((x + 2, y + 2).into(), (3, 42).into()),
+        Rectangle::new((x + 2, y + 2).into(), (16, 3).into()),
+        Rectangle::new((x + 5, y + 5).into(), (6, 6).into()),
+        Rectangle::new((x + 10, y + 13).into(), (6, 6).into()),
+        Rectangle::new((x + 15, y + 21).into(), (6, 6).into()),
+        Rectangle::new((x + 20, y + 29).into(), (6, 6).into()),
+        Rectangle::new((x + 14, y + 38).into(), (11, 3).into()),
+    ];
     let mut rects = Vec::new();
-    for rect in shape {
-        let shadow = Rectangle::new(
-            (rect.loc.x + 1, rect.loc.y + 1).into(),
-            (rect.size.w, rect.size.h).into(),
-        );
-        if let Some(clipped) = shadow.intersection(bounds) {
+    for rect in outline {
+        if let Some(clipped) = rect.intersection(bounds) {
             if clipped.size.w > 0 && clipped.size.h > 0 {
                 rects.push((clipped, SoftwareCursorColor::Black));
             }
         }
     }
-    for rect in shape {
+    for rect in fill {
         if let Some(clipped) = rect.intersection(bounds) {
             if clipped.size.w > 0 && clipped.size.h > 0 {
                 rects.push((clipped, SoftwareCursorColor::White));
@@ -7066,7 +7137,7 @@ mod tests {
     use crate::state::CompositorState;
     use smithay::input::keyboard::{Keysym, ModifiersState, keysyms};
     use smithay::reexports::wayland_server::Display;
-    use smithay::utils::{Logical, Physical, Rectangle, Size, Transform};
+    use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
@@ -7231,11 +7302,11 @@ mod tests {
 
         assert!(rects.iter().any(|(rect, color)| {
             *color == super::SoftwareCursorColor::White
-                && *rect == Rectangle::new((10, 10).into(), (2, 22).into())
+                && *rect == Rectangle::new((12, 12).into(), (3, 42).into())
         }));
         assert!(rects.iter().any(|(rect, color)| {
             *color == super::SoftwareCursorColor::Black
-                && *rect == Rectangle::new((11, 11).into(), (2, 22).into())
+                && *rect == Rectangle::new((10, 10).into(), (5, 54).into())
         }));
         assert!(
             rects
@@ -7260,6 +7331,25 @@ mod tests {
                 && rect.loc.x + rect.size.w <= 12
                 && rect.loc.y + rect.size.h <= 12
         }));
+    }
+
+    #[test]
+    fn software_cursor_defaults_to_output_center_before_pointer_motion() {
+        assert_eq!(
+            super::software_cursor_default_location(Size::<i32, Logical>::from((3840, 2160))),
+            Point::<f64, Logical>::from((1920.0, 1080.0))
+        );
+    }
+
+    #[test]
+    fn pointer_location_clamps_to_output_bounds() {
+        assert_eq!(
+            super::clamp_pointer_location(
+                (-50.0, 2200.0).into(),
+                Size::<i32, Logical>::from((3840, 2160))
+            ),
+            Point::<f64, Logical>::from((0.0, 2159.0))
+        );
     }
 
     #[test]
