@@ -7073,6 +7073,8 @@ enum SoftwareCursorColor {
 const SOFTWARE_CURSOR_MASK_WIDTH: i32 = 48;
 const SOFTWARE_CURSOR_MASK_HEIGHT: i32 = 48;
 const SOFTWARE_CURSOR_MASK_STRIDE: usize = 6;
+const SOFTWARE_CURSOR_HOTSPOT_X: i32 = 6;
+const SOFTWARE_CURSOR_HOTSPOT_Y: i32 = 4;
 const SOFTWARE_CURSOR_MASK: [u8; 288] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // row 0
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // row 1
@@ -7153,25 +7155,32 @@ fn software_cursor_rects(
 
     let location =
         clamp_pointer_location(location, Size::<i32, Logical>::from((output_w, output_h)));
-    let x = location.x.round() as i32;
-    let y = location.y.round() as i32;
+    let origin = software_cursor_mask_origin(location);
 
     let mut rects = Vec::new();
     append_cursor_mask_spans(
         &mut rects,
         bounds,
-        (x, y).into(),
+        origin,
         SoftwareCursorColor::White,
         |mask_x, mask_y| software_cursor_mask_pixel(mask_x, mask_y),
     );
     append_cursor_mask_spans(
         &mut rects,
         bounds,
-        (x, y).into(),
+        origin,
         SoftwareCursorColor::Black,
         |mask_x, mask_y| software_cursor_outline_pixel(mask_x, mask_y),
     );
     rects
+}
+
+fn software_cursor_mask_origin(location: Point<f64, Logical>) -> Point<i32, Logical> {
+    (
+        location.x.round() as i32 - SOFTWARE_CURSOR_HOTSPOT_X,
+        location.y.round() as i32 - SOFTWARE_CURSOR_HOTSPOT_Y,
+    )
+        .into()
 }
 
 fn append_cursor_mask_spans(
@@ -7526,11 +7535,11 @@ mod tests {
         assert_eq!(rects[0].1, super::SoftwareCursorColor::White);
         assert!(rects.iter().any(|(rect, color)| {
             *color == super::SoftwareCursorColor::White
-                && *rect == Rectangle::new((16, 14).into(), (1, 1).into())
+                && *rect == Rectangle::new((10, 10).into(), (1, 1).into())
         }));
         assert!(rects.iter().any(|(rect, color)| {
             *color == super::SoftwareCursorColor::Black
-                && *rect == Rectangle::new((15, 13).into(), (3, 1).into())
+                && *rect == Rectangle::new((9, 9).into(), (3, 1).into())
         }));
         assert!(
             rects
@@ -7549,6 +7558,8 @@ mod tests {
         assert_eq!(super::SOFTWARE_CURSOR_MASK_WIDTH, 48);
         assert_eq!(super::SOFTWARE_CURSOR_MASK_HEIGHT, 48);
         assert_eq!(super::SOFTWARE_CURSOR_MASK_STRIDE, 6);
+        assert_eq!(super::SOFTWARE_CURSOR_HOTSPOT_X, 6);
+        assert_eq!(super::SOFTWARE_CURSOR_HOTSPOT_Y, 4);
         assert_eq!(
             super::SOFTWARE_CURSOR_MASK.len(),
             (super::SOFTWARE_CURSOR_MASK_HEIGHT as usize) * super::SOFTWARE_CURSOR_MASK_STRIDE
@@ -7566,6 +7577,22 @@ mod tests {
         assert!(super::software_cursor_mask_pixel(20, 42));
         assert!(!super::software_cursor_mask_pixel(21, 42));
         assert!(!super::software_cursor_mask_pixel(18, 43));
+    }
+
+    #[test]
+    fn software_cursor_hotspot_places_arrow_tip_at_pointer_location() {
+        let pointer = Point::<f64, Logical>::from((100.0, 80.0));
+        assert_eq!(
+            super::software_cursor_mask_origin(pointer),
+            Point::<i32, Logical>::from((94, 76))
+        );
+
+        let rects = super::software_cursor_rects(pointer, 200, 160);
+
+        assert!(rects.iter().any(|(rect, color)| {
+            *color == super::SoftwareCursorColor::White
+                && *rect == Rectangle::new((100, 80).into(), (1, 1).into())
+        }));
     }
 
     #[test]
