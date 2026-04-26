@@ -3740,16 +3740,8 @@ fn render_host_scene_with_gles_direct(
             &gles_state.target_texture,
             Size::<i32, Physical>::from((scanout_size.w, scanout_size.h)),
             rotation,
-        )?;
-        draw_software_cursor_to_gles_target(
-            &mut gles_state.renderer,
-            device_path,
-            &mut render_target,
             wayland_state.cursor_render_location(),
             scene_render_size,
-            Size::<i32, Physical>::from((scanout_size.w, scanout_size.h)),
-            rotation,
-            "direct quarter-turn scanout cursor",
         )?;
         capture_screen_from_render_target(
             screen_capture,
@@ -3958,16 +3950,8 @@ fn render_host_scene_with_gles_readback(
             &gles_state.target_texture,
             Size::<i32, Physical>::from((scanout_size.w, scanout_size.h)),
             rotation,
-        )?;
-        draw_software_cursor_to_gles_target(
-            &mut gles_state.renderer,
-            device_path,
-            &mut render_target,
             wayland_state.cursor_render_location(),
             render_size,
-            Size::<i32, Physical>::from((scanout_size.w, scanout_size.h)),
-            rotation,
-            "readback quarter-turn scanout cursor",
         )?;
         let readback_region = Rectangle::from_size(scanout_size);
         let mapping = gles_state
@@ -4255,6 +4239,8 @@ fn composite_scene_texture_to_physical_scanout(
     scene_texture: &GlesTexture,
     scanout_size: Size<i32, Physical>,
     rotation: OutputRotation,
+    cursor_location: Point<f64, Logical>,
+    logical_size: Size<i32, Physical>,
 ) -> Result<(), RuntimeError> {
     let scanout_damage = Rectangle::from_size(scanout_size);
     let scene_src = Rectangle::from_size(scene_texture.size()).to_f64();
@@ -4291,6 +4277,17 @@ fn composite_scene_texture_to_physical_scanout(
                 "failed to composite quarter-turn scene texture into scanout buffer: {err}"
             ),
         })?;
+    draw_software_cursor_frame(
+        &mut frame,
+        cursor_location,
+        logical_size,
+        scanout_size,
+        rotation,
+    )
+    .map_err(|err| RuntimeError::HostOutputClaim {
+        path: device_path.display().to_string(),
+        error: format!("failed to draw quarter-turn scanout cursor: {err}"),
+    })?;
     let _ = frame
         .finish()
         .map_err(|err| RuntimeError::HostOutputClaim {
