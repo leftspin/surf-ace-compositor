@@ -560,14 +560,17 @@ impl CompositorState {
 
     pub fn overlay_regions_status(&self) -> OverlayRegionsStatus {
         let Some(snapshot) = &self.overlay_regions else {
-            return OverlayRegionsStatus::default();
+            return OverlayRegionsStatus {
+                topology_epoch: Some(self.topology_epoch.clone()),
+                ..OverlayRegionsStatus::default()
+            };
         };
         OverlayRegionsStatus {
             surface_id: Some(snapshot.key.surface_id.clone()),
             window_id: snapshot.key.window_id.clone(),
             active_revision: Some(snapshot.revision),
             region_count: snapshot.regions.len(),
-            topology_epoch: Some(snapshot.topology_epoch.clone()),
+            topology_epoch: Some(self.topology_epoch.clone()),
             update_reason: snapshot.update_reason.clone(),
             last_updated_at: Some(snapshot.last_updated_at),
             regions: snapshot.regions.clone(),
@@ -2721,7 +2724,16 @@ mod tests {
             stale_epoch,
             StateError::StaleOverlayTopologyEpoch { .. }
         ));
-        assert_eq!(state.status_snapshot().overlay_regions, before);
+        let after = state.status_snapshot().overlay_regions;
+        assert_eq!(after.surface_id, before.surface_id);
+        assert_eq!(after.window_id, before.window_id);
+        assert_eq!(after.active_revision, before.active_revision);
+        assert_eq!(after.region_count, before.region_count);
+        assert_eq!(after.regions, before.regions);
+        assert_eq!(
+            after.topology_epoch.as_deref(),
+            Some(state.topology_epoch())
+        );
     }
 
     #[test]

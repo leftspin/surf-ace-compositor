@@ -759,6 +759,112 @@ mod tests {
     }
 
     #[test]
+    fn overlay_regions_status_exposes_current_topology_epoch_before_first_set() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state
+            .apply_provider_snapshot(vec![ProviderPaneSnapshot {
+                id: PaneId::new("pane-a"),
+                geometry: PaneGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 640,
+                    height: 480,
+                },
+            }])
+            .expect("provider pane should exist");
+
+        let response = handle_request(&mut state, ControlRequest::OverlayRegionsStatus, None);
+
+        assert!(response.ok);
+        let status = response.status.expect("status should be returned");
+        assert_eq!(status.overlay_regions.region_count, 0);
+        assert!(status.overlay_regions.active_revision.is_none());
+        assert_eq!(
+            status.overlay_regions.topology_epoch.as_deref(),
+            Some(state.topology_epoch())
+        );
+    }
+
+    #[test]
+    fn overlay_regions_first_set_accepts_epoch_reported_by_empty_status() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            640,
+            480,
+        );
+        state
+            .apply_provider_snapshot(vec![ProviderPaneSnapshot {
+                id: PaneId::new("pane-a"),
+                geometry: PaneGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 640,
+                    height: 480,
+                },
+            }])
+            .expect("provider pane should exist");
+        state
+            .switch_pane_to_external_native(
+                &PaneId::new("pane-a"),
+                NativeTargetClass::Terminal,
+                ProcessSpec {
+                    command: "foot".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                },
+            )
+            .expect("pane should be native-hosted");
+        state
+            .mark_external_surface_attached(&PaneId::new("pane-a"))
+            .expect("native pane should attach");
+
+        let empty_status = handle_request(&mut state, ControlRequest::OverlayRegionsStatus, None)
+            .status
+            .expect("status should be returned")
+            .overlay_regions;
+        let reported_epoch = empty_status
+            .topology_epoch
+            .expect("empty overlay status should report topology epoch");
+
+        let set_response = handle_request(
+            &mut state,
+            ControlRequest::OverlayRegionsSet {
+                surface_id: "main-surface".to_string(),
+                window_id: None,
+                revision: 1,
+                topology_epoch: reported_epoch,
+                update_reason: Some(OverlayRegionUpdateReason::Initial),
+                coordinate_space: OverlayCoordinateSpace::SurfaceLogical,
+                regions: vec![overlay_region(
+                    "pane-a-badge",
+                    "pane-a",
+                    "pane-a:0",
+                    OverlayRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 10.0,
+                        height: 10.0,
+                    },
+                )],
+            },
+            None,
+        );
+
+        assert!(set_response.ok);
+        assert_eq!(
+            set_response
+                .status
+                .expect("status should be returned")
+                .overlay_regions
+                .active_revision,
+            Some(1)
+        );
+    }
+
+    #[test]
     fn overlay_regions_control_rejects_invalid_regions_without_mutation() {
         let mut state = CompositorState::new(true, Box::new(NoopProcessController));
         state
