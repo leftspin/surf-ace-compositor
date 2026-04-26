@@ -497,6 +497,20 @@ pub fn run_winit(shared_state: Arc<Mutex<CompositorState>>) -> Result<(), Runtim
                         let _ = frame
                             .finish()
                             .map_err(|err| format!("failed to finish render pass: {err}"))?;
+                        let mut cursor_frame = renderer
+                            .render(&mut framebuffer, size, Transform::Normal)
+                            .map_err(|err| format!("failed to start cursor render pass: {err}"))?;
+                        draw_software_cursor_frame(
+                            &mut cursor_frame,
+                            data.wayland_state.cursor_render_location(),
+                            size,
+                            size,
+                            rotation,
+                        )
+                        .map_err(|err| format!("failed to draw software cursor: {err}"))?;
+                        let _ = cursor_frame
+                            .finish()
+                            .map_err(|err| format!("failed to finish cursor render pass: {err}"))?;
                     }
                     backend
                         .submit(Some(&[damage]))
@@ -3727,6 +3741,16 @@ fn render_host_scene_with_gles_direct(
             Size::<i32, Physical>::from((scanout_size.w, scanout_size.h)),
             rotation,
         )?;
+        draw_software_cursor_to_gles_target(
+            &mut gles_state.renderer,
+            device_path,
+            &mut render_target,
+            wayland_state.cursor_render_location(),
+            scene_render_size,
+            Size::<i32, Physical>::from((scanout_size.w, scanout_size.h)),
+            rotation,
+            "direct quarter-turn scanout cursor",
+        )?;
         capture_screen_from_render_target(
             screen_capture,
             &mut gles_state.renderer,
@@ -3786,6 +3810,16 @@ fn render_host_scene_with_gles_direct(
             path: device_path.display().to_string(),
             error: format!("failed to finish direct gles render pass: {err}"),
         })?;
+    draw_software_cursor_to_gles_target(
+        &mut gles_state.renderer,
+        device_path,
+        &mut render_target,
+        wayland_state.cursor_render_location(),
+        render_size,
+        render_size,
+        rotation,
+        "direct scanout cursor",
+    )?;
     capture_screen_from_render_target(
         screen_capture,
         &mut gles_state.renderer,
@@ -3925,6 +3959,16 @@ fn render_host_scene_with_gles_readback(
             Size::<i32, Physical>::from((scanout_size.w, scanout_size.h)),
             rotation,
         )?;
+        draw_software_cursor_to_gles_target(
+            &mut gles_state.renderer,
+            device_path,
+            &mut render_target,
+            wayland_state.cursor_render_location(),
+            render_size,
+            Size::<i32, Physical>::from((scanout_size.w, scanout_size.h)),
+            rotation,
+            "readback quarter-turn scanout cursor",
+        )?;
         let readback_region = Rectangle::from_size(scanout_size);
         let mapping = gles_state
             .renderer
@@ -4000,6 +4044,16 @@ fn render_host_scene_with_gles_readback(
             path: device_path.display().to_string(),
             error: format!("failed to finish gles render pass: {err}"),
         })?;
+    draw_software_cursor_to_gles_target(
+        &mut gles_state.renderer,
+        device_path,
+        &mut render_target,
+        wayland_state.cursor_render_location(),
+        render_size,
+        Size::<i32, Physical>::from((scanout_size.w, scanout_size.h)),
+        rotation,
+        "readback scanout cursor",
+    )?;
 
     let readback_region = Rectangle::from_size(scanout_size);
     let mapping = gles_state
@@ -4032,6 +4086,100 @@ fn render_host_scene_with_gles_readback(
 fn render_output_size_before_transform(wayland_state: &RuntimeWaylandState) -> Size<i32, Physical> {
     let size = wayland_state.runtime_output_size();
     Size::<i32, Physical>::from((size.w.max(1), size.h.max(1)))
+}
+
+fn draw_software_cursor_to_gles_target(
+    renderer: &mut GlesRenderer,
+    device_path: &Path,
+    render_target: &mut smithay::backend::renderer::gles::GlesTarget<'_>,
+    location: Point<f64, Logical>,
+    logical_size: Size<i32, Physical>,
+    scanout_size: Size<i32, Physical>,
+    rotation: OutputRotation,
+    target_name: &str,
+) -> Result<(), RuntimeError> {
+    let mut frame = renderer
+        .render(render_target, scanout_size, Transform::Normal)
+        .map_err(|err| RuntimeError::HostOutputClaim {
+            path: device_path.display().to_string(),
+            error: format!("failed to begin {target_name} render pass: {err}"),
+        })?;
+    draw_software_cursor_frame(&mut frame, location, logical_size, scanout_size, rotation)
+        .map_err(|err| RuntimeError::HostOutputClaim {
+            path: device_path.display().to_string(),
+            error: format!("failed to draw {target_name}: {err}"),
+        })?;
+    let _ = frame
+        .finish()
+        .map_err(|err| RuntimeError::HostOutputClaim {
+            path: device_path.display().to_string(),
+            error: format!("failed to finish {target_name} render pass: {err}"),
+        })?;
+    Ok(())
+}
+
+fn draw_software_cursor_frame<F: Frame>(
+    frame: &mut F,
+    location: Point<f64, Logical>,
+    logical_size: Size<i32, Physical>,
+    scanout_size: Size<i32, Physical>,
+    rotation: OutputRotation,
+) -> Result<(), F::Error> {
+    let logical_size = Size::<i32, Logical>::from((logical_size.w, logical_size.h));
+    let output_bounds = Rectangle::from_size(scanout_size);
+    let output_damage = [output_bounds];
+    for (rect, color) in software_cursor_rects(location, logical_size.w, logical_size.h)
+        .into_iter()
+        .rev()
+    {
+        let Some(rect) = cursor_rect_to_scanout(rect, logical_size, scanout_size, rotation)
+            .and_then(|rect| rect.intersection(output_bounds))
+        else {
+            continue;
+        };
+        let color = match color {
+            SoftwareCursorColor::White => Color32F::new(1.0, 1.0, 1.0, 1.0),
+            SoftwareCursorColor::Black => Color32F::new(0.0, 0.0, 0.0, 1.0),
+        };
+        frame.draw_solid(rect, &output_damage, color)?;
+    }
+    Ok(())
+}
+
+fn cursor_rect_to_scanout(
+    rect: Rectangle<i32, Logical>,
+    logical_size: Size<i32, Logical>,
+    scanout_size: Size<i32, Physical>,
+    rotation: OutputRotation,
+) -> Option<Rectangle<i32, Physical>> {
+    if rect.size.w <= 0 || rect.size.h <= 0 || scanout_size.w <= 0 || scanout_size.h <= 0 {
+        return None;
+    }
+    let logical_w = logical_size.w.max(1);
+    let logical_h = logical_size.h.max(1);
+    let mapped = match rotation {
+        OutputRotation::Deg0 => Rectangle::new(
+            (rect.loc.x, rect.loc.y).into(),
+            (rect.size.w, rect.size.h).into(),
+        ),
+        OutputRotation::Deg180 => Rectangle::new(
+            (
+                logical_w - (rect.loc.x + rect.size.w),
+                logical_h - (rect.loc.y + rect.size.h),
+            )
+                .into(),
+            (rect.size.w, rect.size.h).into(),
+        ),
+        OutputRotation::Deg90 => Rectangle::new(
+            (logical_h - (rect.loc.y + rect.size.h), rect.loc.x).into(),
+            (rect.size.h, rect.size.w).into(),
+        ),
+        OutputRotation::Deg270 => Rectangle::new(
+            (rect.loc.y, logical_w - (rect.loc.x + rect.size.w)).into(),
+            (rect.size.h, rect.size.w).into(),
+        ),
+    };
+    mapped.intersection(Rectangle::from_size(scanout_size))
 }
 
 fn ensure_gles_render_target_size(
@@ -4327,7 +4475,6 @@ struct RuntimeWaylandState {
 
 #[derive(Debug, Clone, Copy)]
 enum RenderElementSource {
-    Cursor,
     Main,
     MainPopup,
     NativePane,
@@ -4375,7 +4522,6 @@ impl RenderElementCapture {
         }
         self.elements.extend(new_elements);
         match source {
-            RenderElementSource::Cursor => self.counts.cursor += added,
             RenderElementSource::Main => self.counts.main += added,
             RenderElementSource::MainPopup => self.counts.main_popups += added,
             RenderElementSource::NativePane => self.counts.native_panes += added,
@@ -4387,19 +4533,14 @@ impl RenderElementCapture {
     }
 
     fn primary_plane_elements(&self) -> Vec<&SurfAceRenderElement> {
-        let cursor_end = self.counts.cursor.min(self.elements.len());
-        let primary_start = (self.counts.cursor + self.counts.overlay_popups + self.counts.overlay)
-            .min(self.elements.len());
-        let mut elements = Vec::with_capacity(cursor_end + self.elements.len() - primary_start);
-        elements.extend(self.elements[..cursor_end].iter());
-        elements.extend(self.elements[primary_start..].iter());
-        elements
+        let primary_start =
+            (self.counts.overlay_popups + self.counts.overlay).min(self.elements.len());
+        self.elements[primary_start..].iter().collect()
     }
 }
 
 #[derive(Default, Debug, Clone, Copy)]
 struct RenderElementCounts {
-    cursor: usize,
     main: usize,
     main_popups: usize,
     native_panes: usize,
@@ -5979,11 +6120,8 @@ impl RuntimeWaylandState {
                 .then_some(status.overlay_regions.regions)
         };
         // Smithay expects top-to-bottom order; otherwise an opaque main surface
-        // can cull the overlay before it is drawn.
-        capture.push_elements(
-            RenderElementSource::Cursor,
-            software_cursor_elements(self.cursor_render_location(), _output_width, _output_height),
-        );
+        // can cull the overlay before it is drawn. The compositor cursor is
+        // drawn in the final output pass so it is not clipped by scene surfaces.
         capture.push(RenderElementSource::OverlayPopup, overlay_popup_elements);
         capture.push(RenderElementSource::Overlay, overlay_elements);
         if let Some(regions) = debug_border_regions {
@@ -6949,32 +7087,6 @@ fn clamp_pointer_location(
     (location.x.clamp(0.0, max_x), location.y.clamp(0.0, max_y)).into()
 }
 
-fn software_cursor_elements(
-    location: Point<f64, Logical>,
-    output_w: i32,
-    output_h: i32,
-) -> Vec<SurfAceRenderElement> {
-    software_cursor_rects(location, output_w, output_h)
-        .into_iter()
-        .map(|(rect, color)| {
-            SolidColorRenderElement::new(
-                Id::new(),
-                Rectangle::<i32, Physical>::new(
-                    (rect.loc.x, rect.loc.y).into(),
-                    (rect.size.w, rect.size.h).into(),
-                ),
-                CommitCounter::default(),
-                match color {
-                    SoftwareCursorColor::White => Color32F::new(1.0, 1.0, 1.0, 1.0),
-                    SoftwareCursorColor::Black => Color32F::new(0.0, 0.0, 0.0, 1.0),
-                },
-                Kind::Unspecified,
-            )
-            .into()
-        })
-        .collect()
-}
-
 fn software_cursor_rects(
     location: Point<f64, Logical>,
     output_w: i32,
@@ -6989,34 +7101,54 @@ fn software_cursor_rects(
         clamp_pointer_location(location, Size::<i32, Logical>::from((output_w, output_h)));
     let x = location.x.round() as i32;
     let y = location.y.round() as i32;
-    let outline = [
-        Rectangle::new((x, y).into(), (5, 54).into()),
-        Rectangle::new((x, y).into(), (26, 5).into()),
-        Rectangle::new((x + 5, y + 5).into(), (8, 8).into()),
-        Rectangle::new((x + 10, y + 13).into(), (8, 8).into()),
-        Rectangle::new((x + 15, y + 21).into(), (8, 8).into()),
-        Rectangle::new((x + 20, y + 29).into(), (8, 8).into()),
-        Rectangle::new((x + 25, y + 37).into(), (8, 8).into()),
-        Rectangle::new((x + 11, y + 39).into(), (17, 5).into()),
-    ];
-    let fill = [
-        Rectangle::new((x + 2, y + 2).into(), (3, 42).into()),
-        Rectangle::new((x + 2, y + 2).into(), (16, 3).into()),
-        Rectangle::new((x + 5, y + 5).into(), (6, 6).into()),
-        Rectangle::new((x + 10, y + 13).into(), (6, 6).into()),
-        Rectangle::new((x + 15, y + 21).into(), (6, 6).into()),
-        Rectangle::new((x + 20, y + 29).into(), (6, 6).into()),
-        Rectangle::new((x + 14, y + 38).into(), (11, 3).into()),
-    ];
     let mut rects = Vec::new();
-    for rect in fill {
+
+    let mut push_scaled_span = |row: i32, start: i32, width: i32, color: SoftwareCursorColor| {
+        if width <= 0 {
+            return;
+        }
+        let scale = 2;
+        let rect = Rectangle::new(
+            (x + start * scale, y + row * scale).into(),
+            (width * scale, scale).into(),
+        );
         if let Some(clipped) = rect.intersection(bounds) {
             if clipped.size.w > 0 && clipped.size.h > 0 {
-                rects.push((clipped, SoftwareCursorColor::White));
+                rects.push((clipped, color));
             }
         }
+    };
+
+    for row in 2..=17 {
+        push_scaled_span(row, 2, (row - 2).max(1), SoftwareCursorColor::White);
     }
-    for rect in outline {
+    for row in 18..=20 {
+        push_scaled_span(row, 2, 6, SoftwareCursorColor::White);
+    }
+    for row in 21..=28 {
+        push_scaled_span(row, 7, 4, SoftwareCursorColor::White);
+    }
+
+    for row in 0..=19 {
+        push_scaled_span(row, 0, row + 3, SoftwareCursorColor::Black);
+    }
+    for row in 20..=22 {
+        push_scaled_span(row, 0, 10, SoftwareCursorColor::Black);
+    }
+    for row in 23..=30 {
+        push_scaled_span(row, 5, 8, SoftwareCursorColor::Black);
+    }
+    for row in 31..=34 {
+        push_scaled_span(row, 7, 6, SoftwareCursorColor::Black);
+    }
+
+    let tip_and_tail = [
+        Rectangle::new((x, y).into(), (4, 4).into()),
+        Rectangle::new((x + 2, y + 2).into(), (4, 4).into()),
+        Rectangle::new((x + 22, y + 38).into(), (14, 4).into()),
+        Rectangle::new((x + 24, y + 42).into(), (10, 4).into()),
+    ];
+    for rect in tip_and_tail {
         if let Some(clipped) = rect.intersection(bounds) {
             if clipped.size.w > 0 && clipped.size.h > 0 {
                 rects.push((clipped, SoftwareCursorColor::Black));
@@ -7306,11 +7438,11 @@ mod tests {
         assert_eq!(rects[0].1, super::SoftwareCursorColor::White);
         assert!(rects.iter().any(|(rect, color)| {
             *color == super::SoftwareCursorColor::White
-                && *rect == Rectangle::new((12, 12).into(), (3, 42).into())
+                && *rect == Rectangle::new((14, 14).into(), (2, 2).into())
         }));
         assert!(rects.iter().any(|(rect, color)| {
             *color == super::SoftwareCursorColor::Black
-                && *rect == Rectangle::new((10, 10).into(), (5, 54).into())
+                && *rect == Rectangle::new((10, 10).into(), (6, 2).into())
         }));
         assert!(
             rects
@@ -7357,13 +7489,42 @@ mod tests {
     }
 
     #[test]
-    fn primary_plane_elements_keep_cursor_when_overlay_plane_is_split() {
-        let mut capture = super::RenderElementCapture::default();
-        capture.push_elements(
-            super::RenderElementSource::Cursor,
-            super::software_cursor_elements((10.0, 10.0).into(), 160, 100),
+    fn cursor_rects_map_to_output_scanout_after_rotation() {
+        let rect = Rectangle::<i32, Logical>::new((10, 20).into(), (30, 40).into());
+        let logical_size = Size::<i32, Logical>::from((3840, 2160));
+        let scanout_size = Size::<i32, Physical>::from((2160, 3840));
+
+        assert_eq!(
+            super::cursor_rect_to_scanout(
+                rect,
+                logical_size,
+                Size::<i32, Physical>::from((3840, 2160)),
+                OutputRotation::Deg0
+            ),
+            Some(Rectangle::<i32, Physical>::new(
+                (10, 20).into(),
+                (30, 40).into()
+            ))
         );
-        let cursor_count = capture.counts.cursor;
+        assert_eq!(
+            super::cursor_rect_to_scanout(rect, logical_size, scanout_size, OutputRotation::Deg90),
+            Some(Rectangle::<i32, Physical>::new(
+                (2100, 10).into(),
+                (40, 30).into()
+            ))
+        );
+        assert_eq!(
+            super::cursor_rect_to_scanout(rect, logical_size, scanout_size, OutputRotation::Deg270),
+            Some(Rectangle::<i32, Physical>::new(
+                (20, 3800).into(),
+                (40, 30).into()
+            ))
+        );
+    }
+
+    #[test]
+    fn primary_plane_elements_keep_debug_borders_when_overlay_plane_is_split() {
+        let mut capture = super::RenderElementCapture::default();
         capture.push_elements(
             super::RenderElementSource::Overlay,
             super::overlay_region_debug_border_elements(
@@ -7390,8 +7551,7 @@ mod tests {
 
         let primary = capture.primary_plane_elements();
 
-        assert_eq!(primary.len(), cursor_count + debug_count);
-        assert!(cursor_count > 0);
+        assert_eq!(primary.len(), debug_count);
         assert!(debug_count > 0);
     }
 
