@@ -7009,17 +7009,17 @@ fn software_cursor_rects(
         Rectangle::new((x + 14, y + 38).into(), (11, 3).into()),
     ];
     let mut rects = Vec::new();
-    for rect in outline {
-        if let Some(clipped) = rect.intersection(bounds) {
-            if clipped.size.w > 0 && clipped.size.h > 0 {
-                rects.push((clipped, SoftwareCursorColor::Black));
-            }
-        }
-    }
     for rect in fill {
         if let Some(clipped) = rect.intersection(bounds) {
             if clipped.size.w > 0 && clipped.size.h > 0 {
                 rects.push((clipped, SoftwareCursorColor::White));
+            }
+        }
+    }
+    for rect in outline {
+        if let Some(clipped) = rect.intersection(bounds) {
+            if clipped.size.w > 0 && clipped.size.h > 0 {
+                rects.push((clipped, SoftwareCursorColor::Black));
             }
         }
     }
@@ -7033,7 +7033,10 @@ fn draw_software_cursor(
     output_w: i32,
     output_h: i32,
 ) {
-    for (rect, color) in software_cursor_rects(location, output_w, output_h) {
+    for (rect, color) in software_cursor_rects(location, output_w, output_h)
+        .into_iter()
+        .rev()
+    {
         let (b, g, r) = match color {
             SoftwareCursorColor::White => (0xFF, 0xFF, 0xFF),
             SoftwareCursorColor::Black => (0x00, 0x00, 0x00),
@@ -7300,6 +7303,7 @@ mod tests {
     fn software_cursor_uses_non_magenta_visible_rectangles_at_pointer_location() {
         let rects = super::software_cursor_rects((10.0, 10.0).into(), 160, 100);
 
+        assert_eq!(rects[0].1, super::SoftwareCursorColor::White);
         assert!(rects.iter().any(|(rect, color)| {
             *color == super::SoftwareCursorColor::White
                 && *rect == Rectangle::new((12, 12).into(), (3, 42).into())
