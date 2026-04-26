@@ -1,7 +1,8 @@
 use crate::model::{
     HostRuntimeStartTrigger, MainAppLaunchIntent, NativePaneHostRequest, NativeTargetClass,
-    OutputRotation, PaneId, ProcessSpec, ProviderPaneSnapshot, RuntimeBackend, RuntimeFocusTarget,
-    RuntimePhase, StatusSnapshot, SurfaceBindingEvidence,
+    OutputRotation, OverlayCoordinateSpace, OverlayRegionRequest, OverlayRegionUpdateReason,
+    PaneId, ProcessSpec, ProviderPaneSnapshot, RuntimeBackend, RuntimeFocusTarget, RuntimePhase,
+    StatusSnapshot, SurfaceBindingEvidence,
 };
 use crate::screen_capture::ScreenCaptureStore;
 use crate::state::CompositorState;
@@ -13,7 +14,7 @@ use std::path::Path;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlRequest {
     GetStatus,
@@ -40,6 +41,34 @@ pub enum ControlRequest {
         #[serde(default)]
         pane_ids: Vec<PaneId>,
     },
+    #[serde(rename = "overlay_regions.set")]
+    OverlayRegionsSet {
+        #[serde(rename = "surfaceId")]
+        surface_id: String,
+        #[serde(rename = "windowId", default, skip_serializing_if = "Option::is_none")]
+        window_id: Option<String>,
+        revision: u64,
+        #[serde(rename = "topologyEpoch")]
+        topology_epoch: String,
+        #[serde(
+            rename = "updateReason",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        update_reason: Option<OverlayRegionUpdateReason>,
+        #[serde(rename = "coordinateSpace")]
+        coordinate_space: OverlayCoordinateSpace,
+        regions: Vec<OverlayRegionRequest>,
+    },
+    #[serde(rename = "overlay_regions.clear")]
+    OverlayRegionsClear {
+        #[serde(rename = "surfaceId")]
+        surface_id: String,
+        #[serde(rename = "windowId", default, skip_serializing_if = "Option::is_none")]
+        window_id: Option<String>,
+    },
+    #[serde(rename = "overlay_regions.status")]
+    OverlayRegionsStatus,
     LaunchNativePaneHosts {
         #[serde(default)]
         pane_ids: Vec<PaneId>,
@@ -82,7 +111,7 @@ pub enum RuntimeControlCommand {
     StartHostRuntime,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ControlResponse {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -320,6 +349,34 @@ fn handle_request_with_capture(
             .release_native_pane_hosts(pane_ids)
             .map(|_| Some(state.status_snapshot()))
             .map_err(|err| err.to_string()),
+        ControlRequest::OverlayRegionsSet {
+            surface_id,
+            window_id,
+            revision,
+            topology_epoch,
+            update_reason,
+            coordinate_space,
+            regions,
+        } => state
+            .set_overlay_regions(
+                surface_id,
+                window_id,
+                revision,
+                topology_epoch,
+                update_reason,
+                coordinate_space,
+                regions,
+            )
+            .map(|_| Some(state.status_snapshot()))
+            .map_err(|err| err.to_string()),
+        ControlRequest::OverlayRegionsClear {
+            surface_id,
+            window_id,
+        } => state
+            .clear_overlay_regions(surface_id, window_id)
+            .map(|_| Some(state.status_snapshot()))
+            .map_err(|err| err.to_string()),
+        ControlRequest::OverlayRegionsStatus => Ok(Some(state.status_snapshot())),
         ControlRequest::LaunchNativePaneHosts { pane_ids } => state
             .launch_native_pane_hosts(pane_ids)
             .map(|_| Some(state.status_snapshot()))
@@ -430,10 +487,10 @@ fn handle_request_with_capture(
 mod tests {
     use super::*;
     use crate::model::{
-        ExternalNativeLifecycleState, HostRuntimeStartTrigger, NativePaneHostRequest, PaneGeometry,
-        PaneRenderMode, ProcessSpec, RuntimeBackend, RuntimeDmabufFormatStatus,
-        RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource, SurfaceBindingEvidence,
-        SurfaceBindingEvidenceOutcome,
+        CompositorOverlayKind, ExternalNativeLifecycleState, HostRuntimeStartTrigger,
+        NativePaneHostRequest, OverlayCaptureCapability, OverlayRect, PaneGeometry, PaneRenderMode,
+        ProcessSpec, RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeHostPresentOwnership,
+        RuntimeHostQueuedPresentSource, SurfaceBindingEvidence, SurfaceBindingEvidenceOutcome,
     };
     use crate::process_manager::{ProcessController, ProcessExit};
     use crate::screen_capture::ScreenCaptureStore;
@@ -474,6 +531,27 @@ mod tests {
             "surf-ace-control-{label}-{}-{suffix}.sock",
             std::process::id()
         ))
+    }
+
+    fn overlay_region(
+        region_id: &str,
+        pane_id: &str,
+        pane_instance_id: &str,
+        rect: OverlayRect,
+    ) -> OverlayRegionRequest {
+        OverlayRegionRequest {
+            region_id: region_id.to_string(),
+            pane_id: PaneId::new(pane_id),
+            pane_instance_id: pane_instance_id.to_string(),
+            kind: CompositorOverlayKind::PaneBadge,
+            rect,
+            z_index: None,
+            captures: vec![
+                OverlayCaptureCapability::PointerHover,
+                OverlayCaptureCapability::PointerButton,
+                OverlayCaptureCapability::PointerAxis,
+            ],
+        }
     }
 
     #[test]
@@ -568,6 +646,218 @@ mod tests {
             PaneRenderMode::ExternalNative { .. }
         ));
         assert!(status.prototype_policy.active_overlay_pane.is_none());
+    }
+
+    #[test]
+    fn overlay_regions_control_set_status_and_clear_are_data_only() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            640,
+            480,
+        );
+        state
+            .apply_provider_snapshot(vec![ProviderPaneSnapshot {
+                id: PaneId::new("pane-a"),
+                geometry: PaneGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 640,
+                    height: 480,
+                },
+            }])
+            .expect("provider pane should exist");
+        state
+            .switch_pane_to_external_native(
+                &PaneId::new("pane-a"),
+                NativeTargetClass::Terminal,
+                ProcessSpec {
+                    command: "foot".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                },
+            )
+            .expect("pane should be native-hosted");
+        state
+            .mark_external_surface_attached(&PaneId::new("pane-a"))
+            .expect("native pane should attach");
+        let topology_epoch = state.topology_epoch().to_string();
+        let set_response = handle_request(
+            &mut state,
+            ControlRequest::OverlayRegionsSet {
+                surface_id: "main-surface".to_string(),
+                window_id: None,
+                revision: 1,
+                topology_epoch,
+                update_reason: Some(OverlayRegionUpdateReason::Initial),
+                coordinate_space: OverlayCoordinateSpace::SurfaceLogical,
+                regions: vec![overlay_region(
+                    "pane-a-badge",
+                    "pane-a",
+                    "pane-a:0",
+                    OverlayRect {
+                        x: 600.0,
+                        y: 10.0,
+                        width: 100.0,
+                        height: 50.0,
+                    },
+                )],
+            },
+            None,
+        );
+        assert!(set_response.ok);
+        let status = set_response.status.expect("status should be returned");
+        assert_eq!(
+            status.prototype_policy.active_overlay_pane,
+            Some(PaneId::new("pane-a"))
+        );
+        assert!(status.runtime.active_focus_target.is_none());
+        assert_eq!(status.overlay_regions.regions.len(), 1);
+        assert_eq!(
+            status.overlay_regions.regions[0].rect,
+            OverlayRect {
+                x: 600.0,
+                y: 10.0,
+                width: 40.0,
+                height: 50.0,
+            }
+        );
+
+        let status_response =
+            handle_request(&mut state, ControlRequest::OverlayRegionsStatus, None);
+        assert!(status_response.ok);
+        assert_eq!(
+            status_response
+                .status
+                .as_ref()
+                .expect("status should be returned")
+                .overlay_regions
+                .regions
+                .len(),
+            1
+        );
+
+        let clear_response = handle_request(
+            &mut state,
+            ControlRequest::OverlayRegionsClear {
+                surface_id: "main-surface".to_string(),
+                window_id: None,
+            },
+            None,
+        );
+        assert!(clear_response.ok);
+        assert!(
+            clear_response
+                .status
+                .expect("status should be returned")
+                .overlay_regions
+                .regions
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn overlay_regions_control_rejects_invalid_regions_without_mutation() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state
+            .apply_provider_snapshot(vec![ProviderPaneSnapshot {
+                id: PaneId::new("pane-a"),
+                geometry: PaneGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 640,
+                    height: 480,
+                },
+            }])
+            .expect("provider pane should exist");
+        state
+            .switch_pane_to_external_native(
+                &PaneId::new("pane-a"),
+                NativeTargetClass::Terminal,
+                ProcessSpec {
+                    command: "foot".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                },
+            )
+            .expect("pane should be native-hosted");
+        state
+            .mark_external_surface_attached(&PaneId::new("pane-a"))
+            .expect("native pane should attach");
+        let before = state.status_snapshot().overlay_regions;
+        let topology_epoch = state.topology_epoch().to_string();
+
+        let response = handle_request(
+            &mut state,
+            ControlRequest::OverlayRegionsSet {
+                surface_id: "main-surface".to_string(),
+                window_id: None,
+                revision: 1,
+                topology_epoch,
+                update_reason: None,
+                coordinate_space: OverlayCoordinateSpace::SurfaceLogical,
+                regions: vec![overlay_region(
+                    "pane-a-badge",
+                    "pane-a",
+                    "pane-a:0",
+                    OverlayRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 1.0,
+                        height: 0.0,
+                    },
+                )],
+            },
+            None,
+        );
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_deref(),
+            Some("invalid overlay region: rect width and height must be greater than zero")
+        );
+        assert_eq!(state.status_snapshot().overlay_regions, before);
+    }
+
+    #[test]
+    fn overlay_regions_control_rejects_unknown_pane_without_mutation() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let before = state.status_snapshot().overlay_regions;
+        let topology_epoch = state.topology_epoch().to_string();
+
+        let response = handle_request(
+            &mut state,
+            ControlRequest::OverlayRegionsSet {
+                surface_id: "main-surface".to_string(),
+                window_id: None,
+                revision: 1,
+                topology_epoch,
+                update_reason: None,
+                coordinate_space: OverlayCoordinateSpace::SurfaceLogical,
+                regions: vec![overlay_region(
+                    "missing-badge",
+                    "missing",
+                    "missing:0",
+                    OverlayRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 1.0,
+                        height: 1.0,
+                    },
+                )],
+            },
+            None,
+        );
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_deref(),
+            Some("pane not found: PaneId(\"missing\")")
+        );
+        assert_eq!(state.status_snapshot().overlay_regions, before);
     }
 
     #[test]

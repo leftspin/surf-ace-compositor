@@ -250,6 +250,116 @@ pub struct ProviderPaneSnapshot {
     pub geometry: PaneGeometry,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OverlayRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompositorOverlayKind {
+    PaneBadge,
+    HistoryBack,
+    HistoryForward,
+    PaneHandle,
+    AnnotationControl,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayCaptureCapability {
+    PointerHover,
+    PointerButton,
+    PointerAxis,
+    Touch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayRegionUpdateReason {
+    Initial,
+    Layout,
+    Resize,
+    Visibility,
+    Drag,
+    Animation,
+    NativeAttach,
+    NativeDetach,
+    Clear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayCoordinateSpace {
+    SurfaceLogical,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayRegionRequest {
+    pub region_id: String,
+    pub pane_id: PaneId,
+    pub pane_instance_id: String,
+    pub kind: CompositorOverlayKind,
+    pub rect: OverlayRect,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub z_index: Option<i32>,
+    pub captures: Vec<OverlayCaptureCapability>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayRegionStatus {
+    pub region_id: String,
+    pub pane_id: PaneId,
+    pub pane_instance_id: String,
+    pub kind: CompositorOverlayKind,
+    pub rect: OverlayRect,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub z_index: Option<i32>,
+    pub captures: Vec<OverlayCaptureCapability>,
+    pub clamped: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayRegionsStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_revision: Option<u64>,
+    pub region_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topology_epoch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_reason: Option<OverlayRegionUpdateReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_updated_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub regions: Vec<OverlayRegionStatus>,
+}
+
+impl Default for OverlayRegionsStatus {
+    fn default() -> Self {
+        Self {
+            surface_id: None,
+            window_id: None,
+            active_revision: None,
+            region_count: 0,
+            topology_epoch: None,
+            update_reason: None,
+            last_updated_at: None,
+            regions: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativePaneHostRequest {
     pub id: PaneId,
@@ -517,11 +627,13 @@ impl Default for RuntimeStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusSnapshot {
     pub host_mode_active: bool,
     pub output_rotation: OutputRotation,
     pub panes: Vec<PaneStatus>,
+    #[serde(default)]
+    pub overlay_regions: OverlayRegionsStatus,
     pub prototype_policy: PrototypePolicyStatus,
     pub runtime: RuntimeStatus,
 }

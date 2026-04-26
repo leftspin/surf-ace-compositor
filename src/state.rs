@@ -1,11 +1,12 @@
 use crate::model::{
     ExternalNativeEventContract, ExternalNativeLifecycleState, HostRuntimeStartTrigger,
     MainAppLaunchIntent, MainAppLaunchState, MainAppSurfaceBinding, NativePaneHostRequest,
-    NativePaneHostStatus, NativeTargetClass, OutputRotation, PaneId, PaneRenderMode, PaneStatus,
-    ProcessSpec, ProviderPaneSnapshot, RuntimeBackend, RuntimeDmabufFormatStatus,
-    RuntimeFocusTarget, RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource,
-    RuntimeHostSelectionState, RuntimePhase, RuntimeSelectionMode, RuntimeStatus, StatusSnapshot,
-    SurfaceBindingEvidence,
+    NativePaneHostStatus, NativeTargetClass, OutputRotation, OverlayCoordinateSpace, OverlayRect,
+    OverlayRegionRequest, OverlayRegionStatus, OverlayRegionUpdateReason, OverlayRegionsStatus,
+    PaneId, PaneRenderMode, PaneStatus, ProcessSpec, ProviderPaneSnapshot, RuntimeBackend,
+    RuntimeDmabufFormatStatus, RuntimeFocusTarget, RuntimeHostPresentOwnership,
+    RuntimeHostQueuedPresentSource, RuntimeHostSelectionState, RuntimePhase, RuntimeSelectionMode,
+    RuntimeStatus, StatusSnapshot, SurfaceBindingEvidence,
 };
 use crate::policy::{PrototypeOverlayPolicy, PrototypePolicyError};
 use crate::process_manager::ProcessController;
@@ -15,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const SHELL_OVERLAY_PANE_ID: &str = "shell-overlay";
+const OVERLAY_REGIONS_MAX_COUNT: usize = 1024;
 pub const LAUNCH_TOKEN_ENV: &str = "SURF_ACE_COMPOSITOR_LAUNCH_TOKEN";
 pub const NATIVE_PANE_CONTENT_ID_ENV: &str = "SURF_ACE_NATIVE_PANE_CONTENT_ID";
 pub const NATIVE_PANE_BINDING_ID_ENV: &str = "SURF_ACE_NATIVE_PANE_BINDING_ID";
@@ -47,6 +49,22 @@ pub struct NativePaneBindingExpectation {
     pub launch_token: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OverlaySurfaceKey {
+    surface_id: String,
+    window_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct OverlayRegionSnapshot {
+    key: OverlaySurfaceKey,
+    revision: u64,
+    topology_epoch: String,
+    update_reason: Option<OverlayRegionUpdateReason>,
+    last_updated_at: u64,
+    regions: Vec<OverlayRegionStatus>,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum StateError {
     #[error("pane not found: {0:?}")]
@@ -65,6 +83,14 @@ pub enum StateError {
     Process(String),
     #[error("{0}")]
     ShellOverlayUnavailable(String),
+    #[error("invalid overlay region: {0}")]
+    InvalidOverlayRegion(String),
+    #[error("stale overlay region revision: {incoming} <= {active}")]
+    StaleOverlayRegionRevision { incoming: u64, active: u64 },
+    #[error("stale overlay topology epoch: {incoming} != {active}")]
+    StaleOverlayTopologyEpoch { incoming: String, active: String },
+    #[error("too many overlay regions: {count} > {max}")]
+    TooManyOverlayRegions { count: usize, max: usize },
 }
 
 pub struct CompositorState {
@@ -74,6 +100,9 @@ pub struct CompositorState {
     shell_overlay_process: Option<ProcessSpec>,
     shell_overlay_lifecycle: ExternalNativeLifecycleState,
     shell_overlay_focus_on_attach: bool,
+    overlay_regions: Option<OverlayRegionSnapshot>,
+    topology_epoch_counter: u64,
+    topology_epoch: String,
     prototype_overlay_policy: PrototypeOverlayPolicy,
     runtime: RuntimeStatus,
     process_controller: Box<dyn ProcessController>,
@@ -140,6 +169,9 @@ impl CompositorState {
             shell_overlay_process: None,
             shell_overlay_lifecycle: ExternalNativeLifecycleState::Absent,
             shell_overlay_focus_on_attach: false,
+            overlay_regions: None,
+            topology_epoch_counter: 0,
+            topology_epoch: "topology-0".to_string(),
             prototype_overlay_policy: PrototypeOverlayPolicy::default(),
             runtime: RuntimeStatus::default(),
             process_controller,
@@ -157,6 +189,10 @@ impl CompositorState {
 
     pub fn output_rotation(&self) -> OutputRotation {
         self.output_rotation
+    }
+
+    pub fn topology_epoch(&self) -> &str {
+        &self.topology_epoch
     }
 
     pub fn runtime_main_app_launch_intent(&self) -> Option<&MainAppLaunchIntent> {
@@ -422,6 +458,122 @@ impl CompositorState {
         self.runtime.overlay_bound_pane_id = overlay_bound_pane_id;
     }
 
+    pub fn set_overlay_regions(
+        &mut self,
+        surface_id: String,
+        window_id: Option<String>,
+        revision: u64,
+        topology_epoch: String,
+        update_reason: Option<OverlayRegionUpdateReason>,
+        coordinate_space: OverlayCoordinateSpace,
+        regions: Vec<OverlayRegionRequest>,
+    ) -> Result<(), StateError> {
+        let key = validate_overlay_surface_key(surface_id, window_id)?;
+        if !matches!(coordinate_space, OverlayCoordinateSpace::SurfaceLogical) {
+            return Err(StateError::InvalidOverlayRegion(
+                "coordinateSpace must be surface_logical".to_string(),
+            ));
+        }
+        if regions.len() > OVERLAY_REGIONS_MAX_COUNT {
+            return Err(StateError::TooManyOverlayRegions {
+                count: regions.len(),
+                max: OVERLAY_REGIONS_MAX_COUNT,
+            });
+        }
+        if topology_epoch != self.topology_epoch {
+            return Err(StateError::StaleOverlayTopologyEpoch {
+                incoming: topology_epoch,
+                active: self.topology_epoch.clone(),
+            });
+        }
+        if let Some(active) = &self.overlay_regions {
+            if active.key == key && revision <= active.revision {
+                return Err(StateError::StaleOverlayRegionRevision {
+                    incoming: revision,
+                    active: active.revision,
+                });
+            }
+        }
+
+        let mut next_regions = Vec::with_capacity(regions.len());
+        for region in regions {
+            validate_overlay_region(&region)?;
+            let Some(pane) = self.panes.get(&region.pane_id) else {
+                return Err(StateError::PaneNotFound(region.pane_id));
+            };
+            if !pane_allows_overlay_regions(pane) {
+                return Err(StateError::InvalidOverlayRegion(format!(
+                    "pane {:?} is not a live native-hosted pane",
+                    region.pane_id
+                )));
+            }
+            let live_instance_id = pane_instance_id(&region.pane_id, pane);
+            if region.pane_instance_id != live_instance_id {
+                return Err(StateError::InvalidOverlayRegion(format!(
+                    "pane_instance_id '{}' does not match live pane instance '{}'",
+                    region.pane_instance_id, live_instance_id
+                )));
+            }
+            let (rect, clamped) = clamp_overlay_rect_to_runtime_bounds(
+                region.rect,
+                self.runtime.window_width,
+                self.runtime.window_height,
+            )?;
+            next_regions.push(OverlayRegionStatus {
+                region_id: region.region_id,
+                pane_id: region.pane_id,
+                pane_instance_id: region.pane_instance_id,
+                kind: region.kind,
+                rect,
+                z_index: region.z_index,
+                captures: region.captures,
+                clamped,
+            });
+        }
+
+        self.overlay_regions = Some(OverlayRegionSnapshot {
+            key,
+            revision,
+            topology_epoch: self.topology_epoch.clone(),
+            update_reason,
+            last_updated_at: current_unix_millis(),
+            regions: next_regions,
+        });
+        Ok(())
+    }
+
+    pub fn clear_overlay_regions(
+        &mut self,
+        surface_id: String,
+        window_id: Option<String>,
+    ) -> Result<(), StateError> {
+        let key = validate_overlay_surface_key(surface_id, window_id)?;
+        if self
+            .overlay_regions
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.key == key)
+        {
+            self.overlay_regions = None;
+        }
+        Ok(())
+    }
+
+    pub fn overlay_regions_status(&self) -> OverlayRegionsStatus {
+        let Some(snapshot) = &self.overlay_regions else {
+            return OverlayRegionsStatus::default();
+        };
+        OverlayRegionsStatus {
+            surface_id: Some(snapshot.key.surface_id.clone()),
+            window_id: snapshot.key.window_id.clone(),
+            active_revision: Some(snapshot.revision),
+            region_count: snapshot.regions.len(),
+            topology_epoch: Some(snapshot.topology_epoch.clone()),
+            update_reason: snapshot.update_reason.clone(),
+            last_updated_at: Some(snapshot.last_updated_at),
+            regions: snapshot.regions.clone(),
+        }
+    }
+
     pub fn set_runtime_focus_target(&mut self, target: Option<RuntimeFocusTarget>) {
         self.runtime.active_focus_target = target;
     }
@@ -597,6 +749,7 @@ impl CompositorState {
         &mut self,
         provider_panes: Vec<ProviderPaneSnapshot>,
     ) -> Result<(), StateError> {
+        self.bump_topology_epoch();
         let mut incoming = HashMap::new();
         for pane in provider_panes {
             let previous = self.panes.get(&pane.id);
@@ -643,6 +796,7 @@ impl CompositorState {
         self.prototype_overlay_policy.clear_if_removed(|pane_id| {
             self.panes.contains_key(pane_id) || is_shell_overlay_pane_id(pane_id)
         });
+        self.prune_stale_overlay_regions();
         Ok(())
     }
 
@@ -716,6 +870,7 @@ impl CompositorState {
         &mut self,
         requests: Vec<NativePaneHostRequest>,
     ) -> Result<(), StateError> {
+        self.bump_topology_epoch();
         for request in &requests {
             if request.process.command.trim().is_empty() {
                 return Err(StateError::InvalidProcessSpec);
@@ -762,6 +917,7 @@ impl CompositorState {
             pane.native_host_revision = request.revision;
         }
 
+        self.prune_stale_overlay_regions();
         Ok(())
     }
 
@@ -949,11 +1105,13 @@ impl CompositorState {
                     pane.external_native_state = ExternalNativeLifecycleState::Launching { pid };
                     pane.external_native_surface_id = None;
                     pane.external_native_binding_evidence = None;
+                    self.prune_stale_overlay_regions();
                     return true;
                 }
                 ExternalNativeLifecycleState::Launching { pid } if pid == client_pid => {
                     pane.external_native_surface_id = None;
                     pane.external_native_binding_evidence = None;
+                    self.prune_stale_overlay_regions();
                     return true;
                 }
                 ExternalNativeLifecycleState::Absent
@@ -987,6 +1145,7 @@ impl CompositorState {
         pane.external_native_binding_evidence = None;
         pane.external_native_launch_token = None;
         self.prototype_overlay_policy.release_if_matches(pane_id);
+        self.prune_stale_overlay_regions();
         Ok(())
     }
 
@@ -1170,6 +1329,7 @@ impl CompositorState {
                 pane.external_native_binding_evidence = None;
             }
         }
+        self.prune_stale_overlay_regions();
     }
 
     pub fn shell_overlay_focus_requested(&self) -> bool {
@@ -1217,6 +1377,7 @@ impl CompositorState {
             host_mode_active: self.host_mode_active,
             output_rotation: self.output_rotation,
             panes,
+            overlay_regions: self.overlay_regions_status(),
             prototype_policy: self.prototype_overlay_policy.status(),
             runtime: self.runtime.clone(),
         }
@@ -1353,6 +1514,153 @@ impl CompositorState {
             let _ = self.process_controller.terminate(pid);
         }
     }
+
+    fn prune_stale_overlay_regions(&mut self) {
+        let Some(snapshot) = self.overlay_regions.as_mut() else {
+            return;
+        };
+        snapshot.regions.retain(|region| {
+            let Some(pane) = self.panes.get(&region.pane_id) else {
+                return false;
+            };
+            pane_allows_overlay_regions(pane)
+                && pane_instance_id(&region.pane_id, pane) == region.pane_instance_id
+        });
+        if snapshot.regions.is_empty() {
+            self.overlay_regions = None;
+        }
+    }
+
+    fn bump_topology_epoch(&mut self) {
+        self.topology_epoch_counter = self.topology_epoch_counter.saturating_add(1);
+        self.topology_epoch = format!("topology-{}", self.topology_epoch_counter);
+    }
+}
+
+fn validate_overlay_region(region: &OverlayRegionRequest) -> Result<(), StateError> {
+    if region.region_id.trim().is_empty() {
+        return Err(StateError::InvalidOverlayRegion(
+            "regionId must not be empty".to_string(),
+        ));
+    }
+    if region.pane_id.0.trim().is_empty() {
+        return Err(StateError::InvalidOverlayRegion(
+            "pane_id must not be empty".to_string(),
+        ));
+    }
+    if region.pane_instance_id.trim().is_empty() {
+        return Err(StateError::InvalidOverlayRegion(
+            "paneInstanceId must not be empty".to_string(),
+        ));
+    }
+    if region.captures.is_empty() {
+        return Err(StateError::InvalidOverlayRegion(
+            "captures must not be empty".to_string(),
+        ));
+    }
+    validate_overlay_rect(region.rect)
+}
+
+fn validate_overlay_rect(rect: OverlayRect) -> Result<(), StateError> {
+    if !rect.x.is_finite()
+        || !rect.y.is_finite()
+        || !rect.width.is_finite()
+        || !rect.height.is_finite()
+    {
+        return Err(StateError::InvalidOverlayRegion(
+            "rect coordinates must be finite".to_string(),
+        ));
+    }
+    if rect.width < 0.0 || rect.height < 0.0 {
+        return Err(StateError::InvalidOverlayRegion(
+            "rect width and height must not be negative".to_string(),
+        ));
+    }
+    if rect.width == 0.0 || rect.height == 0.0 {
+        return Err(StateError::InvalidOverlayRegion(
+            "rect width and height must be greater than zero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_overlay_surface_key(
+    surface_id: String,
+    window_id: Option<String>,
+) -> Result<OverlaySurfaceKey, StateError> {
+    if surface_id.trim().is_empty() {
+        return Err(StateError::InvalidOverlayRegion(
+            "surfaceId must not be empty".to_string(),
+        ));
+    }
+    if window_id
+        .as_ref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(StateError::InvalidOverlayRegion(
+            "windowId must not be empty".to_string(),
+        ));
+    }
+    Ok(OverlaySurfaceKey {
+        surface_id,
+        window_id,
+    })
+}
+
+fn clamp_overlay_rect_to_runtime_bounds(
+    rect: OverlayRect,
+    window_width: Option<i32>,
+    window_height: Option<i32>,
+) -> Result<(OverlayRect, bool), StateError> {
+    validate_overlay_rect(rect)?;
+    let Some(max_width) = window_width.filter(|value| *value > 0).map(i64::from) else {
+        return Ok((rect, false));
+    };
+    let Some(max_height) = window_height.filter(|value| *value > 0).map(i64::from) else {
+        return Ok((rect, false));
+    };
+
+    let max_width = max_width as f64;
+    let max_height = max_height as f64;
+    let left = rect.x.clamp(0.0, (max_width - 1.0).max(0.0));
+    let top = rect.y.clamp(0.0, (max_height - 1.0).max(0.0));
+    let right = (rect.x + rect.width).clamp(left + 1.0, max_width);
+    let bottom = (rect.y + rect.height).clamp(top + 1.0, max_height);
+    let clamped = left != rect.x
+        || top != rect.y
+        || (right - left) != rect.width
+        || (bottom - top) != rect.height;
+
+    Ok((
+        OverlayRect {
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top,
+        },
+        clamped,
+    ))
+}
+
+fn pane_allows_overlay_regions(pane: &PaneRuntimeState) -> bool {
+    matches!(pane.render_mode, PaneRenderMode::ExternalNative { .. })
+        && matches!(
+            pane.external_native_state,
+            ExternalNativeLifecycleState::Attached { .. }
+        )
+}
+
+fn pane_instance_id(pane_id: &PaneId, pane: &PaneRuntimeState) -> String {
+    pane.native_host_binding_id
+        .clone()
+        .unwrap_or_else(|| format!("{}:{}", pane_id.0, pane.native_host_revision))
+}
+
+fn current_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or_default()
 }
 
 fn running_pid(state: &ExternalNativeLifecycleState) -> Option<u32> {
@@ -1377,8 +1685,9 @@ fn is_shell_overlay_pane_id(pane_id: &PaneId) -> bool {
 mod tests {
     use super::*;
     use crate::model::{
-        MainAppLaunchIntent, MainAppLaunchState, MainAppSurfaceBinding, PaneGeometry,
-        ProviderPaneSnapshot, SurfaceBindingEvidence, SurfaceBindingEvidenceOutcome,
+        CompositorOverlayKind, MainAppLaunchIntent, MainAppLaunchState, MainAppSurfaceBinding,
+        OverlayCaptureCapability, PaneGeometry, ProviderPaneSnapshot, SurfaceBindingEvidence,
+        SurfaceBindingEvidenceOutcome,
     };
     use crate::process_manager::{ProcessController, ProcessExit};
     use std::collections::{BTreeMap, HashSet};
@@ -1473,6 +1782,27 @@ mod tests {
             args: vec![],
             cwd: None,
             env: BTreeMap::new(),
+        }
+    }
+
+    fn overlay_region(
+        region_id: &str,
+        pane_id: &str,
+        pane_instance_id: &str,
+        rect: OverlayRect,
+    ) -> OverlayRegionRequest {
+        OverlayRegionRequest {
+            region_id: region_id.to_string(),
+            pane_id: PaneId::new(pane_id),
+            pane_instance_id: pane_instance_id.to_string(),
+            kind: CompositorOverlayKind::PaneBadge,
+            rect,
+            z_index: None,
+            captures: vec![
+                OverlayCaptureCapability::PointerHover,
+                OverlayCaptureCapability::PointerButton,
+                OverlayCaptureCapability::PointerAxis,
+            ],
         }
     }
 
@@ -2058,6 +2388,470 @@ mod tests {
                 .active_overlay_pane
                 .is_none()
         );
+    }
+
+    #[test]
+    fn overlay_regions_store_region_data_only_and_clamp_to_runtime_bounds() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state
+            .apply_provider_snapshot(vec![pane("p-1", 0, 0, 100, 100)])
+            .expect("provider snapshot should apply");
+        state
+            .switch_pane_to_external_native(
+                &PaneId::new("p-1"),
+                NativeTargetClass::Terminal,
+                terminal_process(),
+            )
+            .expect("pane should become native-hosted");
+        state
+            .mark_external_surface_attached(&PaneId::new("p-1"))
+            .expect("native pane should attach");
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            800,
+            600,
+        );
+        let topology_epoch = state.topology_epoch().to_string();
+
+        state
+            .set_overlay_regions(
+                "main-surface".to_string(),
+                Some("window-1".to_string()),
+                1,
+                topology_epoch,
+                Some(OverlayRegionUpdateReason::Initial),
+                OverlayCoordinateSpace::SurfaceLogical,
+                vec![overlay_region(
+                    "badge",
+                    "p-1",
+                    "p-1:0",
+                    OverlayRect {
+                        x: -20.0,
+                        y: 590.0,
+                        width: 900.0,
+                        height: 40.0,
+                    },
+                )],
+            )
+            .expect("valid overlay region should store");
+
+        let status = state.status_snapshot();
+        assert_eq!(
+            status.prototype_policy.active_overlay_pane,
+            Some(PaneId::new("p-1"))
+        );
+        assert!(status.runtime.overlay_bound_pane_id.is_none());
+        assert_eq!(
+            status.overlay_regions.surface_id.as_deref(),
+            Some("main-surface")
+        );
+        assert_eq!(
+            status.overlay_regions.window_id.as_deref(),
+            Some("window-1")
+        );
+        assert_eq!(status.overlay_regions.active_revision, Some(1));
+        assert_eq!(status.overlay_regions.region_count, 1);
+        assert_eq!(
+            status.overlay_regions.update_reason,
+            Some(OverlayRegionUpdateReason::Initial)
+        );
+        assert!(status.overlay_regions.last_updated_at.is_some());
+        assert_eq!(status.overlay_regions.regions.len(), 1);
+        let region = &status.overlay_regions.regions[0];
+        assert_eq!(region.region_id, "badge");
+        assert_eq!(region.pane_id, PaneId::new("p-1"));
+        assert_eq!(region.pane_instance_id, "p-1:0");
+        assert_eq!(
+            region.rect,
+            OverlayRect {
+                x: 0.0,
+                y: 590.0,
+                width: 800.0,
+                height: 10.0,
+            }
+        );
+        assert!(region.clamped);
+    }
+
+    #[test]
+    fn overlay_regions_reject_empty_pane_or_empty_geometry() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state
+            .apply_provider_snapshot(vec![pane("p-1", 0, 0, 100, 100)])
+            .expect("provider snapshot should apply");
+        state
+            .switch_pane_to_external_native(
+                &PaneId::new("p-1"),
+                NativeTargetClass::Terminal,
+                terminal_process(),
+            )
+            .expect("pane should become native-hosted");
+        state
+            .mark_external_surface_attached(&PaneId::new("p-1"))
+            .expect("native pane should attach");
+        let topology_epoch = state.topology_epoch().to_string();
+
+        let empty_pane = state
+            .set_overlay_regions(
+                "main-surface".to_string(),
+                None,
+                1,
+                topology_epoch.clone(),
+                None,
+                OverlayCoordinateSpace::SurfaceLogical,
+                vec![overlay_region(
+                    "badge",
+                    "  ",
+                    "p-1:0",
+                    OverlayRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 10.0,
+                        height: 10.0,
+                    },
+                )],
+            )
+            .expect_err("empty pane id should be rejected");
+        assert!(matches!(empty_pane, StateError::InvalidOverlayRegion(_)));
+
+        let empty_rect = state
+            .set_overlay_regions(
+                "main-surface".to_string(),
+                None,
+                1,
+                topology_epoch,
+                None,
+                OverlayCoordinateSpace::SurfaceLogical,
+                vec![overlay_region(
+                    "badge",
+                    "p-1",
+                    "p-1:0",
+                    OverlayRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 0.0,
+                        height: 10.0,
+                    },
+                )],
+            )
+            .expect_err("zero width should be rejected");
+        assert!(matches!(empty_rect, StateError::InvalidOverlayRegion(_)));
+        assert!(state.status_snapshot().overlay_regions.regions.is_empty());
+    }
+
+    #[test]
+    fn overlay_regions_reject_unknown_panes_without_replacing_existing_set() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state
+            .apply_provider_snapshot(vec![pane("left", 0, 0, 100, 100)])
+            .expect("provider snapshot should apply");
+        state
+            .switch_pane_to_external_native(
+                &PaneId::new("left"),
+                NativeTargetClass::Terminal,
+                terminal_process(),
+            )
+            .expect("pane should become native-hosted");
+        state
+            .mark_external_surface_attached(&PaneId::new("left"))
+            .expect("native pane should attach");
+        let topology_epoch = state.topology_epoch().to_string();
+        state
+            .set_overlay_regions(
+                "main-surface".to_string(),
+                None,
+                1,
+                topology_epoch.clone(),
+                None,
+                OverlayCoordinateSpace::SurfaceLogical,
+                vec![overlay_region(
+                    "left-badge",
+                    "left",
+                    "left:0",
+                    OverlayRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 100.0,
+                        height: 100.0,
+                    },
+                )],
+            )
+            .expect("known pane region should store");
+        let before = state.status_snapshot().overlay_regions;
+
+        let error = state
+            .set_overlay_regions(
+                "main-surface".to_string(),
+                None,
+                2,
+                topology_epoch,
+                None,
+                OverlayCoordinateSpace::SurfaceLogical,
+                vec![
+                    overlay_region(
+                        "left-badge",
+                        "left",
+                        "left:0",
+                        OverlayRect {
+                            x: 10.0,
+                            y: 10.0,
+                            width: 50.0,
+                            height: 50.0,
+                        },
+                    ),
+                    overlay_region(
+                        "missing-badge",
+                        "missing",
+                        "missing:0",
+                        OverlayRect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 10.0,
+                            height: 10.0,
+                        },
+                    ),
+                ],
+            )
+            .expect_err("unknown pane should reject the whole overlay region set");
+
+        assert!(matches!(error, StateError::PaneNotFound(id) if id == PaneId::new("missing")));
+        assert_eq!(state.status_snapshot().overlay_regions, before);
+    }
+
+    #[test]
+    fn overlay_regions_reject_stale_revision_and_topology_epoch_without_mutation() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state
+            .apply_provider_snapshot(vec![pane("left", 0, 0, 100, 100)])
+            .expect("provider snapshot should apply");
+        state
+            .switch_pane_to_external_native(
+                &PaneId::new("left"),
+                NativeTargetClass::Terminal,
+                terminal_process(),
+            )
+            .expect("pane should become native-hosted");
+        state
+            .mark_external_surface_attached(&PaneId::new("left"))
+            .expect("native pane should attach");
+        let epoch = state.topology_epoch().to_string();
+        state
+            .set_overlay_regions(
+                "main-surface".to_string(),
+                None,
+                7,
+                epoch.clone(),
+                None,
+                OverlayCoordinateSpace::SurfaceLogical,
+                vec![overlay_region(
+                    "left-badge",
+                    "left",
+                    "left:0",
+                    OverlayRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 100.0,
+                        height: 100.0,
+                    },
+                )],
+            )
+            .expect("initial region should store");
+        let before = state.status_snapshot().overlay_regions;
+
+        let stale_revision = state
+            .set_overlay_regions(
+                "main-surface".to_string(),
+                None,
+                7,
+                epoch.clone(),
+                None,
+                OverlayCoordinateSpace::SurfaceLogical,
+                vec![overlay_region(
+                    "left-badge",
+                    "left",
+                    "left:0",
+                    OverlayRect {
+                        x: 10.0,
+                        y: 10.0,
+                        width: 10.0,
+                        height: 10.0,
+                    },
+                )],
+            )
+            .expect_err("same revision should be stale");
+        assert!(matches!(
+            stale_revision,
+            StateError::StaleOverlayRegionRevision {
+                incoming: 7,
+                active: 7
+            }
+        ));
+        assert_eq!(state.status_snapshot().overlay_regions, before);
+
+        state
+            .apply_provider_snapshot(vec![pane("left", 0, 0, 100, 100)])
+            .expect("topology replay should advance epoch");
+        let stale_epoch = state
+            .set_overlay_regions(
+                "main-surface".to_string(),
+                None,
+                8,
+                epoch,
+                None,
+                OverlayCoordinateSpace::SurfaceLogical,
+                vec![overlay_region(
+                    "left-badge",
+                    "left",
+                    "left:0",
+                    OverlayRect {
+                        x: 10.0,
+                        y: 10.0,
+                        width: 10.0,
+                        height: 10.0,
+                    },
+                )],
+            )
+            .expect_err("old topology epoch should be stale");
+        assert!(matches!(
+            stale_epoch,
+            StateError::StaleOverlayTopologyEpoch { .. }
+        ));
+        assert_eq!(state.status_snapshot().overlay_regions, before);
+    }
+
+    #[test]
+    fn overlay_regions_clear_and_prune_removed_panes() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state
+            .apply_provider_snapshot(vec![
+                pane("left", 0, 0, 100, 100),
+                pane("right", 100, 0, 100, 100),
+            ])
+            .expect("provider snapshot should apply");
+        state
+            .apply_native_pane_host_plan(vec![
+                NativePaneHostRequest {
+                    id: PaneId::new("left"),
+                    content_id: None,
+                    binding_id: None,
+                    revision: 0,
+                    geometry: PaneGeometry {
+                        x: 0,
+                        y: 0,
+                        width: 100,
+                        height: 100,
+                    },
+                    target: NativeTargetClass::Terminal,
+                    process: terminal_process(),
+                },
+                NativePaneHostRequest {
+                    id: PaneId::new("right"),
+                    content_id: None,
+                    binding_id: None,
+                    revision: 0,
+                    geometry: PaneGeometry {
+                        x: 100,
+                        y: 0,
+                        width: 100,
+                        height: 100,
+                    },
+                    target: NativeTargetClass::Terminal,
+                    process: terminal_process(),
+                },
+            ])
+            .expect("native pane host plan should apply");
+        state
+            .launch_native_pane_hosts(Vec::new())
+            .expect("native panes should launch");
+        state
+            .mark_external_surface_attached(&PaneId::new("left"))
+            .expect("left native surface should attach");
+        state
+            .mark_external_surface_attached(&PaneId::new("right"))
+            .expect("right native surface should attach");
+        let topology_epoch = state.topology_epoch().to_string();
+        state
+            .set_overlay_regions(
+                "main-surface".to_string(),
+                None,
+                1,
+                topology_epoch,
+                None,
+                OverlayCoordinateSpace::SurfaceLogical,
+                vec![
+                    overlay_region(
+                        "left-badge",
+                        "left",
+                        "left:0",
+                        OverlayRect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 100.0,
+                            height: 100.0,
+                        },
+                    ),
+                    overlay_region(
+                        "right-badge",
+                        "right",
+                        "right:0",
+                        OverlayRect {
+                            x: 100.0,
+                            y: 0.0,
+                            width: 100.0,
+                            height: 100.0,
+                        },
+                    ),
+                ],
+            )
+            .expect("overlay regions should store");
+
+        assert!(state.runtime_mark_native_pane_surface_detached_for_pid(1));
+        assert_eq!(state.status_snapshot().overlay_regions.regions.len(), 1);
+        assert_eq!(
+            state.status_snapshot().overlay_regions.regions[0].pane_id,
+            PaneId::new("right")
+        );
+
+        state
+            .apply_provider_snapshot(vec![pane("left", 0, 0, 100, 100)])
+            .expect("provider snapshot should prune stale right region");
+        assert!(state.status_snapshot().overlay_regions.regions.is_empty());
+
+        state
+            .mark_external_surface_attached(&PaneId::new("left"))
+            .expect("left native surface should reattach");
+        let topology_epoch = state.topology_epoch().to_string();
+        state
+            .set_overlay_regions(
+                "main-surface".to_string(),
+                None,
+                1,
+                topology_epoch,
+                None,
+                OverlayCoordinateSpace::SurfaceLogical,
+                vec![overlay_region(
+                    "left-badge",
+                    "left",
+                    "left:0",
+                    OverlayRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 100.0,
+                        height: 100.0,
+                    },
+                )],
+            )
+            .expect("overlay region should store again");
+        state
+            .clear_overlay_regions("main-surface".to_string(), None)
+            .expect("empty clear set should clear all regions");
+        assert!(state.status_snapshot().overlay_regions.regions.is_empty());
     }
 
     #[test]
