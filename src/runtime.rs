@@ -7070,6 +7070,60 @@ enum SoftwareCursorColor {
     Black,
 }
 
+const SOFTWARE_CURSOR_MASK_WIDTH: i32 = 48;
+const SOFTWARE_CURSOR_MASK_HEIGHT: i32 = 48;
+const SOFTWARE_CURSOR_MASK_STRIDE: usize = 6;
+const SOFTWARE_CURSOR_MASK: [u8; 288] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // row 0
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // row 1
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // row 2
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // row 3
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, // row 4
+    0x03, 0x00, 0x00, 0x00, 0x00, 0x00, // row 5
+    0x03, 0x80, 0x00, 0x00, 0x00, 0x00, // row 6
+    0x03, 0xC0, 0x00, 0x00, 0x00, 0x00, // row 7
+    0x03, 0xE0, 0x00, 0x00, 0x00, 0x00, // row 8
+    0x03, 0xF0, 0x00, 0x00, 0x00, 0x00, // row 9
+    0x03, 0xF8, 0x00, 0x00, 0x00, 0x00, // row 10
+    0x03, 0xFC, 0x00, 0x00, 0x00, 0x00, // row 11
+    0x03, 0xFE, 0x00, 0x00, 0x00, 0x00, // row 12
+    0x03, 0xFF, 0x00, 0x00, 0x00, 0x00, // row 13
+    0x03, 0xFF, 0x80, 0x00, 0x00, 0x00, // row 14
+    0x03, 0xFF, 0xC0, 0x00, 0x00, 0x00, // row 15
+    0x03, 0xFF, 0xE0, 0x00, 0x00, 0x00, // row 16
+    0x03, 0xFF, 0xF0, 0x00, 0x00, 0x00, // row 17
+    0x03, 0xFF, 0xF8, 0x00, 0x00, 0x00, // row 18
+    0x03, 0xFF, 0xFC, 0x00, 0x00, 0x00, // row 19
+    0x03, 0xFF, 0xFE, 0x00, 0x00, 0x00, // row 20
+    0x03, 0xFF, 0xFF, 0x00, 0x00, 0x00, // row 21
+    0x03, 0xFF, 0xFF, 0x80, 0x00, 0x00, // row 22
+    0x03, 0xFF, 0xFF, 0xC0, 0x00, 0x00, // row 23
+    0x03, 0xFF, 0xFF, 0xE0, 0x00, 0x00, // row 24
+    0x03, 0xFF, 0xC0, 0x00, 0x00, 0x00, // row 25
+    0x03, 0xFF, 0xE0, 0x00, 0x00, 0x00, // row 26
+    0x03, 0xF7, 0xE0, 0x00, 0x00, 0x00, // row 27
+    0x03, 0xE7, 0xF0, 0x00, 0x00, 0x00, // row 28
+    0x03, 0xC3, 0xF0, 0x00, 0x00, 0x00, // row 29
+    0x03, 0x83, 0xF8, 0x00, 0x00, 0x00, // row 30
+    0x03, 0x03, 0xF8, 0x00, 0x00, 0x00, // row 31
+    0x02, 0x01, 0xFC, 0x00, 0x00, 0x00, // row 32
+    0x00, 0x01, 0xFC, 0x00, 0x00, 0x00, // row 33
+    0x00, 0x01, 0xFE, 0x00, 0x00, 0x00, // row 34
+    0x00, 0x00, 0xFE, 0x00, 0x00, 0x00, // row 35
+    0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, // row 36
+    0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, // row 37
+    0x00, 0x00, 0x7F, 0x80, 0x00, 0x00, // row 38
+    0x00, 0x00, 0x7F, 0x80, 0x00, 0x00, // row 39
+    0x00, 0x00, 0x7F, 0x80, 0x00, 0x00, // row 40
+    0x00, 0x00, 0x3E, 0x00, 0x00, 0x00, // row 41
+    0x00, 0x00, 0x38, 0x00, 0x00, 0x00, // row 42
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // row 43
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // row 44
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // row 45
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // row 46
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // row 47
+];
+
 fn software_cursor_default_location(output_size: Size<i32, Logical>) -> Point<f64, Logical> {
     (
         (output_size.w.max(1) as f64 / 2.0).floor(),
@@ -7101,61 +7155,95 @@ fn software_cursor_rects(
         clamp_pointer_location(location, Size::<i32, Logical>::from((output_w, output_h)));
     let x = location.x.round() as i32;
     let y = location.y.round() as i32;
+
     let mut rects = Vec::new();
-
-    let mut push_scaled_span = |row: i32, start: i32, width: i32, color: SoftwareCursorColor| {
-        if width <= 0 {
-            return;
-        }
-        let scale = 2;
-        let rect = Rectangle::new(
-            (x + start * scale, y + row * scale).into(),
-            (width * scale, scale).into(),
-        );
-        if let Some(clipped) = rect.intersection(bounds) {
-            if clipped.size.w > 0 && clipped.size.h > 0 {
-                rects.push((clipped, color));
-            }
-        }
-    };
-
-    for row in 2..=17 {
-        push_scaled_span(row, 2, (row - 2).max(1), SoftwareCursorColor::White);
-    }
-    for row in 18..=20 {
-        push_scaled_span(row, 2, 6, SoftwareCursorColor::White);
-    }
-    for row in 21..=28 {
-        push_scaled_span(row, 7, 4, SoftwareCursorColor::White);
-    }
-
-    for row in 0..=19 {
-        push_scaled_span(row, 0, row + 3, SoftwareCursorColor::Black);
-    }
-    for row in 20..=22 {
-        push_scaled_span(row, 0, 10, SoftwareCursorColor::Black);
-    }
-    for row in 23..=30 {
-        push_scaled_span(row, 5, 8, SoftwareCursorColor::Black);
-    }
-    for row in 31..=34 {
-        push_scaled_span(row, 7, 6, SoftwareCursorColor::Black);
-    }
-
-    let tip_and_tail = [
-        Rectangle::new((x, y).into(), (4, 4).into()),
-        Rectangle::new((x + 2, y + 2).into(), (4, 4).into()),
-        Rectangle::new((x + 22, y + 38).into(), (14, 4).into()),
-        Rectangle::new((x + 24, y + 42).into(), (10, 4).into()),
-    ];
-    for rect in tip_and_tail {
-        if let Some(clipped) = rect.intersection(bounds) {
-            if clipped.size.w > 0 && clipped.size.h > 0 {
-                rects.push((clipped, SoftwareCursorColor::Black));
-            }
-        }
-    }
+    append_cursor_mask_spans(
+        &mut rects,
+        bounds,
+        (x, y).into(),
+        SoftwareCursorColor::White,
+        |mask_x, mask_y| software_cursor_mask_pixel(mask_x, mask_y),
+    );
+    append_cursor_mask_spans(
+        &mut rects,
+        bounds,
+        (x, y).into(),
+        SoftwareCursorColor::Black,
+        |mask_x, mask_y| software_cursor_outline_pixel(mask_x, mask_y),
+    );
     rects
+}
+
+fn append_cursor_mask_spans(
+    rects: &mut Vec<(Rectangle<i32, Logical>, SoftwareCursorColor)>,
+    bounds: Rectangle<i32, Logical>,
+    origin: Point<i32, Logical>,
+    color: SoftwareCursorColor,
+    pixel_on: impl Fn(i32, i32) -> bool,
+) {
+    for mask_y in 0..SOFTWARE_CURSOR_MASK_HEIGHT {
+        let mut span_start = None;
+        for mask_x in 0..=SOFTWARE_CURSOR_MASK_WIDTH {
+            let on = mask_x < SOFTWARE_CURSOR_MASK_WIDTH && pixel_on(mask_x, mask_y);
+            match (span_start, on) {
+                (None, true) => span_start = Some(mask_x),
+                (Some(start), false) => {
+                    push_cursor_rect(
+                        rects,
+                        bounds,
+                        Rectangle::new(
+                            (origin.x + start, origin.y + mask_y).into(),
+                            (mask_x - start, 1).into(),
+                        ),
+                        color,
+                    );
+                    span_start = None;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn push_cursor_rect(
+    rects: &mut Vec<(Rectangle<i32, Logical>, SoftwareCursorColor)>,
+    bounds: Rectangle<i32, Logical>,
+    rect: Rectangle<i32, Logical>,
+    color: SoftwareCursorColor,
+) {
+    if let Some(clipped) = rect.intersection(bounds) {
+        if clipped.size.w > 0 && clipped.size.h > 0 {
+            rects.push((clipped, color));
+        }
+    }
+}
+
+fn software_cursor_mask_pixel(mask_x: i32, mask_y: i32) -> bool {
+    if !(0..SOFTWARE_CURSOR_MASK_WIDTH).contains(&mask_x)
+        || !(0..SOFTWARE_CURSOR_MASK_HEIGHT).contains(&mask_y)
+    {
+        return false;
+    }
+    let byte_index = mask_y as usize * SOFTWARE_CURSOR_MASK_STRIDE + mask_x as usize / 8;
+    let bit = 0x80 >> (mask_x as usize % 8);
+    SOFTWARE_CURSOR_MASK[byte_index] & bit != 0
+}
+
+fn software_cursor_outline_pixel(mask_x: i32, mask_y: i32) -> bool {
+    if software_cursor_mask_pixel(mask_x, mask_y) {
+        return false;
+    }
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            if software_cursor_mask_pixel(mask_x - dx, mask_y - dy) {
+                return true;
+            }
+        }
+    }
+    software_cursor_mask_pixel(mask_x - 2, mask_y - 2)
 }
 
 fn draw_software_cursor(
@@ -7438,11 +7526,11 @@ mod tests {
         assert_eq!(rects[0].1, super::SoftwareCursorColor::White);
         assert!(rects.iter().any(|(rect, color)| {
             *color == super::SoftwareCursorColor::White
-                && *rect == Rectangle::new((14, 14).into(), (2, 2).into())
+                && *rect == Rectangle::new((16, 14).into(), (1, 1).into())
         }));
         assert!(rects.iter().any(|(rect, color)| {
             *color == super::SoftwareCursorColor::Black
-                && *rect == Rectangle::new((10, 10).into(), (6, 2).into())
+                && *rect == Rectangle::new((15, 13).into(), (3, 1).into())
         }));
         assert!(
             rects
@@ -7454,6 +7542,30 @@ mod tests {
                 .iter()
                 .any(|(_, color)| *color == super::SoftwareCursorColor::Black)
         );
+    }
+
+    #[test]
+    fn software_cursor_mask_is_48_by_48_msb_first_rows() {
+        assert_eq!(super::SOFTWARE_CURSOR_MASK_WIDTH, 48);
+        assert_eq!(super::SOFTWARE_CURSOR_MASK_HEIGHT, 48);
+        assert_eq!(super::SOFTWARE_CURSOR_MASK_STRIDE, 6);
+        assert_eq!(
+            super::SOFTWARE_CURSOR_MASK.len(),
+            (super::SOFTWARE_CURSOR_MASK_HEIGHT as usize) * super::SOFTWARE_CURSOR_MASK_STRIDE
+        );
+
+        assert!(super::software_cursor_mask_pixel(6, 4));
+        assert!(!super::software_cursor_mask_pixel(5, 4));
+        assert!(!super::software_cursor_mask_pixel(7, 4));
+        assert!(super::software_cursor_mask_pixel(6, 24));
+        assert!(super::software_cursor_mask_pixel(26, 24));
+        assert!(!super::software_cursor_mask_pixel(27, 24));
+        assert!(super::software_cursor_mask_pixel(11, 27));
+        assert!(!super::software_cursor_mask_pixel(12, 27));
+        assert!(super::software_cursor_mask_pixel(13, 27));
+        assert!(super::software_cursor_mask_pixel(20, 42));
+        assert!(!super::software_cursor_mask_pixel(21, 42));
+        assert!(!super::software_cursor_mask_pixel(18, 43));
     }
 
     #[test]
