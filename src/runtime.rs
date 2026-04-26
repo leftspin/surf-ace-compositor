@@ -4171,11 +4171,11 @@ fn cursor_rect_to_scanout(
             (rect.size.w, rect.size.h).into(),
         ),
         OutputRotation::Deg90 => Rectangle::new(
-            (logical_h - (rect.loc.y + rect.size.h), rect.loc.x).into(),
+            (rect.loc.y, logical_w - (rect.loc.x + rect.size.w)).into(),
             (rect.size.h, rect.size.w).into(),
         ),
         OutputRotation::Deg270 => Rectangle::new(
-            (rect.loc.y, logical_w - (rect.loc.x + rect.size.w)).into(),
+            (logical_h - (rect.loc.y + rect.size.h), rect.loc.x).into(),
             (rect.size.h, rect.size.w).into(),
         ),
     };
@@ -7509,17 +7509,33 @@ mod tests {
         assert_eq!(
             super::cursor_rect_to_scanout(rect, logical_size, scanout_size, OutputRotation::Deg90),
             Some(Rectangle::<i32, Physical>::new(
-                (2100, 10).into(),
+                (20, 3800).into(),
                 (40, 30).into()
             ))
         );
         assert_eq!(
             super::cursor_rect_to_scanout(rect, logical_size, scanout_size, OutputRotation::Deg270),
             Some(Rectangle::<i32, Physical>::new(
-                (20, 3800).into(),
+                (2100, 10).into(),
                 (40, 30).into()
             ))
         );
+    }
+
+    #[test]
+    fn deg90_cursor_mapping_is_inverse_of_capture_rotation() {
+        let logical_size = Size::<i32, Logical>::from((3840, 2160));
+        let scanout_size = Size::<i32, Physical>::from((2160, 3840));
+        let rect = Rectangle::<i32, Logical>::new((10, 20).into(), (30, 40).into());
+        let mapped =
+            super::cursor_rect_to_scanout(rect, logical_size, scanout_size, OutputRotation::Deg90)
+                .expect("deg90 cursor rect should map into scanout bounds");
+
+        let view_x = scanout_size.h - (mapped.loc.y + mapped.size.h);
+        let view_y = mapped.loc.x;
+
+        assert_eq!((view_x, view_y), (rect.loc.x, rect.loc.y));
+        assert_eq!((mapped.size.h, mapped.size.w), (rect.size.w, rect.size.h));
     }
 
     #[test]
