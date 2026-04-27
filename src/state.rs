@@ -24,6 +24,7 @@ pub const NATIVE_PANE_REVISION_ENV: &str = "SURF_ACE_NATIVE_PANE_REVISION";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PaneRuntimeState {
+    provider_owned: bool,
     geometry: crate::model::PaneGeometry,
     render_mode: PaneRenderMode,
     external_native_state: ExternalNativeLifecycleState,
@@ -762,6 +763,7 @@ impl CompositorState {
             let previous = self.panes.get(&pane.id);
             let runtime = match previous {
                 Some(prev) => PaneRuntimeState {
+                    provider_owned: true,
                     geometry: pane.geometry,
                     render_mode: prev.render_mode.clone(),
                     external_native_state: prev.external_native_state.clone(),
@@ -773,6 +775,7 @@ impl CompositorState {
                     external_native_launch_token: prev.external_native_launch_token.clone(),
                 },
                 None => PaneRuntimeState {
+                    provider_owned: true,
                     geometry: pane.geometry,
                     render_mode: PaneRenderMode::SurfAceRendered,
                     external_native_state: ExternalNativeLifecycleState::Absent,
@@ -889,6 +892,7 @@ impl CompositorState {
                 .panes
                 .entry(request.id)
                 .or_insert_with(|| PaneRuntimeState {
+                    provider_owned: false,
                     geometry: request.geometry,
                     render_mode: PaneRenderMode::SurfAceRendered,
                     external_native_state: ExternalNativeLifecycleState::Absent,
@@ -1170,6 +1174,16 @@ impl CompositorState {
                 return Err(StateError::PaneNotFound(pane_id));
             }
             self.switch_pane_to_surf_ace(&pane_id)?;
+            if self
+                .panes
+                .get(&pane_id)
+                .map(|pane| !pane.provider_owned)
+                .unwrap_or(false)
+            {
+                self.panes.remove(&pane_id);
+                self.prototype_overlay_policy.release_if_matches(&pane_id);
+                self.prune_stale_overlay_regions();
+            }
         }
 
         Ok(())

@@ -1242,6 +1242,75 @@ mod tests {
         );
         assert!(release_response.ok);
         let status = release_response.status.expect("status should be returned");
+        assert!(
+            status.panes.is_empty(),
+            "host-created native pane records should be removed after release"
+        );
+    }
+
+    #[test]
+    fn native_pane_release_preserves_provider_owned_pane_record() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".into()),
+            1280,
+            720,
+        );
+        let provider_response = handle_request(
+            &mut state,
+            ControlRequest::ApplyProviderSnapshot {
+                panes: vec![ProviderPaneSnapshot {
+                    id: PaneId::new("pane-a"),
+                    geometry: PaneGeometry {
+                        x: 10,
+                        y: 20,
+                        width: 300,
+                        height: 200,
+                    },
+                }],
+            },
+            None,
+        );
+        assert!(provider_response.ok);
+
+        let host_response = handle_request(
+            &mut state,
+            ControlRequest::NativePaneHost {
+                panes: vec![NativePaneHostRequest {
+                    id: PaneId::new("pane-a"),
+                    content_id: Some("content-a".to_string()),
+                    binding_id: Some("binding-a".to_string()),
+                    revision: 1,
+                    geometry: PaneGeometry {
+                        x: 10,
+                        y: 20,
+                        width: 300,
+                        height: 200,
+                    },
+                    target: NativeTargetClass::Terminal,
+                    process: ProcessSpec {
+                        command: "foot".to_string(),
+                        args: vec!["top".to_string()],
+                        cwd: None,
+                        env: BTreeMap::new(),
+                    },
+                }],
+            },
+            None,
+        );
+        assert!(host_response.ok);
+
+        let release_response = handle_request(
+            &mut state,
+            ControlRequest::NativePaneRelease {
+                pane_ids: vec![PaneId::new("pane-a")],
+            },
+            None,
+        );
+        assert!(release_response.ok);
+        let status = release_response.status.expect("status should be returned");
+        assert_eq!(status.panes.len(), 1);
         assert!(matches!(
             status.panes[0].render_mode,
             PaneRenderMode::SurfAceRendered
