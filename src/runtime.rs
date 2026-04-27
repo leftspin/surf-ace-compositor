@@ -48,6 +48,7 @@ use smithay::delegate_dmabuf;
 use smithay::delegate_output;
 use smithay::delegate_seat;
 use smithay::delegate_shm;
+use smithay::delegate_xdg_decoration;
 use smithay::delegate_xdg_shell;
 use smithay::input::keyboard::{FilterResult, Keysym, ModifiersState, keysyms, xkb};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
@@ -71,7 +72,10 @@ use smithay::reexports::drm::{
         plane as drm_plane, property as drm_property,
     },
 };
-use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+use smithay::reexports::wayland_protocols::xdg::{
+    decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as XdgDecorationMode,
+    shell::server::xdg_toplevel,
+};
 use smithay::reexports::wayland_server::backend::{
     ClientData, ClientId, DisconnectReason, ObjectId,
 };
@@ -101,6 +105,7 @@ use smithay::wayland::selection::data_device::{
 use smithay::wayland::shell::xdg::{
     Configure, PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface, XdgShellHandler,
     XdgShellState, XdgToplevelSurfaceData,
+    decoration::{XdgDecorationHandler, XdgDecorationState},
 };
 use smithay::wayland::shm::{BufferAccessError, ShmHandler, ShmState, with_buffer_contents};
 use smithay::wayland::socket::ListeningSocketSource;
@@ -4433,6 +4438,10 @@ enum RuntimeSurfaceRole {
     NativePane(PaneId),
 }
 
+fn embedded_toplevel_decoration_mode() -> XdgDecorationMode {
+    XdgDecorationMode::ServerSide
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SurfaceClassification {
     MainApp,
@@ -4449,6 +4458,7 @@ struct RuntimeWaylandState {
     _data_device_state: DataDeviceState,
     output: Output,
     xdg_shell_state: XdgShellState,
+    _xdg_decoration_state: XdgDecorationState,
     shm_state: ShmState,
     dmabuf_state: DmabufState,
     dmabuf_global: Option<DmabufGlobal>,
@@ -4857,6 +4867,7 @@ impl RuntimeWaylandState {
         );
         let _ = output.create_global::<Self>(&display_handle);
         let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
+        let xdg_decoration_state = XdgDecorationState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
         let dmabuf_state = DmabufState::new();
         let mut seat_state = SeatState::new();
@@ -4872,6 +4883,7 @@ impl RuntimeWaylandState {
             _data_device_state: data_device_state,
             output,
             xdg_shell_state,
+            _xdg_decoration_state: xdg_decoration_state,
             shm_state,
             dmabuf_state,
             dmabuf_global: None,
@@ -5834,6 +5846,7 @@ impl RuntimeWaylandState {
 
         surface.with_pending_state(|pending| {
             pending.states.set(xdg_toplevel::State::Activated);
+            pending.decoration_mode = Some(embedded_toplevel_decoration_mode());
             match role {
                 RuntimeSurfaceRole::MainApp => {
                     pending.states.set(xdg_toplevel::State::Fullscreen);
@@ -6757,6 +6770,29 @@ impl XdgShellHandler for RuntimeWaylandState {
     }
 }
 
+impl XdgDecorationHandler for RuntimeWaylandState {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|pending| {
+            pending.decoration_mode = Some(embedded_toplevel_decoration_mode());
+        });
+        let _ = toplevel.send_pending_configure();
+    }
+
+    fn request_mode(&mut self, toplevel: ToplevelSurface, _mode: XdgDecorationMode) {
+        toplevel.with_pending_state(|pending| {
+            pending.decoration_mode = Some(embedded_toplevel_decoration_mode());
+        });
+        let _ = toplevel.send_pending_configure();
+    }
+
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|pending| {
+            pending.decoration_mode = Some(embedded_toplevel_decoration_mode());
+        });
+        let _ = toplevel.send_pending_configure();
+    }
+}
+
 impl ShmHandler for RuntimeWaylandState {
     fn shm_state(&self) -> &ShmState {
         &self.shm_state
@@ -7399,6 +7435,7 @@ fn send_frames_surface_tree(surface: &WlSurface, time: u32) {
 impl OutputHandler for RuntimeWaylandState {}
 
 delegate_xdg_shell!(RuntimeWaylandState);
+delegate_xdg_decoration!(RuntimeWaylandState);
 delegate_compositor!(RuntimeWaylandState);
 delegate_data_device!(RuntimeWaylandState);
 delegate_output!(RuntimeWaylandState);
@@ -7416,7 +7453,7 @@ mod tests {
         parse_shell_overlay_toggle_shortcut, pid_matches_or_descends_from,
         render_output_size_before_transform, scene_texture_transform, screen_capture_src_flipped,
         select_atomic_plane_zpos_values, select_preferred_scanout_format, select_primary_path,
-        source_rect_from_bbox_and_geometry, transform_from_rotation,
+        source_rect_from_bbox_and_geometry, transform_from_rotation, embedded_toplevel_decoration_mode,
     };
     use crate::model::{
         CompositorOverlayKind, OutputRotation, OverlayCaptureCapability, OverlayRect,
@@ -7425,6 +7462,7 @@ mod tests {
     use crate::process_manager::{ProcessController, ProcessExit};
     use crate::state::CompositorState;
     use smithay::input::keyboard::{Keysym, ModifiersState, keysyms};
+    use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as XdgDecorationMode;
     use smithay::reexports::wayland_server::Display;
     use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
     use std::path::{Path, PathBuf};
@@ -7449,6 +7487,14 @@ mod tests {
         fn reap_exited(&mut self) -> Vec<ProcessExit> {
             Vec::new()
         }
+    }
+
+    #[test]
+    fn embedded_toplevels_request_server_side_decoration_mode() {
+        assert_eq!(
+            embedded_toplevel_decoration_mode(),
+            XdgDecorationMode::ServerSide
+        );
     }
 
     #[test]
