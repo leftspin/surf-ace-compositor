@@ -10,14 +10,6 @@ impl PaneId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneGeometry {
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputRotation {
@@ -303,6 +295,17 @@ pub enum OverlayCoordinateSpace {
 pub enum PaneGeometryCoordinateSpace {
     #[default]
     CompositorLogical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneGeometry {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub coordinate_space: PaneGeometryCoordinateSpace,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -668,7 +671,7 @@ pub struct StatusSnapshot {
 mod tests {
     use super::{
         MainAppLaunchIntent, MainAppLaunchState, MainAppSurfaceBinding, MainAppSurfaceBindingMatch,
-        ProcessSpec,
+        PaneGeometry, PaneGeometryCoordinateSpace, ProcessSpec,
     };
     use std::collections::BTreeMap;
 
@@ -754,5 +757,33 @@ mod tests {
             MainAppLaunchState::default(),
             MainAppLaunchState::NotRequested
         );
+    }
+
+    #[test]
+    fn pane_geometry_defaults_missing_coordinate_space_for_migration() {
+        let geometry: PaneGeometry =
+            serde_json::from_str(r#"{"x":0,"y":0,"width":2160,"height":3840}"#)
+                .expect("legacy pane geometry should parse");
+
+        assert_eq!(
+            geometry.coordinate_space,
+            PaneGeometryCoordinateSpace::CompositorLogical
+        );
+        assert_eq!(
+            serde_json::to_value(geometry)
+                .expect("geometry should serialize")
+                .get("coordinateSpace"),
+            Some(&serde_json::json!("compositor_logical"))
+        );
+    }
+
+    #[test]
+    fn pane_geometry_rejects_unknown_coordinate_space() {
+        let error = serde_json::from_str::<PaneGeometry>(
+            r#"{"x":0,"y":0,"width":3840,"height":2160,"coordinateSpace":"physical_output"}"#,
+        )
+        .expect_err("unknown pane geometry coordinate space should fail");
+
+        assert!(error.to_string().contains("unknown variant"));
     }
 }

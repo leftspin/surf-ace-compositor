@@ -1432,6 +1432,14 @@ impl CompositorState {
         &self,
         geometry: &PaneGeometry,
     ) -> Result<(), StateError> {
+        if !matches!(
+            geometry.coordinate_space,
+            PaneGeometryCoordinateSpace::CompositorLogical
+        ) {
+            return Err(StateError::InvalidPaneGeometry(
+                "geometry.coordinateSpace must be compositor_logical".to_string(),
+            ));
+        }
         if geometry.width == 0 || geometry.height == 0 {
             return Err(StateError::InvalidPaneGeometry(
                 "width and height must be greater than zero".to_string(),
@@ -1854,6 +1862,7 @@ mod tests {
                 y,
                 width,
                 height,
+                coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
             },
         }
     }
@@ -2022,6 +2031,7 @@ mod tests {
                         y: 0,
                         width: 640,
                         height: 720,
+                        coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
                     process: terminal_process(),
@@ -2036,6 +2046,7 @@ mod tests {
                         y: 0,
                         width: 640,
                         height: 720,
+                        coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
                     process: ProcessSpec {
@@ -2097,6 +2108,7 @@ mod tests {
                         y: 0,
                         width: 640,
                         height: 720,
+                        coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
                     process: terminal_process(),
@@ -2111,6 +2123,7 @@ mod tests {
                         y: 0,
                         width: 640,
                         height: 720,
+                        coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
                     process: ProcessSpec {
@@ -2234,6 +2247,7 @@ mod tests {
                     y: 0,
                     width: 3840,
                     height: 2160,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
                 target: NativeTargetClass::Terminal,
                 process: terminal_process(),
@@ -2259,6 +2273,7 @@ mod tests {
                     y: 0,
                     width: 2160,
                     height: 3840,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
                 target: NativeTargetClass::Terminal,
                 process: terminal_process(),
@@ -2269,6 +2284,10 @@ mod tests {
         assert_eq!(status.panes.len(), 1);
         assert_eq!(status.panes[0].geometry.width, 2160);
         assert_eq!(status.panes[0].geometry.height, 3840);
+        assert_eq!(
+            status.panes[0].geometry.coordinate_space,
+            PaneGeometryCoordinateSpace::CompositorLogical
+        );
     }
 
     #[test]
@@ -2318,6 +2337,7 @@ mod tests {
                     y: 0,
                     width: 640,
                     height: 720,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
                 target: NativeTargetClass::Terminal,
                 process: terminal_process(),
@@ -2382,6 +2402,7 @@ mod tests {
                     y: 0,
                     width: 640,
                     height: 480,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
                 target: NativeTargetClass::Terminal,
                 process: terminal_process(),
@@ -2431,6 +2452,7 @@ mod tests {
                     y: 0,
                     width: 640,
                     height: 480,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
                 target: NativeTargetClass::Terminal,
                 process: terminal_process(),
@@ -2499,6 +2521,7 @@ mod tests {
                     y: 0,
                     width: 640,
                     height: 480,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
                 target: NativeTargetClass::Terminal,
                 process: terminal_process(),
@@ -2691,6 +2714,7 @@ mod tests {
                     y: 0,
                     width: 2160,
                     height: 3840,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
                 target: NativeTargetClass::Terminal,
                 process: terminal_process(),
@@ -3020,6 +3044,7 @@ mod tests {
                         y: 0,
                         width: 100,
                         height: 100,
+                        coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
                     process: terminal_process(),
@@ -3034,6 +3059,7 @@ mod tests {
                         y: 0,
                         width: 100,
                         height: 100,
+                        coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
                     process: terminal_process(),

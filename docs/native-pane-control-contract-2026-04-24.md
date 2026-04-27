@@ -24,10 +24,11 @@ Status exposes the coordinate contract explicitly:
 - `status.output_rotation`: the compositor output rotation.
 - `status.runtime.logical_surface_width` / `logical_surface_height`: the rotated compositor surface size that pane geometry must fit.
 - `status.runtime.pane_geometry_coordinate_space`: currently `compositor_logical`.
+- `status.panes[].geometry.coordinateSpace`: the coordinate space for that pane rectangle, currently `compositor_logical`.
 
-Example: on Racter with physical mode `3840x2160` and `output_rotation: "deg90"`, the compositor logical surface is `2160x3840`. A single full-screen pane must therefore use `{ "x": 0, "y": 0, "width": 2160, "height": 3840 }`, not `{ "width": 3840, "height": 2160 }`.
+Example: on Racter with physical mode `3840x2160` and `output_rotation: "deg90"`, the compositor logical surface is `2160x3840`. A single full-screen pane must therefore use `{ "x": 0, "y": 0, "width": 2160, "height": 3840, "coordinateSpace": "compositor_logical" }`, not `{ "width": 3840, "height": 2160 }`.
 
-When the runtime logical surface is known, `native_pane.host`, `native_pane.update`, and provider snapshots reject pane rectangles that are empty, negative/outside the logical surface, or sized from the unrotated physical mode. Overlay regions also use `surface_logical` coordinates and clamp to the same logical surface bounds.
+When the runtime logical surface is known, `native_pane.host`, `native_pane.update`, and provider snapshots reject pane rectangles that are empty, negative/outside the logical surface, sized from the unrotated physical mode, or tagged with any unsupported `geometry.coordinateSpace`. For migration, missing `geometry.coordinateSpace` defaults to `compositor_logical`; clients should still send it explicitly. Overlay regions also use `surface_logical` coordinates and clamp to the same logical surface bounds.
 
 ## Requests
 
@@ -42,7 +43,7 @@ Host or relaunch pane-native content:
       "content_id": "content-123",
       "binding_id": "binding-123",
       "revision": 7,
-      "geometry": { "x": 0, "y": 0, "width": 640, "height": 720 },
+      "geometry": { "x": 0, "y": 0, "width": 640, "height": 720, "coordinateSpace": "compositor_logical" },
       "target": "terminal",
       "process": { "command": "ghostty", "args": ["-e", "top"] }
     }
@@ -109,7 +110,7 @@ Every response that returns status includes `status.panes[]`. Native-hosted pane
 ```json
 {
   "id": "pane-left",
-  "geometry": { "x": 0, "y": 0, "width": 640, "height": 720 },
+  "geometry": { "x": 0, "y": 0, "width": 640, "height": 720, "coordinateSpace": "compositor_logical" },
   "render_mode": { "kind": "external_native", "target": "terminal", "process": { "command": "ghostty", "args": ["-e", "top"] } },
   "external_native_state": { "state": "attached", "pid": 12345 },
   "nativeHost": {

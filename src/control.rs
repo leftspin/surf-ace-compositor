@@ -496,9 +496,10 @@ mod tests {
     use super::*;
     use crate::model::{
         CompositorOverlayKind, ExternalNativeLifecycleState, HostRuntimeStartTrigger,
-        NativePaneHostRequest, OverlayCaptureCapability, OverlayRect, PaneGeometry, PaneRenderMode,
-        ProcessSpec, RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeHostPresentOwnership,
-        RuntimeHostQueuedPresentSource, SurfaceBindingEvidence, SurfaceBindingEvidenceOutcome,
+        NativePaneHostRequest, OverlayCaptureCapability, OverlayRect, PaneGeometry,
+        PaneGeometryCoordinateSpace, PaneRenderMode, ProcessSpec, RuntimeBackend,
+        RuntimeDmabufFormatStatus, RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource,
+        SurfaceBindingEvidence, SurfaceBindingEvidenceOutcome,
     };
     use crate::process_manager::{ProcessController, ProcessExit};
     use crate::screen_capture::ScreenCaptureStore;
@@ -605,6 +606,7 @@ mod tests {
                             y: 20,
                             width: 300,
                             height: 200,
+                            coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                         },
                         target: NativeTargetClass::Terminal,
                         process: ProcessSpec {
@@ -624,6 +626,7 @@ mod tests {
                             y: 20,
                             width: 300,
                             height: 200,
+                            coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                         },
                         target: NativeTargetClass::Terminal,
                         process: ProcessSpec {
@@ -657,6 +660,91 @@ mod tests {
     }
 
     #[test]
+    fn native_pane_host_migrates_missing_geometry_coordinate_space_and_status_exports_it() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            3840,
+            2160,
+        );
+        state.set_output_rotation(crate::model::OutputRotation::Deg90);
+
+        let request: ControlRequest = serde_json::from_str(
+            r#"{
+                "type": "native_pane.host",
+                "panes": [{
+                    "id": "full",
+                    "revision": 1,
+                    "geometry": { "x": 0, "y": 0, "width": 2160, "height": 3840 },
+                    "target": "terminal",
+                    "process": { "command": "foot", "args": [] }
+                }]
+            }"#,
+        )
+        .expect("missing geometry coordinateSpace should default during migration");
+
+        let response = handle_request(&mut state, request, None);
+        assert!(response.ok);
+        let status = response.status.expect("status should be returned");
+        assert_eq!(
+            status.panes[0].geometry.coordinate_space,
+            PaneGeometryCoordinateSpace::CompositorLogical
+        );
+        assert_eq!(status.runtime.logical_surface_width, Some(2160));
+        assert_eq!(status.runtime.logical_surface_height, Some(3840));
+
+        let serialized = serde_json::to_value(&status.panes[0].geometry)
+            .expect("geometry status should serialize");
+        assert_eq!(
+            serialized.get("coordinateSpace"),
+            Some(&serde_json::json!("compositor_logical"))
+        );
+    }
+
+    #[test]
+    fn native_pane_host_rejects_physical_shaped_geometry_after_rotation() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            3840,
+            2160,
+        );
+        state.set_output_rotation(crate::model::OutputRotation::Deg90);
+
+        let request: ControlRequest = serde_json::from_str(
+            r#"{
+                "type": "native_pane.host",
+                "panes": [{
+                    "id": "full",
+                    "revision": 1,
+                    "geometry": {
+                        "x": 0,
+                        "y": 0,
+                        "width": 3840,
+                        "height": 2160,
+                        "coordinateSpace": "compositor_logical"
+                    },
+                    "target": "terminal",
+                    "process": { "command": "foot", "args": [] }
+                }]
+            }"#,
+        )
+        .expect("request shape should parse");
+
+        let response = handle_request(&mut state, request, None);
+        assert!(!response.ok);
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("logical surface 2160x3840"))
+        );
+        assert!(state.status_snapshot().panes.is_empty());
+    }
+
+    #[test]
     fn overlay_regions_control_set_status_and_clear_are_data_only() {
         let mut state = CompositorState::new(true, Box::new(NoopProcessController));
         state.mark_runtime_running(
@@ -673,6 +761,7 @@ mod tests {
                     y: 0,
                     width: 640,
                     height: 480,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
             }])
             .expect("provider pane should exist");
@@ -809,6 +898,7 @@ mod tests {
                     y: 0,
                     width: 640,
                     height: 480,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
             }])
             .expect("provider pane should exist");
@@ -842,6 +932,7 @@ mod tests {
                     y: 0,
                     width: 640,
                     height: 480,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
             }])
             .expect("provider pane should exist");
@@ -915,6 +1006,7 @@ mod tests {
                     y: 0,
                     width: 640,
                     height: 480,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
             }])
             .expect("provider pane should exist");
@@ -1022,6 +1114,7 @@ mod tests {
                         y: 20,
                         width: 300,
                         height: 200,
+                        coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
                     process: ProcessSpec {
@@ -1076,6 +1169,7 @@ mod tests {
                         y: 20,
                         width: 300,
                         height: 200,
+                        coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
                     process: ProcessSpec {
@@ -1175,6 +1269,7 @@ mod tests {
                         y: 20,
                         width: 300,
                         height: 200,
+                        coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
                     process: ProcessSpec {
@@ -1207,6 +1302,7 @@ mod tests {
                         y: 40,
                         width: 320,
                         height: 220,
+                        coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
                     process: ProcessSpec {
@@ -1267,6 +1363,7 @@ mod tests {
                         y: 20,
                         width: 300,
                         height: 200,
+                        coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                 }],
             },
@@ -1287,6 +1384,7 @@ mod tests {
                         y: 20,
                         width: 300,
                         height: 200,
+                        coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
                     process: ProcessSpec {
