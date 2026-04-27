@@ -7048,11 +7048,11 @@ fn main_overlay_region_render_elements(
 ) -> Vec<SurfAceRenderElement> {
     let mut elements = Vec::new();
     for region in regions {
-        let mapped_rect = mapping.map_rect(overlay_region_logical_rect(region));
-        let crop_rect = Rectangle::<i32, Physical>::new(
-            (mapped_rect.loc.x, mapped_rect.loc.y).into(),
-            (mapped_rect.size.w, mapped_rect.size.h).into(),
-        );
+        // Overlay-region rects are already compositor logical coordinates. The
+        // lifted crop must stay in that target-space so it matches hit testing
+        // and debug border rendering even when the main surface source rect is
+        // not identity-mapped to the output.
+        let crop_rect = overlay_region_crop_rect(region);
         let region_elements = render_elements_from_surface_tree(
             renderer,
             surface,
@@ -7076,6 +7076,14 @@ fn overlay_region_logical_rect(region: &OverlayRegionStatus) -> Rectangle<i32, L
             region.rect.height.ceil().max(1.0) as i32,
         )
             .into(),
+    )
+}
+
+fn overlay_region_crop_rect(region: &OverlayRegionStatus) -> Rectangle<i32, Physical> {
+    let rect = overlay_region_logical_rect(region);
+    Rectangle::new(
+        (rect.loc.x, rect.loc.y).into(),
+        (rect.size.w, rect.size.h).into(),
     )
 }
 
@@ -7861,6 +7869,35 @@ mod tests {
 
         assert_eq!(rect.loc, (10, 20).into());
         assert_eq!(rect.size, (31, 41).into());
+    }
+
+    #[test]
+    fn overlay_region_crop_rect_stays_in_compositor_space() {
+        let mut region =
+            test_overlay_region("main-overlay", vec![OverlayCaptureCapability::PointerHover]);
+        region.rect.x = 944.4;
+        region.rect.y = 1868.2;
+        region.rect.width = 85.0;
+        region.rect.height = 77.0;
+
+        let crop = super::overlay_region_crop_rect(&region);
+        let mapping = RoleSurfaceMapping::new(
+            Rectangle::<i32, Logical>::new((40, 20).into(), (80, 40).into()),
+            Rectangle::<i32, Logical>::new((944, 16).into(), (960, 540).into()),
+        );
+        let remapped = mapping.map_rect(super::overlay_region_logical_rect(&region));
+
+        assert_eq!(
+            crop,
+            Rectangle::<i32, Physical>::new((944, 1868).into(), (85, 77).into())
+        );
+        assert_ne!(
+            Rectangle::<i32, Physical>::new(
+                (remapped.loc.x, remapped.loc.y).into(),
+                (remapped.size.w, remapped.size.h).into(),
+            ),
+            crop
+        );
     }
 
     #[test]
