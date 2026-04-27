@@ -5866,6 +5866,17 @@ impl RuntimeWaylandState {
         let _ = surface.send_pending_configure();
     }
 
+    fn configure_toplevel_with_current_role(&self, surface: &ToplevelSurface) {
+        if let Some(role) = self.role_for_surface(surface.wl_surface()) {
+            self.configure_toplevel_for_role(surface, role);
+            return;
+        }
+        surface.with_pending_state(|pending| {
+            pending.decoration_mode = Some(embedded_toplevel_decoration_mode());
+        });
+        let _ = surface.send_pending_configure();
+    }
+
     fn reconfigure_roles(&mut self, width: i32, height: i32) {
         self.backend_output_size = Size::<i32, Physical>::from((width.max(1), height.max(1)));
         {
@@ -6772,24 +6783,15 @@ impl XdgShellHandler for RuntimeWaylandState {
 
 impl XdgDecorationHandler for RuntimeWaylandState {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
-        toplevel.with_pending_state(|pending| {
-            pending.decoration_mode = Some(embedded_toplevel_decoration_mode());
-        });
-        let _ = toplevel.send_pending_configure();
+        self.configure_toplevel_with_current_role(&toplevel);
     }
 
     fn request_mode(&mut self, toplevel: ToplevelSurface, _mode: XdgDecorationMode) {
-        toplevel.with_pending_state(|pending| {
-            pending.decoration_mode = Some(embedded_toplevel_decoration_mode());
-        });
-        let _ = toplevel.send_pending_configure();
+        self.configure_toplevel_with_current_role(&toplevel);
     }
 
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
-        toplevel.with_pending_state(|pending| {
-            pending.decoration_mode = Some(embedded_toplevel_decoration_mode());
-        });
-        let _ = toplevel.send_pending_configure();
+        self.configure_toplevel_with_current_role(&toplevel);
     }
 }
 
