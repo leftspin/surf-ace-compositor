@@ -298,6 +298,13 @@ pub enum OverlayCoordinateSpace {
     SurfaceLogical,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneGeometryCoordinateSpace {
+    #[default]
+    CompositorLogical,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OverlayRegionRequest {
@@ -517,6 +524,16 @@ pub struct RuntimeStatus {
     pub window_width: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_height: Option<i32>,
+    #[serde(default)]
+    pub pane_geometry_coordinate_space: PaneGeometryCoordinateSpace,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_output_width: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_output_height: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_surface_width: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_surface_height: Option<i32>,
     pub redraw_count: u64,
     pub input_event_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -591,6 +608,11 @@ impl Default for RuntimeStatus {
             wayland_socket: None,
             window_width: None,
             window_height: None,
+            pane_geometry_coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+            physical_output_width: None,
+            physical_output_height: None,
+            logical_surface_width: None,
+            logical_surface_height: None,
             redraw_count: 0,
             input_event_count: 0,
             host_seat_name: None,

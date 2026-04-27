@@ -14,6 +14,21 @@ Socket discovery:
 
 The compositor CLI now accepts `SURF_ACE_COMPOSITOR_SOCKET` for `serve`, `ctl`, `rotate`, and `capture`. Top-level `surf-ace-compositor --launch ...` also uses that env var when deciding whether to contact an already-running compositor.
 
+## Geometry Authority
+
+Pane geometry is always in compositor logical surface coordinates. Surf Ace is the pane topology and geometry authority, and the compositor materializes native surfaces into those logical rectangles. Clients must not send physical output-mode dimensions as pane geometry.
+
+Status exposes the coordinate contract explicitly:
+
+- `status.runtime.physical_output_width` / `physical_output_height`: the active output mode or runtime window size before compositor rotation.
+- `status.output_rotation`: the compositor output rotation.
+- `status.runtime.logical_surface_width` / `logical_surface_height`: the rotated compositor surface size that pane geometry must fit.
+- `status.runtime.pane_geometry_coordinate_space`: currently `compositor_logical`.
+
+Example: on Racter with physical mode `3840x2160` and `output_rotation: "deg90"`, the compositor logical surface is `2160x3840`. A single full-screen pane must therefore use `{ "x": 0, "y": 0, "width": 2160, "height": 3840 }`, not `{ "width": 3840, "height": 2160 }`.
+
+When the runtime logical surface is known, `native_pane.host`, `native_pane.update`, and provider snapshots reject pane rectangles that are empty, negative/outside the logical surface, or sized from the unrotated physical mode. Overlay regions also use `surface_logical` coordinates and clamp to the same logical surface bounds.
+
 ## Requests
 
 Host or relaunch pane-native content:

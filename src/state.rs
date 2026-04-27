@@ -3,11 +3,12 @@ use crate::model::{
     MainAppLaunchIntent, MainAppLaunchState, MainAppSurfaceBinding, NativePaneHostRequest,
     NativePaneHostStatus, NativeTargetClass, OutputRotation, OverlayCoordinateSpace, OverlayRect,
     OverlayRegionRequest, OverlayRegionStatus, OverlayRegionUpdateReason, OverlayRegionsStatus,
-    PaneId, PaneRenderMode, PaneStatus, ProcessSpec, ProviderPaneSnapshot, RuntimeBackend,
-    RuntimeDmabufFormatStatus, RuntimeFocusTarget, RuntimeHostPresentOwnership,
-    RuntimeHostQueuedPresentSource, RuntimeHostSelectionState, RuntimePhase, RuntimeSelectionMode,
-    RuntimeStatus, StatusSnapshot, SurfaceBindingEvidence,
+    PaneGeometry, PaneGeometryCoordinateSpace, PaneId, PaneRenderMode, PaneStatus, ProcessSpec,
+    ProviderPaneSnapshot, RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeFocusTarget,
+    RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource, RuntimeHostSelectionState,
+    RuntimePhase, RuntimeSelectionMode, RuntimeStatus, StatusSnapshot, SurfaceBindingEvidence,
 };
+use crate::output_rotation_model::OutputRotationModel;
 use crate::policy::{PrototypeOverlayPolicy, PrototypePolicyError};
 use crate::process_manager::ProcessController;
 use std::collections::{BTreeMap, HashMap};
@@ -86,6 +87,8 @@ pub enum StateError {
     ShellOverlayUnavailable(String),
     #[error("invalid overlay region: {0}")]
     InvalidOverlayRegion(String),
+    #[error("invalid pane geometry: {0}")]
+    InvalidPaneGeometry(String),
     #[error("stale overlay region revision: {incoming} <= {active}")]
     StaleOverlayRegionRevision { incoming: u64, active: u64 },
     #[error("stale overlay topology epoch: {incoming} != {active}")]
@@ -515,11 +518,9 @@ impl CompositorState {
                     region.pane_instance_id, live_instance_id
                 )));
             }
-            let (rect, clamped) = clamp_overlay_rect_to_runtime_bounds(
-                region.rect,
-                self.runtime.window_width,
-                self.runtime.window_height,
-            )?;
+            let (logical_width, logical_height) = self.runtime_logical_surface_size().unzip();
+            let (rect, clamped) =
+                clamp_overlay_rect_to_runtime_bounds(region.rect, logical_width, logical_height)?;
             next_regions.push(OverlayRegionStatus {
                 region_id: region.region_id,
                 pane_id: region.pane_id,
@@ -757,6 +758,10 @@ impl CompositorState {
         &mut self,
         provider_panes: Vec<ProviderPaneSnapshot>,
     ) -> Result<(), StateError> {
+        for pane in &provider_panes {
+            self.validate_pane_geometry_in_compositor_space(&pane.geometry)?;
+        }
+
         self.bump_topology_epoch();
         let mut incoming = HashMap::new();
         for pane in provider_panes {
@@ -880,13 +885,14 @@ impl CompositorState {
         &mut self,
         requests: Vec<NativePaneHostRequest>,
     ) -> Result<(), StateError> {
-        self.bump_topology_epoch();
         for request in &requests {
             if request.process.command.trim().is_empty() {
                 return Err(StateError::InvalidProcessSpec);
             }
+            self.validate_pane_geometry_in_compositor_space(&request.geometry)?;
         }
 
+        self.bump_topology_epoch();
         for request in requests {
             let pane = self
                 .panes
@@ -1394,14 +1400,69 @@ impl CompositorState {
             .collect();
         panes.sort_by(|left, right| left.id.cmp(&right.id));
 
+        let mut runtime = self.runtime.clone();
+        runtime.pane_geometry_coordinate_space = PaneGeometryCoordinateSpace::CompositorLogical;
+        runtime.physical_output_width = runtime.window_width;
+        runtime.physical_output_height = runtime.window_height;
+        if let Some((logical_width, logical_height)) = self.runtime_logical_surface_size() {
+            runtime.logical_surface_width = Some(logical_width);
+            runtime.logical_surface_height = Some(logical_height);
+        } else {
+            runtime.logical_surface_width = None;
+            runtime.logical_surface_height = None;
+        }
+
         StatusSnapshot {
             host_mode_active: self.host_mode_active,
             output_rotation: self.output_rotation,
             panes,
             overlay_regions: self.overlay_regions_status(),
             prototype_policy: self.prototype_overlay_policy.status(),
-            runtime: self.runtime.clone(),
+            runtime,
         }
+    }
+
+    fn runtime_logical_surface_size(&self) -> Option<(i32, i32)> {
+        let width = self.runtime.window_width.filter(|value| *value > 0)?;
+        let height = self.runtime.window_height.filter(|value| *value > 0)?;
+        Some(OutputRotationModel::new(self.output_rotation).logical_size_i32(width, height))
+    }
+
+    fn validate_pane_geometry_in_compositor_space(
+        &self,
+        geometry: &PaneGeometry,
+    ) -> Result<(), StateError> {
+        if geometry.width == 0 || geometry.height == 0 {
+            return Err(StateError::InvalidPaneGeometry(
+                "width and height must be greater than zero".to_string(),
+            ));
+        }
+
+        let Some((logical_width, logical_height)) = self.runtime_logical_surface_size() else {
+            return Ok(());
+        };
+
+        let left = i64::from(geometry.x);
+        let top = i64::from(geometry.y);
+        let right = left + i64::from(geometry.width);
+        let bottom = top + i64::from(geometry.height);
+        if left < 0
+            || top < 0
+            || right > i64::from(logical_width)
+            || bottom > i64::from(logical_height)
+        {
+            return Err(StateError::InvalidPaneGeometry(format!(
+                "pane geometry must be compositor_logical and fit logical surface {}x{}; got x={} y={} width={} height={}",
+                logical_width,
+                logical_height,
+                geometry.x,
+                geometry.y,
+                geometry.width,
+                geometry.height
+            )));
+        }
+
+        Ok(())
     }
 
     fn open_shell_overlay(&mut self) -> Result<(), StateError> {
@@ -2125,6 +2186,118 @@ mod tests {
     }
 
     #[test]
+    fn status_exposes_physical_mode_and_rotated_logical_surface() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            3840,
+            2160,
+        );
+        state.set_output_rotation(OutputRotation::Deg90);
+
+        let runtime = state.status_snapshot().runtime;
+        assert_eq!(
+            runtime.pane_geometry_coordinate_space,
+            PaneGeometryCoordinateSpace::CompositorLogical
+        );
+        assert_eq!(runtime.window_width, Some(3840));
+        assert_eq!(runtime.window_height, Some(2160));
+        assert_eq!(runtime.physical_output_width, Some(3840));
+        assert_eq!(runtime.physical_output_height, Some(2160));
+        assert_eq!(runtime.logical_surface_width, Some(2160));
+        assert_eq!(runtime.logical_surface_height, Some(3840));
+    }
+
+    #[test]
+    fn native_pane_host_rejects_physical_geometry_on_rotated_logical_surface() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            3840,
+            2160,
+        );
+        state.set_output_rotation(OutputRotation::Deg90);
+        let topology_before = state.topology_epoch().to_string();
+
+        let physical_geometry = state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: PaneId::new("full"),
+                content_id: None,
+                binding_id: None,
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 3840,
+                    height: 2160,
+                },
+                target: NativeTargetClass::Terminal,
+                process: terminal_process(),
+            }])
+            .expect_err("physical dimensions must not be accepted as logical pane geometry");
+
+        assert!(matches!(
+            physical_geometry,
+            StateError::InvalidPaneGeometry(message)
+                if message.contains("logical surface 2160x3840")
+        ));
+        assert_eq!(state.topology_epoch(), topology_before);
+        assert!(state.status_snapshot().panes.is_empty());
+
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: PaneId::new("full"),
+                content_id: None,
+                binding_id: None,
+                revision: 2,
+                geometry: PaneGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 2160,
+                    height: 3840,
+                },
+                target: NativeTargetClass::Terminal,
+                process: terminal_process(),
+            }])
+            .expect("logical full-surface pane geometry should apply");
+
+        let status = state.status_snapshot();
+        assert_eq!(status.panes.len(), 1);
+        assert_eq!(status.panes[0].geometry.width, 2160);
+        assert_eq!(status.panes[0].geometry.height, 3840);
+    }
+
+    #[test]
+    fn provider_snapshot_rejects_physical_geometry_when_logical_surface_is_known() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            3840,
+            2160,
+        );
+        state.set_output_rotation(OutputRotation::Deg90);
+        let topology_before = state.topology_epoch().to_string();
+
+        let error = state
+            .apply_provider_snapshot(vec![pane("full", 0, 0, 3840, 2160)])
+            .expect_err("provider geometry must use compositor logical bounds");
+
+        assert!(matches!(
+            error,
+            StateError::InvalidPaneGeometry(message)
+                if message.contains("logical surface 2160x3840")
+        ));
+        assert_eq!(state.topology_epoch(), topology_before);
+        assert!(state.status_snapshot().panes.is_empty());
+    }
+
+    #[test]
     fn native_pane_surface_reconciles_by_launched_pid_and_reports_evidence() {
         let process = FakeProcessController::default();
         let mut state = CompositorState::new(true, Box::new(process));
@@ -2490,6 +2663,77 @@ mod tests {
                 x: 0.0,
                 y: 590.0,
                 width: 800.0,
+                height: 10.0,
+            }
+        );
+        assert!(region.clamped);
+    }
+
+    #[test]
+    fn overlay_regions_clamp_to_rotated_logical_surface_not_physical_mode() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            3840,
+            2160,
+        );
+        state.set_output_rotation(OutputRotation::Deg90);
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: PaneId::new("full"),
+                content_id: None,
+                binding_id: None,
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 2160,
+                    height: 3840,
+                },
+                target: NativeTargetClass::Terminal,
+                process: terminal_process(),
+            }])
+            .expect("logical native pane should apply");
+        state
+            .launch_native_pane_hosts(Vec::new())
+            .expect("native pane should launch");
+        state
+            .mark_external_surface_attached(&PaneId::new("full"))
+            .expect("native pane should attach");
+        let topology_epoch = state.topology_epoch().to_string();
+
+        state
+            .set_overlay_regions(
+                "main-surface".to_string(),
+                None,
+                1,
+                topology_epoch,
+                Some(OverlayRegionUpdateReason::Layout),
+                OverlayCoordinateSpace::SurfaceLogical,
+                vec![overlay_region(
+                    "bottom-right",
+                    "full",
+                    "full:1",
+                    OverlayRect {
+                        x: 2150.0,
+                        y: 3830.0,
+                        width: 100.0,
+                        height: 100.0,
+                    },
+                )],
+            )
+            .expect("overlay region should clamp to logical surface");
+
+        let status = state.status_snapshot();
+        let region = &status.overlay_regions.regions[0];
+        assert_eq!(
+            region.rect,
+            OverlayRect {
+                x: 2150.0,
+                y: 3830.0,
+                width: 10.0,
                 height: 10.0,
             }
         );
