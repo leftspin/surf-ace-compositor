@@ -27,7 +27,7 @@ use smithay::backend::renderer::element::surface::{
     WaylandSurfaceRenderElement, render_elements_from_surface_tree,
 };
 use smithay::backend::renderer::element::{
-    Id, Kind, render_elements, solid::SolidColorRenderElement,
+    Id, Kind, render_elements, solid::SolidColorRenderElement, utils::CropRenderElement,
 };
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{
@@ -4472,6 +4472,7 @@ struct RuntimeWaylandState {
 
 #[derive(Debug, Clone, Copy)]
 enum RenderElementSource {
+    MainOverlayRegion,
     Main,
     MainPopup,
     NativePane,
@@ -4484,6 +4485,7 @@ enum RenderElementSource {
 render_elements! {
     SurfAceRenderElement<=GlesRenderer>;
     Wayland=WaylandSurfaceRenderElement<GlesRenderer>,
+    CroppedWayland=CropRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
     Solid=SolidColorRenderElement,
 }
 
@@ -4519,6 +4521,7 @@ impl RenderElementCapture {
         }
         self.elements.extend(new_elements);
         match source {
+            RenderElementSource::MainOverlayRegion => self.counts.main_overlay_regions += added,
             RenderElementSource::Main => self.counts.main += added,
             RenderElementSource::MainPopup => self.counts.main_popups += added,
             RenderElementSource::NativePane => self.counts.native_panes += added,
@@ -4538,6 +4541,7 @@ impl RenderElementCapture {
 
 #[derive(Default, Debug, Clone, Copy)]
 struct RenderElementCounts {
+    main_overlay_regions: usize,
     main: usize,
     main_popups: usize,
     native_panes: usize,
@@ -5948,6 +5952,7 @@ impl RuntimeWaylandState {
     ) -> RenderElementCapture {
         let mut capture = RenderElementCapture::default();
         let mut main_elements = Vec::new();
+        let mut main_overlay_region_elements = Vec::new();
         let mut main_popup_elements = Vec::new();
         let mut native_pane_elements = Vec::new();
         let mut native_pane_popup_elements = Vec::new();
@@ -5960,6 +5965,13 @@ impl RuntimeWaylandState {
         let main_mapping = self.role_surface_mapping(RuntimeSurfaceRole::MainApp, output_rect);
         let overlay_mapping =
             self.role_surface_mapping(RuntimeSurfaceRole::OverlayNative, self.overlay_rect());
+        let overlay_region_status = {
+            let status = lock_state(&self.shared_state).status_snapshot();
+            (
+                status.runtime.overlay_region_debug_borders,
+                status.overlay_regions.regions,
+            )
+        };
 
         if let Some(main) = &self.main_toplevel {
             if let Some(mapping) = main_mapping {
@@ -5978,6 +5990,14 @@ impl RuntimeWaylandState {
                     Kind::Unspecified,
                 );
                 main_elements.extend(elements);
+                if !overlay_region_status.1.is_empty() {
+                    main_overlay_region_elements.extend(main_overlay_region_render_elements(
+                        renderer,
+                        main.wl_surface(),
+                        mapping,
+                        &overlay_region_status.1,
+                    ));
+                }
             }
         }
 
@@ -6109,13 +6129,9 @@ impl RuntimeWaylandState {
             }
         }
 
-        let debug_border_regions = {
-            let status = lock_state(&self.shared_state).status_snapshot();
-            status
-                .runtime
-                .overlay_region_debug_borders
-                .then_some(status.overlay_regions.regions)
-        };
+        let debug_border_regions = overlay_region_status
+            .0
+            .then_some(overlay_region_status.1.as_slice());
         // Smithay expects top-to-bottom order; otherwise an opaque main surface
         // can cull the overlay before it is drawn. The compositor cursor is
         // drawn in the final output pass so it is not clipped by scene surfaces.
@@ -6124,9 +6140,13 @@ impl RuntimeWaylandState {
         if let Some(regions) = debug_border_regions {
             capture.push_elements(
                 RenderElementSource::OverlayRegionDebug,
-                overlay_region_debug_border_elements(&regions, _output_width, _output_height),
+                overlay_region_debug_border_elements(regions, _output_width, _output_height),
             );
         }
+        capture.push_elements(
+            RenderElementSource::MainOverlayRegion,
+            main_overlay_region_elements,
+        );
         capture.push(
             RenderElementSource::NativePanePopup,
             native_pane_popup_elements,
@@ -6982,6 +7002,45 @@ fn overlay_region_capture_contains(
     })
 }
 
+fn main_overlay_region_render_elements(
+    renderer: &mut GlesRenderer,
+    surface: &WlSurface,
+    mapping: RoleSurfaceMapping,
+    regions: &[OverlayRegionStatus],
+) -> Vec<SurfAceRenderElement> {
+    let mut elements = Vec::new();
+    for region in regions {
+        let mapped_rect = mapping.map_rect(overlay_region_logical_rect(region));
+        let crop_rect = Rectangle::<i32, Physical>::new(
+            (mapped_rect.loc.x, mapped_rect.loc.y).into(),
+            (mapped_rect.size.w, mapped_rect.size.h).into(),
+        );
+        let region_elements = render_elements_from_surface_tree(
+            renderer,
+            surface,
+            mapping.render_element_location(),
+            mapping.render_element_scale(),
+            1.0,
+            Kind::Unspecified,
+        );
+        elements.extend(region_elements.into_iter().filter_map(|element| {
+            CropRenderElement::from_element(element, 1.0, crop_rect).map(SurfAceRenderElement::from)
+        }));
+    }
+    elements
+}
+
+fn overlay_region_logical_rect(region: &OverlayRegionStatus) -> Rectangle<i32, Logical> {
+    Rectangle::new(
+        (region.rect.x.floor() as i32, region.rect.y.floor() as i32).into(),
+        (
+            region.rect.width.ceil().max(1.0) as i32,
+            region.rect.height.ceil().max(1.0) as i32,
+        )
+            .into(),
+    )
+}
+
 fn overlay_region_debug_border_elements(
     regions: &[OverlayRegionStatus],
     output_w: i32,
@@ -7017,10 +7076,11 @@ fn overlay_region_debug_border_rects(
 
     let mut rects = Vec::new();
     for region in regions {
-        let x = region.rect.x.floor() as i32;
-        let y = region.rect.y.floor() as i32;
-        let w = region.rect.width.ceil().max(1.0) as i32;
-        let h = region.rect.height.ceil().max(1.0) as i32;
+        let region_rect = overlay_region_logical_rect(region);
+        let x = region_rect.loc.x;
+        let y = region_rect.loc.y;
+        let w = region_rect.size.w;
+        let h = region_rect.size.h;
         let border = 2.min(w).min(h).max(1);
         let candidates = [
             Rectangle::new((x, y).into(), (w, border).into()),
@@ -7705,6 +7765,54 @@ mod tests {
 
         assert_eq!(primary.len(), debug_count);
         assert!(debug_count > 0);
+    }
+
+    #[test]
+    fn primary_plane_elements_keep_lifted_main_overlay_regions() {
+        let mut capture = super::RenderElementCapture::default();
+        capture.push_elements(
+            super::RenderElementSource::Overlay,
+            super::overlay_region_debug_border_elements(
+                &[test_overlay_region(
+                    "dedicated-overlay",
+                    vec![OverlayCaptureCapability::PointerHover],
+                )],
+                160,
+                100,
+            ),
+        );
+        capture.push_elements(
+            super::RenderElementSource::MainOverlayRegion,
+            super::overlay_region_debug_border_elements(
+                &[test_overlay_region(
+                    "main-overlay",
+                    vec![OverlayCaptureCapability::PointerHover],
+                )],
+                160,
+                100,
+            ),
+        );
+        let lifted_count = capture.counts.main_overlay_regions;
+
+        let primary = capture.primary_plane_elements();
+
+        assert_eq!(primary.len(), lifted_count);
+        assert!(lifted_count > 0);
+    }
+
+    #[test]
+    fn overlay_region_logical_rect_rounds_outward_for_visual_lift_mask() {
+        let mut region =
+            test_overlay_region("main-overlay", vec![OverlayCaptureCapability::PointerHover]);
+        region.rect.x = 10.8;
+        region.rect.y = 20.2;
+        region.rect.width = 30.1;
+        region.rect.height = 40.9;
+
+        let rect = super::overlay_region_logical_rect(&region);
+
+        assert_eq!(rect.loc, (10, 20).into());
+        assert_eq!(rect.size, (31, 41).into());
     }
 
     #[test]
