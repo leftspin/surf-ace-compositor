@@ -6156,6 +6156,8 @@ impl RuntimeWaylandState {
         let debug_border_regions = overlay_region_status
             .0
             .then_some(overlay_region_status.1.as_slice());
+        let logical_output_w = self.runtime_output_width();
+        let logical_output_h = self.runtime_output_height();
         // Smithay expects top-to-bottom order; otherwise an opaque main surface
         // can cull the overlay before it is drawn. The compositor cursor is
         // drawn in the final output pass so it is not clipped by scene surfaces.
@@ -6164,7 +6166,7 @@ impl RuntimeWaylandState {
         if let Some(regions) = debug_border_regions {
             capture.push_elements(
                 RenderElementSource::OverlayRegionDebug,
-                overlay_region_debug_border_elements(regions, _output_width, _output_height),
+                overlay_region_debug_border_elements(regions, logical_output_w, logical_output_h),
             );
         }
         capture.push_elements(
@@ -7636,6 +7638,29 @@ mod tests {
         assert!(rects.contains(&Rectangle::new((10, 68).into(), (100, 2).into())));
         assert!(rects.contains(&Rectangle::new((10, 20).into(), (2, 50).into())));
         assert!(rects.contains(&Rectangle::new((108, 20).into(), (2, 50).into())));
+    }
+
+    #[test]
+    fn overlay_region_debug_borders_use_rotated_logical_surface_bounds() {
+        let mut region = test_overlay_region(
+            "bottom-chrome",
+            vec![OverlayCaptureCapability::PointerHover],
+        );
+        region.rect.x = 466.0;
+        region.rect.y = 3743.0;
+        region.rect.width = 148.0;
+        region.rect.height = 48.0;
+
+        assert!(
+            super::overlay_region_debug_border_rects(&[region.clone()], 3840, 2160).is_empty(),
+            "physical scanout bounds incorrectly clip bottom chrome on deg90"
+        );
+        let rects = super::overlay_region_debug_border_rects(&[region], 2160, 3840);
+
+        assert!(rects.contains(&Rectangle::new((466, 3743).into(), (148, 2).into())));
+        assert!(rects.contains(&Rectangle::new((466, 3789).into(), (148, 2).into())));
+        assert!(rects.contains(&Rectangle::new((466, 3743).into(), (2, 48).into())));
+        assert!(rects.contains(&Rectangle::new((612, 3743).into(), (2, 48).into())));
     }
 
     #[test]
