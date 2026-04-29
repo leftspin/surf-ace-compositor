@@ -4822,8 +4822,30 @@ impl RuntimeWaylandState {
         (width, height).into()
     }
 
+    fn runtime_physical_output_size(&self) -> Size<i32, Physical> {
+        let state = lock_state(&self.shared_state);
+        let width = state
+            .status_snapshot()
+            .runtime
+            .window_width
+            .unwrap_or(1280)
+            .max(1);
+        let height = state
+            .status_snapshot()
+            .runtime
+            .window_height
+            .unwrap_or(800)
+            .max(1);
+        (width, height).into()
+    }
+
     fn new(display_handle: DisplayHandle, shared_state: Arc<Mutex<CompositorState>>) -> Self {
-        let (backend_output_size, applied_output_rotation, shell_overlay_toggle_shortcut) = {
+        let (
+            backend_output_size,
+            initial_pointer_output_size,
+            applied_output_rotation,
+            shell_overlay_toggle_shortcut,
+        ) = {
             let state = lock_state(&shared_state);
             let width = state
                 .status_snapshot()
@@ -4847,9 +4869,13 @@ impl RuntimeWaylandState {
                 parse_shell_overlay_toggle_shortcut("Super+`")
                     .expect("default shell overlay shortcut must remain valid")
             });
+            let applied_output_rotation = state.output_rotation();
+            let (logical_width, logical_height) =
+                OutputRotationModel::new(applied_output_rotation).logical_size_i32(width, height);
             (
                 Size::<i32, Physical>::from((width, height)),
-                state.output_rotation(),
+                Size::<i32, Logical>::from((logical_width, logical_height)),
+                applied_output_rotation,
                 shell_overlay_toggle_shortcut,
             )
         };
@@ -4896,10 +4922,7 @@ impl RuntimeWaylandState {
             native_pane_toplevels: HashMap::new(),
             pending_toplevels: Vec::new(),
             popups: Vec::new(),
-            pointer_location: software_cursor_default_location(Size::<i32, Logical>::from((
-                backend_output_size.w,
-                backend_output_size.h,
-            ))),
+            pointer_location: software_cursor_default_location(initial_pointer_output_size),
             pointer_location_initialized: false,
             start_time: std::time::Instant::now(),
             host_surface_buffers: HashMap::new(),
@@ -5110,10 +5133,11 @@ impl RuntimeWaylandState {
                 }
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
-                let output_w = self.runtime_output_width();
-                let output_h = self.runtime_output_height();
+                let physical_size = self.runtime_physical_output_size();
+                let physical_pos =
+                    event.position_transformed((physical_size.w, physical_size.h).into());
                 let pos = self.update_pointer_location(
-                    event.position_transformed((output_w, output_h).into()),
+                    self.map_physical_pointer_point_to_logical(physical_pos),
                 );
                 let serial = SERIAL_COUNTER.next_serial();
 
@@ -5570,6 +5594,21 @@ impl RuntimeWaylandState {
 
     fn runtime_output_height(&self) -> i32 {
         self.runtime_output_size().h
+    }
+
+    fn map_physical_pointer_point_to_logical(
+        &self,
+        point: Point<f64, Logical>,
+    ) -> Point<f64, Logical> {
+        let physical_size = self.runtime_physical_output_size();
+        let rotation = { lock_state(&self.shared_state).output_rotation() };
+        let (x, y) = OutputRotationModel::new(rotation).physical_point_to_logical(
+            point.x,
+            point.y,
+            physical_size.w,
+            physical_size.h,
+        );
+        (x, y).into()
     }
 
     fn update_pointer_location(&mut self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
@@ -8081,6 +8120,39 @@ mod tests {
 
         assert_eq!(wayland_state.runtime_output_width(), 2160);
         assert_eq!(wayland_state.runtime_output_height(), 3840);
+    }
+
+    #[test]
+    fn runtime_pointer_input_maps_physical_deg90_events_to_logical_surface() {
+        let shared_state = Arc::new(Mutex::new(CompositorState::new(
+            true,
+            Box::new(NoopProcessController),
+        )));
+        {
+            let mut state = match shared_state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.mark_runtime_resize(3840, 2160);
+            state.set_output_rotation(OutputRotation::Deg90);
+        }
+
+        let display: Display<RuntimeWaylandState> =
+            Display::new().expect("test wayland display should initialize");
+        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state);
+
+        assert_eq!(
+            wayland_state.runtime_physical_output_size(),
+            Size::<i32, Physical>::from((3840, 2160))
+        );
+        assert_eq!(
+            wayland_state.pointer_location,
+            Point::<f64, Logical>::from((1080.0, 1920.0))
+        );
+        assert_eq!(
+            wayland_state.map_physical_pointer_point_to_logical((3839.0, 2159.0).into()),
+            Point::<f64, Logical>::from((0.0, 3839.0))
+        );
     }
 
     #[test]

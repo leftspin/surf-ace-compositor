@@ -84,6 +84,29 @@ impl OutputRotationModel {
             (width, height)
         }
     }
+
+    pub fn physical_point_to_logical(
+        self,
+        x: f64,
+        y: f64,
+        physical_width: i32,
+        physical_height: i32,
+    ) -> (f64, f64) {
+        let physical_max_x = (physical_width.max(1) - 1) as f64;
+        let physical_max_y = (physical_height.max(1) - 1) as f64;
+        let x = x.clamp(0.0, physical_max_x);
+        let y = y.clamp(0.0, physical_max_y);
+        let (logical_width, logical_height) =
+            self.logical_size_i32(physical_width, physical_height);
+        let logical_max_x = (logical_width.max(1) - 1) as f64;
+        let logical_max_y = (logical_height.max(1) - 1) as f64;
+        match self.rotation {
+            OutputRotation::Deg0 => (x, y),
+            OutputRotation::Deg180 => (logical_max_x - x, logical_max_y - y),
+            OutputRotation::Deg90 => (logical_max_x - y, x),
+            OutputRotation::Deg270 => (y, logical_max_y - x),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -172,5 +195,34 @@ mod tests {
         assert_eq!(deg270.scene_texture_transform(), Transform::_90);
         assert_eq!(deg270.output_transform(), Transform::_90);
         assert_eq!(deg270.scene_texture_transform(), deg270.output_transform());
+    }
+
+    #[test]
+    fn physical_pointer_points_are_mapped_into_rotated_logical_surface() {
+        let deg90 = OutputRotationModel::new(OutputRotation::Deg90);
+        assert_eq!(
+            deg90.physical_point_to_logical(100.0, 200.0, 3840, 2160),
+            (1959.0, 100.0)
+        );
+        assert_eq!(
+            deg90.physical_point_to_logical(3839.0, 2159.0, 3840, 2160),
+            (0.0, 3839.0)
+        );
+
+        let deg270 = OutputRotationModel::new(OutputRotation::Deg270);
+        assert_eq!(
+            deg270.physical_point_to_logical(100.0, 200.0, 3840, 2160),
+            (200.0, 3739.0)
+        );
+        assert_eq!(
+            deg270.physical_point_to_logical(0.0, 0.0, 3840, 2160),
+            (0.0, 3839.0)
+        );
+
+        let deg180 = OutputRotationModel::new(OutputRotation::Deg180);
+        assert_eq!(
+            deg180.physical_point_to_logical(100.0, 200.0, 3840, 2160),
+            (3739.0, 1959.0)
+        );
     }
 }
