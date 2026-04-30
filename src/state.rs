@@ -504,6 +504,19 @@ impl CompositorState {
             }
         }
 
+        if regions.is_empty() {
+            self.prune_stale_overlay_regions();
+            if let Some(active) = self.overlay_regions.as_mut() {
+                if active.key == key && !active.regions.is_empty() {
+                    active.revision = revision;
+                    active.topology_epoch = self.topology_epoch.clone();
+                    active.update_reason = update_reason;
+                    active.last_updated_at = current_unix_millis();
+                    return Ok(());
+                }
+            }
+        }
+
         let mut next_regions = Vec::with_capacity(regions.len());
         for region in regions {
             validate_overlay_region(&region)?;
@@ -1650,7 +1663,7 @@ impl CompositorState {
             let Some(pane) = self.panes.get(&region.pane_id) else {
                 return false;
             };
-            pane_allows_overlay_regions(pane)
+            pane_retains_overlay_regions(pane)
                 && pane_instance_id(&region.pane_id, pane) == region.pane_instance_id
         });
         if snapshot.regions.is_empty() {
@@ -1877,6 +1890,14 @@ fn pane_allows_overlay_regions(pane: &PaneRuntimeState) -> bool {
         && matches!(
             pane.external_native_state,
             ExternalNativeLifecycleState::Attached { .. }
+        )
+}
+
+fn pane_retains_overlay_regions(pane: &PaneRuntimeState) -> bool {
+    matches!(pane.render_mode, PaneRenderMode::ExternalNative { .. })
+        && matches!(
+            pane.external_native_state,
+            ExternalNativeLifecycleState::Launching { .. } | ExternalNativeLifecycleState::Attached { .. }
         )
 }
 
@@ -3318,45 +3339,320 @@ mod tests {
             .expect("overlay regions should store");
 
         assert!(state.runtime_mark_native_pane_surface_detached_for_pid(1));
-        assert_eq!(state.status_snapshot().overlay_regions.regions.len(), 1);
         assert_eq!(
-            state.status_snapshot().overlay_regions.regions[0].pane_id,
-            PaneId::new("right")
+            state.status_snapshot().overlay_regions.regions.len(),
+            2,
+            "a transiently detached native surface still belongs to the same live binding"
         );
 
         state
             .apply_provider_snapshot(vec![pane("left", 0, 0, 100, 100)])
             .expect("provider snapshot should prune stale right region");
-        assert!(state.status_snapshot().overlay_regions.regions.is_empty());
+        assert_eq!(state.status_snapshot().overlay_regions.regions.len(), 1);
+        assert_eq!(
+            state.status_snapshot().overlay_regions.regions[0].pane_id,
+            PaneId::new("left")
+        );
 
         state
             .mark_external_surface_attached(&PaneId::new("left"))
             .expect("left native surface should reattach");
+        assert_eq!(state.status_snapshot().overlay_regions.regions.len(), 1);
+        state
+            .clear_overlay_regions("main-surface".to_string(), None)
+            .expect("empty clear set should clear all regions");
+        assert!(state.status_snapshot().overlay_regions.regions.is_empty());
+    }
+
+    #[test]
+    fn overlay_regions_survive_release_of_unrelated_native_pane_host() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            3840,
+            2160,
+        );
+        state.set_output_rotation(OutputRotation::Deg90);
+        state
+            .apply_provider_snapshot(vec![pane("1", 0, 0, 2160, 3840)])
+            .expect("provider snapshot should apply");
+        state
+            .apply_native_pane_host_plan(vec![
+                NativePaneHostRequest {
+                    id: PaneId::new("1"),
+                    content_id: Some("target_top_full_41".to_string()),
+                    binding_id: Some("1:target_top_full_41".to_string()),
+                    revision: 1,
+                    geometry: PaneGeometry {
+                        x: 0,
+                        y: 0,
+                        width: 2160,
+                        height: 3840,
+                        coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                    },
+                    target: NativeTargetClass::Terminal,
+                    process: terminal_process(),
+                },
+                NativePaneHostRequest {
+                    id: PaneId::new("top-proof"),
+                    content_id: Some("target-top-proof".to_string()),
+                    binding_id: Some("top-proof:target".to_string()),
+                    revision: 1,
+                    geometry: PaneGeometry {
+                        x: 1080,
+                        y: 0,
+                        width: 1080,
+                        height: 3840,
+                        coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                    },
+                    target: NativeTargetClass::Terminal,
+                    process: terminal_process(),
+                },
+            ])
+            .expect("native pane host plan should apply");
+        state
+            .launch_native_pane_hosts(Vec::new())
+            .expect("native panes should launch");
+        state
+            .mark_external_surface_attached(&PaneId::new("1"))
+            .expect("full-screen top should attach");
+        state
+            .mark_external_surface_attached(&PaneId::new("top-proof"))
+            .expect("proof pane should attach");
+
         let topology_epoch = state.topology_epoch().to_string();
         state
             .set_overlay_regions(
                 "main-surface".to_string(),
-                None,
-                1,
+                Some("main-window".to_string()),
+                8,
                 topology_epoch,
-                None,
+                Some(OverlayRegionUpdateReason::Layout),
+                OverlayCoordinateSpace::SurfaceLogical,
+                vec![
+                    overlay_region(
+                        "top-focus-edge",
+                        "1",
+                        "1:target_top_full_41",
+                        OverlayRect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 2160.0,
+                            height: 2.0,
+                        },
+                    ),
+                    overlay_region(
+                        "top-handle",
+                        "1",
+                        "1:target_top_full_41",
+                        OverlayRect {
+                            x: 1049.0,
+                            y: 3724.0,
+                            width: 62.0,
+                            height: 62.0,
+                        },
+                    ),
+                ],
+            )
+            .expect("overlay regions should store for live full-screen top");
+
+        state
+            .release_native_pane_hosts(vec![PaneId::new("top-proof")])
+            .expect("unrelated proof pane should release");
+
+        let status = state.status_snapshot();
+        assert_eq!(status.panes.len(), 1);
+        assert_eq!(status.panes[0].id, PaneId::new("1"));
+        assert_eq!(
+            status.panes[0]
+                .native_host
+                .as_ref()
+                .and_then(|host| host.binding_id.as_deref()),
+            Some("1:target_top_full_41")
+        );
+        assert!(matches!(
+            status.panes[0].external_native_state,
+            ExternalNativeLifecycleState::Attached { .. }
+        ));
+        assert_eq!(
+            status.overlay_regions.region_count, 2,
+            "release of an unrelated native pane must not clear overlays for a still-live binding"
+        );
+        assert!(status
+            .overlay_regions
+            .regions
+            .iter()
+            .all(|region| region.pane_instance_id == "1:target_top_full_41"));
+    }
+
+    #[test]
+    fn overlay_regions_survive_later_host_plan_for_unrelated_native_pane() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            3840,
+            2160,
+        );
+        state.set_output_rotation(OutputRotation::Deg90);
+        state
+            .apply_provider_snapshot(vec![pane("1", 0, 0, 2160, 3840)])
+            .expect("provider snapshot should apply");
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: PaneId::new("1"),
+                content_id: Some("target_top_full_41".to_string()),
+                binding_id: Some("1:target_top_full_41".to_string()),
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 2160,
+                    height: 3840,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+                target: NativeTargetClass::Terminal,
+                process: terminal_process(),
+            }])
+            .expect("full-screen native pane host plan should apply");
+        state
+            .launch_native_pane_hosts(Vec::new())
+            .expect("full-screen native pane should launch");
+        state
+            .mark_external_surface_attached(&PaneId::new("1"))
+            .expect("full-screen native pane should attach");
+        let topology_epoch = state.topology_epoch().to_string();
+        state
+            .set_overlay_regions(
+                "main-surface".to_string(),
+                Some("main-window".to_string()),
+                8,
+                topology_epoch,
+                Some(OverlayRegionUpdateReason::Layout),
                 OverlayCoordinateSpace::SurfaceLogical,
                 vec![overlay_region(
-                    "left-badge",
-                    "left",
-                    "left:0",
+                    "top-handle",
+                    "1",
+                    "1:target_top_full_41",
                     OverlayRect {
-                        x: 0.0,
-                        y: 0.0,
-                        width: 100.0,
-                        height: 100.0,
+                        x: 1049.0,
+                        y: 3724.0,
+                        width: 62.0,
+                        height: 62.0,
                     },
                 )],
             )
-            .expect("overlay region should store again");
+            .expect("overlay region should store for live full-screen top");
+
         state
-            .clear_overlay_regions("main-surface".to_string(), None)
-            .expect("empty clear set should clear all regions");
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: PaneId::new("top-proof"),
+                content_id: Some("target-top-proof".to_string()),
+                binding_id: Some("top-proof:target".to_string()),
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 1080,
+                    y: 0,
+                    width: 1080,
+                    height: 3840,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+                target: NativeTargetClass::Terminal,
+                process: terminal_process(),
+            }])
+            .expect("later proof host plan should apply");
+
+        let status = state.status_snapshot();
+        assert_eq!(status.overlay_regions.region_count, 1);
+        assert_eq!(
+            status.overlay_regions.regions[0].pane_instance_id,
+            "1:target_top_full_41"
+        );
+    }
+
+    #[test]
+    fn empty_overlay_region_update_does_not_clear_still_live_native_binding() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            3840,
+            2160,
+        );
+        state.set_output_rotation(OutputRotation::Deg90);
+        state
+            .apply_provider_snapshot(vec![pane("1", 0, 0, 2160, 3840)])
+            .expect("provider snapshot should apply");
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: PaneId::new("1"),
+                content_id: Some("target_top_full_41".to_string()),
+                binding_id: Some("1:target_top_full_41".to_string()),
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 2160,
+                    height: 3840,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+                target: NativeTargetClass::Terminal,
+                process: terminal_process(),
+            }])
+            .expect("full-screen native pane host plan should apply");
+        state
+            .launch_native_pane_hosts(Vec::new())
+            .expect("full-screen native pane should launch");
+        state
+            .mark_external_surface_attached(&PaneId::new("1"))
+            .expect("full-screen native pane should attach");
+        let topology_epoch = state.topology_epoch().to_string();
+        state
+            .set_overlay_regions(
+                "main-surface".to_string(),
+                Some("main-window".to_string()),
+                8,
+                topology_epoch.clone(),
+                Some(OverlayRegionUpdateReason::Layout),
+                OverlayCoordinateSpace::SurfaceLogical,
+                vec![overlay_region(
+                    "top-handle",
+                    "1",
+                    "1:target_top_full_41",
+                    OverlayRect {
+                        x: 1049.0,
+                        y: 3724.0,
+                        width: 62.0,
+                        height: 62.0,
+                    },
+                )],
+            )
+            .expect("overlay region should store for live full-screen top");
+
+        state
+            .set_overlay_regions(
+                "main-surface".to_string(),
+                Some("main-window".to_string()),
+                9,
+                topology_epoch,
+                Some(OverlayRegionUpdateReason::Layout),
+                OverlayCoordinateSpace::SurfaceLogical,
+                Vec::new(),
+            )
+            .expect("empty renderer update should be accepted without dropping live overlays");
+
+        let status = state.status_snapshot().overlay_regions;
+        assert_eq!(status.active_revision, Some(9));
+        assert_eq!(status.region_count, 1);
+        assert_eq!(status.regions[0].pane_instance_id, "1:target_top_full_41");
+
+        state
+            .clear_overlay_regions("main-surface".to_string(), Some("main-window".to_string()))
+            .expect("explicit clear remains the release mechanism");
         assert!(state.status_snapshot().overlay_regions.regions.is_empty());
     }
 
