@@ -188,7 +188,12 @@ impl CompositorState {
     }
 
     pub fn set_output_rotation(&mut self, rotation: OutputRotation) {
+        if self.output_rotation == rotation {
+            return;
+        }
+        let previous_rotation = self.output_rotation;
         self.output_rotation = rotation;
+        self.rotate_native_pane_viewports(previous_rotation, rotation);
     }
 
     pub fn output_rotation(&self) -> OutputRotation {
@@ -1473,6 +1478,38 @@ impl CompositorState {
         Ok(())
     }
 
+    fn rotate_native_pane_viewports(&mut self, previous: OutputRotation, next: OutputRotation) {
+        let Some(physical_width) = self.runtime.window_width.filter(|value| *value > 0) else {
+            return;
+        };
+        let Some(physical_height) = self.runtime.window_height.filter(|value| *value > 0) else {
+            return;
+        };
+
+        let mut changed = false;
+        for pane in self.panes.values_mut() {
+            if !matches!(pane.render_mode, PaneRenderMode::ExternalNative { .. }) {
+                continue;
+            }
+            if let Some(rotated) = rotate_pane_geometry_between_output_rotations(
+                pane.geometry,
+                previous,
+                next,
+                physical_width,
+                physical_height,
+            ) {
+                if rotated != pane.geometry {
+                    pane.geometry = rotated;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.bump_topology_epoch();
+            self.prune_stale_overlay_regions();
+        }
+    }
+
     fn open_shell_overlay(&mut self) -> Result<(), StateError> {
         let process = self.shell_overlay_process.clone().ok_or_else(|| {
             StateError::ShellOverlayUnavailable(
@@ -1730,6 +1767,109 @@ fn clamp_overlay_rect_to_runtime_bounds(
         },
         clamped,
     ))
+}
+
+fn rotate_pane_geometry_between_output_rotations(
+    geometry: PaneGeometry,
+    previous: OutputRotation,
+    next: OutputRotation,
+    physical_width: i32,
+    physical_height: i32,
+) -> Option<PaneGeometry> {
+    if previous == next || physical_width <= 0 || physical_height <= 0 {
+        return Some(geometry);
+    }
+    if geometry.width == 0 || geometry.height == 0 {
+        return None;
+    }
+
+    let left = f64::from(geometry.x);
+    let top = f64::from(geometry.y);
+    let right = left + f64::from(geometry.width);
+    let bottom = top + f64::from(geometry.height);
+    let corners = [(left, top), (right, top), (left, bottom), (right, bottom)];
+    let mapped: Vec<(f64, f64)> = corners
+        .into_iter()
+        .map(|point| logical_point_to_physical(point, previous, physical_width, physical_height))
+        .map(|point| physical_point_to_logical(point, next, physical_width, physical_height))
+        .collect();
+
+    let min_x = mapped
+        .iter()
+        .map(|(x, _)| *x)
+        .fold(f64::INFINITY, f64::min)
+        .floor();
+    let min_y = mapped
+        .iter()
+        .map(|(_, y)| *y)
+        .fold(f64::INFINITY, f64::min)
+        .floor();
+    let max_x = mapped
+        .iter()
+        .map(|(x, _)| *x)
+        .fold(f64::NEG_INFINITY, f64::max)
+        .ceil();
+    let max_y = mapped
+        .iter()
+        .map(|(_, y)| *y)
+        .fold(f64::NEG_INFINITY, f64::max)
+        .ceil();
+
+    let (logical_width, logical_height) =
+        OutputRotationModel::new(next).logical_size_i32(physical_width, physical_height);
+    let clamped_left = min_x.clamp(0.0, f64::from(logical_width.max(1)));
+    let clamped_top = min_y.clamp(0.0, f64::from(logical_height.max(1)));
+    let clamped_right = max_x.clamp(clamped_left, f64::from(logical_width.max(1)));
+    let clamped_bottom = max_y.clamp(clamped_top, f64::from(logical_height.max(1)));
+    let width = (clamped_right - clamped_left).round() as u32;
+    let height = (clamped_bottom - clamped_top).round() as u32;
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    Some(PaneGeometry {
+        x: clamped_left.round() as i32,
+        y: clamped_top.round() as i32,
+        width,
+        height,
+        coordinate_space: geometry.coordinate_space,
+    })
+}
+
+fn logical_point_to_physical(
+    point: (f64, f64),
+    rotation: OutputRotation,
+    physical_width: i32,
+    physical_height: i32,
+) -> (f64, f64) {
+    let (x, y) = point;
+    match rotation {
+        OutputRotation::Deg0 => (x, y),
+        OutputRotation::Deg180 => (
+            f64::from(physical_width) - x,
+            f64::from(physical_height) - y,
+        ),
+        OutputRotation::Deg90 => (y, f64::from(physical_height) - x),
+        OutputRotation::Deg270 => (f64::from(physical_width) - y, x),
+    }
+}
+
+fn physical_point_to_logical(
+    point: (f64, f64),
+    rotation: OutputRotation,
+    physical_width: i32,
+    physical_height: i32,
+) -> (f64, f64) {
+    let (x, y) = point;
+    match rotation {
+        OutputRotation::Deg0 => (x, y),
+        OutputRotation::Deg180 => (
+            f64::from(physical_width) - x,
+            f64::from(physical_height) - y,
+        ),
+        OutputRotation::Deg90 => (f64::from(physical_height) - y, x),
+        OutputRotation::Deg270 => (y, f64::from(physical_width) - x),
+    }
 }
 
 fn pane_allows_overlay_regions(pane: &PaneRuntimeState) -> bool {
@@ -2287,6 +2427,72 @@ mod tests {
         assert_eq!(
             status.panes[0].geometry.coordinate_space,
             PaneGeometryCoordinateSpace::CompositorLogical
+        );
+    }
+
+    #[test]
+    fn rotation_resizes_live_native_panes_to_rotated_viewports() {
+        let process = FakeProcessController::default();
+        let process_probe = process.clone();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            3840,
+            2160,
+        );
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: PaneId::new("top"),
+                content_id: Some("target-top".to_string()),
+                binding_id: Some("top:target-top".to_string()),
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 3840,
+                    height: 1080,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+                target: NativeTargetClass::Terminal,
+                process: terminal_process(),
+            }])
+            .expect("native pane should fit before rotation");
+        state
+            .launch_native_pane_hosts(Vec::new())
+            .expect("native pane should launch before rotation");
+
+        let before = state.status_snapshot();
+        assert_eq!(before.panes.len(), 1);
+        let pid = match before.panes[0].external_native_state {
+            ExternalNativeLifecycleState::Launching { pid } => pid,
+            ref other => panic!("expected launched native pane, got {other:?}"),
+        };
+
+        state.set_output_rotation(OutputRotation::Deg90);
+
+        let after = state.status_snapshot();
+        assert_eq!(after.runtime.logical_surface_width, Some(2160));
+        assert_eq!(after.runtime.logical_surface_height, Some(3840));
+        assert_eq!(after.panes.len(), 1);
+        assert_eq!(after.panes[0].id, PaneId::new("top"));
+        assert_eq!(
+            after.panes[0].geometry,
+            PaneGeometry {
+                x: 1080,
+                y: 0,
+                width: 1080,
+                height: 3840,
+                coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+            }
+        );
+        assert_eq!(
+            after.panes[0].external_native_state,
+            ExternalNativeLifecycleState::Launching { pid }
+        );
+        assert!(
+            process_probe.terminated().is_empty(),
+            "rotation must resize/reconfigure without dropping the native process"
         );
     }
 
