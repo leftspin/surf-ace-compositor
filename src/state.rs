@@ -1897,7 +1897,8 @@ fn pane_retains_overlay_regions(pane: &PaneRuntimeState) -> bool {
     matches!(pane.render_mode, PaneRenderMode::ExternalNative { .. })
         && matches!(
             pane.external_native_state,
-            ExternalNativeLifecycleState::Launching { .. } | ExternalNativeLifecycleState::Attached { .. }
+            ExternalNativeLifecycleState::Launching { .. }
+                | ExternalNativeLifecycleState::Attached { .. }
         )
 }
 
@@ -3480,11 +3481,13 @@ mod tests {
             status.overlay_regions.region_count, 2,
             "release of an unrelated native pane must not clear overlays for a still-live binding"
         );
-        assert!(status
-            .overlay_regions
-            .regions
-            .iter()
-            .all(|region| region.pane_instance_id == "1:target_top_full_41"));
+        assert!(
+            status
+                .overlay_regions
+                .regions
+                .iter()
+                .all(|region| region.pane_instance_id == "1:target_top_full_41")
+        );
     }
 
     #[test]

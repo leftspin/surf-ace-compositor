@@ -107,6 +107,15 @@ impl OutputRotationModel {
             OutputRotation::Deg270 => (y, logical_max_y - x),
         }
     }
+
+    pub const fn physical_delta_to_logical(self, dx: f64, dy: f64) -> (f64, f64) {
+        match self.rotation {
+            OutputRotation::Deg0 => (dx, dy),
+            OutputRotation::Deg180 => (-dx, -dy),
+            OutputRotation::Deg90 => (dx, dy),
+            OutputRotation::Deg270 => (-dy, dx),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -223,6 +232,26 @@ mod tests {
         assert_eq!(
             deg180.physical_point_to_logical(100.0, 200.0, 3840, 2160),
             (3739.0, 1959.0)
+        );
+    }
+
+    #[test]
+    fn physical_pointer_deltas_are_mapped_into_rotated_logical_axes() {
+        assert_eq!(
+            OutputRotationModel::new(OutputRotation::Deg0).physical_delta_to_logical(10.0, -4.0),
+            (10.0, -4.0)
+        );
+        assert_eq!(
+            OutputRotationModel::new(OutputRotation::Deg90).physical_delta_to_logical(10.0, -4.0),
+            (10.0, -4.0)
+        );
+        assert_eq!(
+            OutputRotationModel::new(OutputRotation::Deg180).physical_delta_to_logical(10.0, -4.0),
+            (-10.0, 4.0)
+        );
+        assert_eq!(
+            OutputRotationModel::new(OutputRotation::Deg270).physical_delta_to_logical(10.0, -4.0),
+            (4.0, 10.0)
         );
     }
 }

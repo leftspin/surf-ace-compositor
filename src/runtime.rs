@@ -5108,12 +5108,11 @@ impl RuntimeWaylandState {
             }
             InputEvent::PointerMotion { event, .. } => {
                 let delta = event.delta();
+                let rotation = { lock_state(&self.shared_state).output_rotation() };
+                let (dx, dy) =
+                    OutputRotationModel::new(rotation).physical_delta_to_logical(delta.x, delta.y);
                 let pos = self.update_pointer_location(
-                    (
-                        self.pointer_location.x + delta.x,
-                        self.pointer_location.y + delta.y,
-                    )
-                        .into(),
+                    (self.pointer_location.x + dx, self.pointer_location.y + dy).into(),
                 );
                 let serial = SERIAL_COUNTER.next_serial();
 
@@ -5678,12 +5677,11 @@ impl RuntimeWaylandState {
             && pos.y < (overlay_rect.loc.y + overlay_rect.size.h) as f64;
         if overlay_hit {
             if let Some(overlay) = &self.overlay_toplevel {
-                let local_pos = (
-                    pos.x - overlay_rect.loc.x as f64,
-                    pos.y - overlay_rect.loc.y as f64,
-                )
-                    .into();
-                return Some((overlay.wl_surface().clone(), local_pos));
+                let surface_origin = self
+                    .role_surface_mapping(RuntimeSurfaceRole::OverlayNative, overlay_rect)
+                    .map(|mapping| mapping.origin)
+                    .unwrap_or_else(|| overlay_rect.loc.to_f64());
+                return Some((overlay.wl_surface().clone(), surface_origin));
             }
         }
 
@@ -5692,7 +5690,15 @@ impl RuntimeWaylandState {
             .overlay_regions;
         if overlay_region_capture_contains(&overlay_regions.regions, pos, capture) {
             if let Some(main) = &self.main_toplevel {
-                return Some((main.wl_surface().clone(), pos));
+                let output_rect = Rectangle::new(
+                    (0, 0).into(),
+                    (self.runtime_output_width(), self.runtime_output_height()).into(),
+                );
+                let surface_origin = self
+                    .role_surface_mapping(RuntimeSurfaceRole::MainApp, output_rect)
+                    .map(|mapping| mapping.origin)
+                    .unwrap_or_else(|| Point::<f64, Logical>::from((0.0, 0.0)));
+                return Some((main.wl_surface().clone(), surface_origin));
             }
         }
 
@@ -5705,13 +5711,24 @@ impl RuntimeWaylandState {
                 && pos.y >= rect.loc.y as f64
                 && pos.y < (rect.loc.y + rect.size.h) as f64;
             if hit {
-                let local_pos = (pos.x - rect.loc.x as f64, pos.y - rect.loc.y as f64).into();
-                return Some((native.wl_surface().clone(), local_pos));
+                let surface_origin = self
+                    .role_surface_mapping(RuntimeSurfaceRole::NativePane(pane_id.clone()), rect)
+                    .map(|mapping| mapping.origin)
+                    .unwrap_or_else(|| rect.loc.to_f64());
+                return Some((native.wl_surface().clone(), surface_origin));
             }
         }
-        self.main_toplevel
-            .as_ref()
-            .map(|main| (main.wl_surface().clone(), pos))
+        self.main_toplevel.as_ref().map(|main| {
+            let output_rect = Rectangle::new(
+                (0, 0).into(),
+                (self.runtime_output_width(), self.runtime_output_height()).into(),
+            );
+            let surface_origin = self
+                .role_surface_mapping(RuntimeSurfaceRole::MainApp, output_rect)
+                .map(|mapping| mapping.origin)
+                .unwrap_or_else(|| Point::<f64, Logical>::from((0.0, 0.0)));
+            (main.wl_surface().clone(), surface_origin)
+        })
     }
 
     fn popup_owner_role(&self, popup: &PopupSurface) -> Option<RuntimeSurfaceRole> {
@@ -8391,6 +8408,29 @@ mod tests {
         assert_eq!(
             mapping.map_rect(Rectangle::new((40, 20).into(), (80, 40).into())),
             Rectangle::<i32, Logical>::new((0, 0).into(), (3840, 2160).into())
+        );
+    }
+
+    #[test]
+    fn role_surface_mapping_exposes_global_surface_origin_for_pointer_focus() {
+        let mapping = RoleSurfaceMapping::new(
+            Rectangle::<i32, Logical>::new((0, 0).into(), (640, 480).into()),
+            Rectangle::<i32, Logical>::new((0, 1920).into(), (2160, 1920).into()),
+        );
+
+        assert_eq!(mapping.origin, Point::<f64, Logical>::from((0.0, 1920.0)));
+    }
+
+    #[test]
+    fn role_surface_mapping_offsets_global_surface_origin_for_source_geometry() {
+        let mapping = RoleSurfaceMapping::new(
+            Rectangle::<i32, Logical>::new((40, 20).into(), (80, 40).into()),
+            Rectangle::<i32, Logical>::new((0, 0).into(), (800, 400).into()),
+        );
+
+        assert_eq!(
+            mapping.origin,
+            Point::<f64, Logical>::from((-400.0, -200.0))
         );
     }
 
