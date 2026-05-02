@@ -4637,9 +4637,8 @@ fn source_rect_from_bbox_and_geometry(
     geometry: Option<Rectangle<i32, Logical>>,
 ) -> Rectangle<i32, Logical> {
     match geometry.filter(|geo| geo.size.w > 0 && geo.size.h > 0) {
-        Some(geo) if bbox.size.w <= 0 || bbox.size.h <= 0 => geo,
-        Some(geo) if bbox.contains_rect(geo) => geo,
-        Some(_) | None => bbox,
+        Some(geo) => geo,
+        None => bbox,
     }
 }
 
@@ -4783,6 +4782,24 @@ impl RoleSurfaceMapping {
             self.map_point(source_rect.loc),
             self.map_point(source_rect.loc + source_rect.size),
         )
+    }
+
+    fn unmap_target_point(self, target_point: Point<f64, Logical>) -> Point<f64, Logical> {
+        let scale_x = if self.scale.x.abs() <= f64::EPSILON {
+            1.0
+        } else {
+            self.scale.x
+        };
+        let scale_y = if self.scale.y.abs() <= f64::EPSILON {
+            1.0
+        } else {
+            self.scale.y
+        };
+        (
+            (target_point.x - self.origin.x) / scale_x,
+            (target_point.y - self.origin.y) / scale_y,
+        )
+            .into()
     }
 
     fn render_element_location(self) -> Point<i32, Physical> {
@@ -5162,6 +5179,15 @@ impl RuntimeWaylandState {
                         let surface_under = self.surface_under_point_for_capture(
                             self.pointer_location,
                             OverlayCaptureCapability::PointerButton,
+                        );
+                        pointer.motion(
+                            self,
+                            surface_under.clone(),
+                            &MotionEvent {
+                                location: self.pointer_location,
+                                serial,
+                                time: event.time_msec(),
+                            },
                         );
                         let focus_target =
                             surface_under.as_ref().map(|(surface, _)| surface.clone());
@@ -5677,11 +5703,17 @@ impl RuntimeWaylandState {
             && pos.y < (overlay_rect.loc.y + overlay_rect.size.h) as f64;
         if overlay_hit {
             if let Some(overlay) = &self.overlay_toplevel {
-                let surface_origin = self
+                let local_pos = self
                     .role_surface_mapping(RuntimeSurfaceRole::OverlayNative, overlay_rect)
-                    .map(|mapping| mapping.origin)
-                    .unwrap_or_else(|| overlay_rect.loc.to_f64());
-                return Some((overlay.wl_surface().clone(), surface_origin));
+                    .map(|mapping| mapping.unmap_target_point(pos))
+                    .unwrap_or_else(|| {
+                        (
+                            pos.x - overlay_rect.loc.x as f64,
+                            pos.y - overlay_rect.loc.y as f64,
+                        )
+                            .into()
+                    });
+                return Some((overlay.wl_surface().clone(), local_pos));
             }
         }
 
@@ -5694,11 +5726,11 @@ impl RuntimeWaylandState {
                     (0, 0).into(),
                     (self.runtime_output_width(), self.runtime_output_height()).into(),
                 );
-                let surface_origin = self
+                let local_pos = self
                     .role_surface_mapping(RuntimeSurfaceRole::MainApp, output_rect)
-                    .map(|mapping| mapping.origin)
-                    .unwrap_or_else(|| Point::<f64, Logical>::from((0.0, 0.0)));
-                return Some((main.wl_surface().clone(), surface_origin));
+                    .map(|mapping| mapping.unmap_target_point(pos))
+                    .unwrap_or(pos);
+                return Some((main.wl_surface().clone(), local_pos));
             }
         }
 
@@ -5711,11 +5743,13 @@ impl RuntimeWaylandState {
                 && pos.y >= rect.loc.y as f64
                 && pos.y < (rect.loc.y + rect.size.h) as f64;
             if hit {
-                let surface_origin = self
+                let local_pos = self
                     .role_surface_mapping(RuntimeSurfaceRole::NativePane(pane_id.clone()), rect)
-                    .map(|mapping| mapping.origin)
-                    .unwrap_or_else(|| rect.loc.to_f64());
-                return Some((native.wl_surface().clone(), surface_origin));
+                    .map(|mapping| mapping.unmap_target_point(pos))
+                    .unwrap_or_else(|| {
+                        (pos.x - rect.loc.x as f64, pos.y - rect.loc.y as f64).into()
+                    });
+                return Some((native.wl_surface().clone(), local_pos));
             }
         }
         self.main_toplevel.as_ref().map(|main| {
@@ -5723,11 +5757,11 @@ impl RuntimeWaylandState {
                 (0, 0).into(),
                 (self.runtime_output_width(), self.runtime_output_height()).into(),
             );
-            let surface_origin = self
+            let local_pos = self
                 .role_surface_mapping(RuntimeSurfaceRole::MainApp, output_rect)
-                .map(|mapping| mapping.origin)
-                .unwrap_or_else(|| Point::<f64, Logical>::from((0.0, 0.0)));
-            (main.wl_surface().clone(), surface_origin)
+                .map(|mapping| mapping.unmap_target_point(pos))
+                .unwrap_or(pos);
+            (main.wl_surface().clone(), local_pos)
         })
     }
 
@@ -8422,6 +8456,32 @@ mod tests {
     }
 
     #[test]
+    fn role_surface_mapping_unmaps_target_point_back_into_surface_space() {
+        let mapping = RoleSurfaceMapping::new(
+            Rectangle::<i32, Logical>::new((0, 0).into(), (640, 480).into()),
+            Rectangle::<i32, Logical>::new((0, 1920).into(), (2160, 1920).into()),
+        );
+
+        assert_eq!(
+            mapping.unmap_target_point(Point::<f64, Logical>::from((1080.0, 2880.0))),
+            Point::<f64, Logical>::from((320.0, 240.0))
+        );
+    }
+
+    #[test]
+    fn role_surface_mapping_unmaps_target_point_with_source_geometry_offset() {
+        let mapping = RoleSurfaceMapping::new(
+            Rectangle::<i32, Logical>::new((40, 20).into(), (80, 40).into()),
+            Rectangle::<i32, Logical>::new((0, 0).into(), (800, 400).into()),
+        );
+
+        assert_eq!(
+            mapping.unmap_target_point(Point::<f64, Logical>::from((400.0, 200.0))),
+            Point::<f64, Logical>::from((80.0, 40.0))
+        );
+    }
+
+    #[test]
     fn role_surface_mapping_offsets_global_surface_origin_for_source_geometry() {
         let mapping = RoleSurfaceMapping::new(
             Rectangle::<i32, Logical>::new((40, 20).into(), (80, 40).into()),
@@ -8475,13 +8535,13 @@ mod tests {
     }
 
     #[test]
-    fn source_rect_falls_back_to_renderer_bbox_when_geometry_exceeds_committed_content() {
-        let bbox = Rectangle::<i32, Logical>::new((-32, -16).into(), (864, 632).into());
-        let geometry = Rectangle::<i32, Logical>::new((0, 0).into(), (3840, 2160).into());
+    fn source_rect_prefers_committed_geometry_even_when_renderer_bbox_grows_beyond_it() {
+        let bbox = Rectangle::<i32, Logical>::new((-32, -16).into(), (864, 1264).into());
+        let geometry = Rectangle::<i32, Logical>::new((0, 0).into(), (800, 600).into());
 
         assert_eq!(
             source_rect_from_bbox_and_geometry(bbox, Some(geometry)),
-            bbox
+            geometry
         );
     }
 
