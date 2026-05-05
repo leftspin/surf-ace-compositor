@@ -112,8 +112,8 @@ impl OutputRotationModel {
         match self.rotation {
             OutputRotation::Deg0 => (dx, dy),
             OutputRotation::Deg180 => (-dx, -dy),
-            OutputRotation::Deg90 => (dx, dy),
-            OutputRotation::Deg270 => (-dy, dx),
+            OutputRotation::Deg90 => (-dy, dx),
+            OutputRotation::Deg270 => (dy, -dx),
         }
     }
 }
@@ -174,6 +174,26 @@ mod tests {
             CapturePixelRotation::Rotate90Counterclockwise
         );
         assert!(!deg270.capture_src_flipped(true));
+    }
+
+    #[test]
+    fn physical_pointer_deltas_match_physical_point_derivatives() {
+        assert_eq!(
+            OutputRotationModel::new(OutputRotation::Deg0).physical_delta_to_logical(7.0, 11.0),
+            (7.0, 11.0)
+        );
+        assert_eq!(
+            OutputRotationModel::new(OutputRotation::Deg90).physical_delta_to_logical(7.0, 11.0),
+            (-11.0, 7.0)
+        );
+        assert_eq!(
+            OutputRotationModel::new(OutputRotation::Deg180).physical_delta_to_logical(7.0, 11.0),
+            (-7.0, -11.0)
+        );
+        assert_eq!(
+            OutputRotationModel::new(OutputRotation::Deg270).physical_delta_to_logical(7.0, 11.0),
+            (11.0, -7.0)
+        );
     }
 
     #[test]
@@ -243,7 +263,7 @@ mod tests {
         );
         assert_eq!(
             OutputRotationModel::new(OutputRotation::Deg90).physical_delta_to_logical(10.0, -4.0),
-            (10.0, -4.0)
+            (4.0, 10.0)
         );
         assert_eq!(
             OutputRotationModel::new(OutputRotation::Deg180).physical_delta_to_logical(10.0, -4.0),
@@ -251,7 +271,7 @@ mod tests {
         );
         assert_eq!(
             OutputRotationModel::new(OutputRotation::Deg270).physical_delta_to_logical(10.0, -4.0),
-            (4.0, 10.0)
+            (-4.0, -10.0)
         );
     }
 }
