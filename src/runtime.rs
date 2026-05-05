@@ -4784,22 +4784,8 @@ impl RoleSurfaceMapping {
         )
     }
 
-    fn unmap_target_point(self, target_point: Point<f64, Logical>) -> Point<f64, Logical> {
-        let scale_x = if self.scale.x.abs() <= f64::EPSILON {
-            1.0
-        } else {
-            self.scale.x
-        };
-        let scale_y = if self.scale.y.abs() <= f64::EPSILON {
-            1.0
-        } else {
-            self.scale.y
-        };
-        (
-            (target_point.x - self.origin.x) / scale_x,
-            (target_point.y - self.origin.y) / scale_y,
-        )
-            .into()
+    fn focus_origin(self) -> Point<f64, Logical> {
+        self.origin
     }
 
     fn render_element_location(self) -> Point<i32, Physical> {
@@ -5687,12 +5673,10 @@ impl RuntimeWaylandState {
                 && pos.y >= popup_geometry.loc.y as f64
                 && pos.y < (popup_geometry.loc.y + popup_geometry.size.h) as f64;
             if hit {
-                let local_pos = (
-                    pos.x - popup_geometry.loc.x as f64,
-                    pos.y - popup_geometry.loc.y as f64,
-                )
-                    .into();
-                return Some((popup.surface.wl_surface().clone(), local_pos));
+                return Some((
+                    popup.surface.wl_surface().clone(),
+                    popup_geometry.loc.to_f64(),
+                ));
             }
         }
 
@@ -5703,17 +5687,11 @@ impl RuntimeWaylandState {
             && pos.y < (overlay_rect.loc.y + overlay_rect.size.h) as f64;
         if overlay_hit {
             if let Some(overlay) = &self.overlay_toplevel {
-                let local_pos = self
+                let focus_origin = self
                     .role_surface_mapping(RuntimeSurfaceRole::OverlayNative, overlay_rect)
-                    .map(|mapping| mapping.unmap_target_point(pos))
-                    .unwrap_or_else(|| {
-                        (
-                            pos.x - overlay_rect.loc.x as f64,
-                            pos.y - overlay_rect.loc.y as f64,
-                        )
-                            .into()
-                    });
-                return Some((overlay.wl_surface().clone(), local_pos));
+                    .map(RoleSurfaceMapping::focus_origin)
+                    .unwrap_or_else(|| overlay_rect.loc.to_f64());
+                return Some((overlay.wl_surface().clone(), focus_origin));
             }
         }
 
@@ -5726,11 +5704,11 @@ impl RuntimeWaylandState {
                     (0, 0).into(),
                     (self.runtime_output_width(), self.runtime_output_height()).into(),
                 );
-                let local_pos = self
+                let focus_origin = self
                     .role_surface_mapping(RuntimeSurfaceRole::MainApp, output_rect)
-                    .map(|mapping| mapping.unmap_target_point(pos))
-                    .unwrap_or(pos);
-                return Some((main.wl_surface().clone(), local_pos));
+                    .map(RoleSurfaceMapping::focus_origin)
+                    .unwrap_or_else(|| output_rect.loc.to_f64());
+                return Some((main.wl_surface().clone(), focus_origin));
             }
         }
 
@@ -5743,13 +5721,11 @@ impl RuntimeWaylandState {
                 && pos.y >= rect.loc.y as f64
                 && pos.y < (rect.loc.y + rect.size.h) as f64;
             if hit {
-                let local_pos = self
+                let focus_origin = self
                     .role_surface_mapping(RuntimeSurfaceRole::NativePane(pane_id.clone()), rect)
-                    .map(|mapping| mapping.unmap_target_point(pos))
-                    .unwrap_or_else(|| {
-                        (pos.x - rect.loc.x as f64, pos.y - rect.loc.y as f64).into()
-                    });
-                return Some((native.wl_surface().clone(), local_pos));
+                    .map(RoleSurfaceMapping::focus_origin)
+                    .unwrap_or_else(|| rect.loc.to_f64());
+                return Some((native.wl_surface().clone(), focus_origin));
             }
         }
         self.main_toplevel.as_ref().map(|main| {
@@ -5757,11 +5733,11 @@ impl RuntimeWaylandState {
                 (0, 0).into(),
                 (self.runtime_output_width(), self.runtime_output_height()).into(),
             );
-            let local_pos = self
+            let focus_origin = self
                 .role_surface_mapping(RuntimeSurfaceRole::MainApp, output_rect)
-                .map(|mapping| mapping.unmap_target_point(pos))
-                .unwrap_or(pos);
-            (main.wl_surface().clone(), local_pos)
+                .map(RoleSurfaceMapping::focus_origin)
+                .unwrap_or_else(|| output_rect.loc.to_f64());
+            (main.wl_surface().clone(), focus_origin)
         })
     }
 
@@ -8456,28 +8432,20 @@ mod tests {
     }
 
     #[test]
-    fn role_surface_mapping_unmaps_target_point_back_into_surface_space() {
+    fn role_surface_mapping_focus_origin_yields_smithay_client_coordinates() {
         let mapping = RoleSurfaceMapping::new(
-            Rectangle::<i32, Logical>::new((0, 0).into(), (640, 480).into()),
+            Rectangle::<i32, Logical>::new((0, 0).into(), (2160, 1920).into()),
             Rectangle::<i32, Logical>::new((0, 1920).into(), (2160, 1920).into()),
         );
+        let compositor_point = Point::<f64, Logical>::from((540.0, 2880.0));
 
         assert_eq!(
-            mapping.unmap_target_point(Point::<f64, Logical>::from((1080.0, 2880.0))),
-            Point::<f64, Logical>::from((320.0, 240.0))
+            mapping.focus_origin(),
+            Point::<f64, Logical>::from((0.0, 1920.0))
         );
-    }
-
-    #[test]
-    fn role_surface_mapping_unmaps_target_point_with_source_geometry_offset() {
-        let mapping = RoleSurfaceMapping::new(
-            Rectangle::<i32, Logical>::new((40, 20).into(), (80, 40).into()),
-            Rectangle::<i32, Logical>::new((0, 0).into(), (800, 400).into()),
-        );
-
         assert_eq!(
-            mapping.unmap_target_point(Point::<f64, Logical>::from((400.0, 200.0))),
-            Point::<f64, Logical>::from((80.0, 40.0))
+            compositor_point - mapping.focus_origin(),
+            Point::<f64, Logical>::from((540.0, 960.0))
         );
     }
 
