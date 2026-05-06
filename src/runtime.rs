@@ -7530,6 +7530,7 @@ mod tests {
         select_atomic_plane_zpos_values, select_preferred_scanout_format, select_primary_path,
         source_rect_from_bbox_and_geometry, transform_from_rotation, embedded_toplevel_decoration_mode,
     };
+    use crate::output_rotation_model::OutputRotationModel;
     use crate::model::{
         CompositorOverlayKind, OutputRotation, OverlayCaptureCapability, OverlayRect,
         OverlayRegionStatus, PaneId, ProcessSpec, RuntimeFocusTarget,
@@ -8429,6 +8430,75 @@ mod tests {
         );
 
         assert_eq!(mapping.origin, Point::<f64, Logical>::from((0.0, 1920.0)));
+    }
+
+    fn smithay_client_point(
+        compositor_point: Point<f64, Logical>,
+        mapping: RoleSurfaceMapping,
+    ) -> Point<f64, Logical> {
+        compositor_point - mapping.focus_origin()
+    }
+
+    fn physical_point_for_logical_deg90(logical_x: f64, logical_y: f64) -> Point<f64, Physical> {
+        Point::<f64, Physical>::from((logical_y, 2159.0 - logical_x))
+    }
+
+    #[test]
+    fn rotated_web_mouse_points_preserve_content_coordinates() {
+        let web_mapping = RoleSurfaceMapping::new(
+            Rectangle::<i32, Logical>::new((0, 0).into(), (2160, 3840).into()),
+            Rectangle::<i32, Logical>::new((0, 0).into(), (2160, 3840).into()),
+        );
+        let rotation = OutputRotationModel::new(OutputRotation::Deg90);
+        let web_mouse_points = [
+            (540.0, 1920.0),
+            (543.0, 1918.0),
+            (537.0, 1924.0),
+            (541.0, 1919.0),
+            (540.0, 1920.0),
+        ];
+
+        for (expected_x, expected_y) in web_mouse_points {
+            let physical = physical_point_for_logical_deg90(expected_x, expected_y);
+            let compositor_point =
+                rotation.physical_point_to_logical(physical.x, physical.y, 3840, 2160);
+
+            assert_eq!(
+                smithay_client_point(compositor_point.into(), web_mapping),
+                Point::<f64, Logical>::from((expected_x, expected_y))
+            );
+        }
+    }
+
+    #[test]
+    fn rotated_web_native_mouse_surface_switch_preserves_local_coordinates() {
+        let web_mapping = RoleSurfaceMapping::new(
+            Rectangle::<i32, Logical>::new((0, 0).into(), (1080, 3840).into()),
+            Rectangle::<i32, Logical>::new((0, 0).into(), (1080, 3840).into()),
+        );
+        let native_mapping = RoleSurfaceMapping::new(
+            Rectangle::<i32, Logical>::new((0, 0).into(), (1080, 3840).into()),
+            Rectangle::<i32, Logical>::new((1080, 0).into(), (1080, 3840).into()),
+        );
+        let rotation = OutputRotationModel::new(OutputRotation::Deg90);
+        let samples = [
+            (web_mapping, (540.0, 1920.0), (540.0, 1920.0)),
+            (web_mapping, (542.0, 1921.0), (542.0, 1921.0)),
+            (native_mapping, (1620.0, 1920.0), (540.0, 1920.0)),
+            (native_mapping, (1617.0, 1923.0), (537.0, 1923.0)),
+            (web_mapping, (539.0, 1918.0), (539.0, 1918.0)),
+        ];
+
+        for (mapping, (logical_x, logical_y), (expected_x, expected_y)) in samples {
+            let physical = physical_point_for_logical_deg90(logical_x, logical_y);
+            let compositor_point =
+                rotation.physical_point_to_logical(physical.x, physical.y, 3840, 2160);
+
+            assert_eq!(
+                smithay_client_point(compositor_point.into(), mapping),
+                Point::<f64, Logical>::from((expected_x, expected_y))
+            );
+        }
     }
 
     #[test]
