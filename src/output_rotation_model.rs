@@ -109,12 +109,8 @@ impl OutputRotationModel {
     }
 
     pub const fn physical_delta_to_logical(self, dx: f64, dy: f64) -> (f64, f64) {
-        match self.rotation {
-            OutputRotation::Deg0 => (dx, dy),
-            OutputRotation::Deg180 => (-dx, -dy),
-            OutputRotation::Deg90 => (-dy, dx),
-            OutputRotation::Deg270 => (dy, -dx),
-        }
+        let _ = self.rotation;
+        (dx, dy)
     }
 }
 
@@ -177,22 +173,22 @@ mod tests {
     }
 
     #[test]
-    fn physical_pointer_deltas_match_physical_point_derivatives() {
+    fn relative_pointer_deltas_remain_user_relative_under_rotation() {
         assert_eq!(
             OutputRotationModel::new(OutputRotation::Deg0).physical_delta_to_logical(7.0, 11.0),
             (7.0, 11.0)
         );
         assert_eq!(
             OutputRotationModel::new(OutputRotation::Deg90).physical_delta_to_logical(7.0, 11.0),
-            (-11.0, 7.0)
+            (7.0, 11.0)
         );
         assert_eq!(
             OutputRotationModel::new(OutputRotation::Deg180).physical_delta_to_logical(7.0, 11.0),
-            (-7.0, -11.0)
+            (7.0, 11.0)
         );
         assert_eq!(
             OutputRotationModel::new(OutputRotation::Deg270).physical_delta_to_logical(7.0, 11.0),
-            (11.0, -7.0)
+            (7.0, 11.0)
         );
     }
 
@@ -256,22 +252,22 @@ mod tests {
     }
 
     #[test]
-    fn physical_pointer_deltas_are_mapped_into_rotated_logical_axes() {
+    fn relative_pointer_deltas_do_not_follow_absolute_point_rotation() {
         assert_eq!(
             OutputRotationModel::new(OutputRotation::Deg0).physical_delta_to_logical(10.0, -4.0),
             (10.0, -4.0)
         );
         assert_eq!(
             OutputRotationModel::new(OutputRotation::Deg90).physical_delta_to_logical(10.0, -4.0),
-            (4.0, 10.0)
+            (10.0, -4.0)
         );
         assert_eq!(
             OutputRotationModel::new(OutputRotation::Deg180).physical_delta_to_logical(10.0, -4.0),
-            (-10.0, 4.0)
+            (10.0, -4.0)
         );
         assert_eq!(
             OutputRotationModel::new(OutputRotation::Deg270).physical_delta_to_logical(10.0, -4.0),
-            (-4.0, -10.0)
+            (10.0, -4.0)
         );
     }
 }
