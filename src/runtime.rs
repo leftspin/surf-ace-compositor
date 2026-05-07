@@ -5743,7 +5743,28 @@ impl RuntimeWaylandState {
 
     fn popup_owner_role(&self, popup: &PopupSurface) -> Option<RuntimeSurfaceRole> {
         let parent = popup.get_parent_surface()?;
-        self.role_for_surface(&parent)
+        if self
+            .main_toplevel
+            .as_ref()
+            .map(|main| same_surface(main.wl_surface(), &parent))
+            .unwrap_or(false)
+        {
+            return Some(RuntimeSurfaceRole::MainApp);
+        }
+        if self
+            .overlay_toplevel
+            .as_ref()
+            .map(|overlay| same_surface(overlay.wl_surface(), &parent))
+            .unwrap_or(false)
+        {
+            return Some(RuntimeSurfaceRole::OverlayNative);
+        }
+        for (pane_id, native) in &self.native_pane_toplevels {
+            if same_surface(native.wl_surface(), &parent) {
+                return Some(RuntimeSurfaceRole::NativePane(pane_id.clone()));
+            }
+        }
+        None
     }
 
     fn popup_target_rect(&self, role: RuntimeSurfaceRole) -> Rectangle<i32, Logical> {
