@@ -173,11 +173,11 @@ fn ctl_command_passes_exact_main_app_launch_intent_request_through() {
                 "intent": {
                     "process": {
                         "command": "foot",
-                        "args": ["--app-id", "surf-ace-demo"]
+                        "args": ["--app-id", "surf-ace-visible-verifier"]
                     },
                     "binding": {
                         "kind": "app_id",
-                        "app_id": "surf-ace-demo"
+                        "app_id": "surf-ace-visible-verifier"
                     }
                 }
             })
@@ -188,7 +188,7 @@ fn ctl_command_passes_exact_main_app_launch_intent_request_through() {
                 "host_mode_active": true,
                 "output_rotation": "deg0",
                 "panes": [],
-                "prototype_policy": {},
+                "overlay_role_policy": {},
                 "runtime": {
                     "backend": "none",
                     "phase": "inactive",
@@ -197,11 +197,11 @@ fn ctl_command_passes_exact_main_app_launch_intent_request_through() {
                     "main_app_launch_intent": {
                         "process": {
                             "command": "foot",
-                            "args": ["--app-id", "surf-ace-demo"]
+                            "args": ["--app-id", "surf-ace-visible-verifier"]
                         },
                         "binding": {
                             "kind": "app_id",
-                            "app_id": "surf-ace-demo"
+                            "app_id": "surf-ace-visible-verifier"
                         }
                     },
                     "main_app_launch_state": {
@@ -240,7 +240,7 @@ fn ctl_command_passes_exact_main_app_launch_intent_request_through() {
                 .to_str()
                 .expect("socket path should be valid UTF-8"),
             "--request-json",
-            "{\"type\":\"set_main_app_launch_intent\",\"intent\":{\"process\":{\"command\":\"foot\",\"args\":[\"--app-id\",\"surf-ace-demo\"]},\"binding\":{\"kind\":\"app_id\",\"app_id\":\"surf-ace-demo\"}}}",
+            "{\"type\":\"set_main_app_launch_intent\",\"intent\":{\"process\":{\"command\":\"foot\",\"args\":[\"--app-id\",\"surf-ace-visible-verifier\"]},\"binding\":{\"kind\":\"app_id\",\"app_id\":\"surf-ace-visible-verifier\"}}}",
         ])
         .output()
         .expect("ctl command should run");

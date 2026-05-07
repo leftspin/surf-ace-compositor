@@ -13,7 +13,7 @@ The chosen direction is fixed for this spec:
 - v1 host mode must be able to run Surf Ace itself as the main app inside the compositor
 - v1 host mode must accept an explicit startup parameter for the fullscreen/main app launch intent; that intent is an exact process spec plus explicit expected surface binding identity, not a loose match hint
 - the same fullscreen/main app launch-selection action must also be available on the compositor control surface, including when that control surface is reached over the network
-- v1 host mode is one fullscreen main app plus one overlay app layer for the first prototype, but the long-term pane-hosting model is per-pane and dynamic
+- v1 host mode is one fullscreen main app plus one overlay app layer for the first product slice, but the long-term pane-hosting model is per-pane and dynamic
 - output rotation is supported in host mode
 - the first honest external-surface target is a terminal/CLI app
 - hosted native apps become an explicit external/native surface content type instead of being modeled as `html`
@@ -33,22 +33,22 @@ Surf Ace continues to have two product modes on Linux:
    - Surf Ace runs with a dedicated Linux compositor process that owns the output stack.
    - This mode is Linux-only and optional.
 
-## Prototype Policy vs Long-Term Contract
+## V1 Overlay Policy vs Long-Term Contract
 
 These two truths must not be collapsed into each other:
 
-- **First prototype policy**
+- **First product-slice policy**
   - one fullscreen main app role, with Surf Ace as a required supported target
   - one overlay app layer
   - terminal/CLI as the first honest native-hosted target
-  - overlay placement remains fixed compositor policy relative to the active output; the prototype does not yet realize provider pane geometry for native overlays
+  - overlay placement remains fixed compositor policy relative to the active output; the current v1 slice does not yet realize provider pane geometry for native overlays
 
 - **Long-term product contract**
   - any pane may dynamically switch between Surf Ace-rendered content and native-hosted content
   - native-hosted content remains under Surf Ace/provider pane authority
   - the compositor realizes native surfaces inside Surf Ace-defined pane rectangles
 
-The prototype policy is a narrow proving slice. It is not the long-term limit of the pane-hosting model.
+The v1 overlay policy is a narrow proving slice. It is not the long-term limit of the pane-hosting model.
 
 ## Spec Invariants
 
@@ -64,7 +64,7 @@ These invariants are required even if implementation details change:
 8. The switch between Surf Ace-rendered content and external/native surface hosting must be live and reversible at runtime, not one-time startup configuration.
 9. External/native surfaces must be represented explicitly, never as `html`.
 10. Rotation remains a compositor/output concern, not a provider content concern.
-11. The first prototype may use a single terminal/CLI target, but the pane-hosting abstraction must already support future standard Linux GUI apps.
+11. The first product slice may use a single terminal/CLI target, but the pane-hosting abstraction must already support future standard Linux GUI apps.
 12. For tmux/terminal targets, persistent session state may survive outside the pane binding even when the native surface attachment is destroyed and recreated.
 13. External/native hosting is a pane content mode under Surf Ace authority, not a peer authority.
 14. Discovery and pairing remain attached to the Surf Ace app/surface instance, not to hosted child apps inside panes.
@@ -82,7 +82,7 @@ These invariants are required even if implementation details change:
 26. The compositor must define a default keyboard shortcut that toggles the shell/terminal overlay open and closed; the default is Super+`, that shortcut must be overridable from the compositor command line at startup, and shortcut-triggered open/dismiss transitions must keep focus/input ownership coherent between the fullscreen app and the overlay lifecycle.
 27. Once host runtime selection has begun, later host failure remains a host-mode failure; it must not be reinterpreted as a silent backend reselection or automatic downgrade to `winit`.
 28. Post-selection host failure must preserve the compositor’s local control path for status, rotation, and explicit recovery; recovery stays on that same underlying control surface rather than creating a second authority path.
-29. In the first fullscreen-plus-overlay prototype, fixed overlay placement is compositor policy derived from the active output; role/lifecycle signals from that prototype must not be mistaken for completion of provider-defined pane-rectangle realization.
+29. In the first fullscreen-plus-overlay product slice, fixed overlay placement is compositor policy derived from the active output; role/lifecycle signals from that product slice must not be mistaken for completion of provider-defined pane-rectangle realization.
 30. Overlay lifecycle truth must distinguish requested or launching state from attached state; shortcut-open intent or pending process launch is not itself an attached overlay-native role binding.
 
 ## V1 Success Criteria
@@ -111,8 +111,8 @@ V1 is successful when all of the following are true:
    - acquisition failure is explicit and does not silently downgrade to development backend behavior
    - once host-mode start has begun, later host failure remains failed host mode rather than silently downgrading to `winit`
    - the local control path remains reachable after host failure for status and explicit recovery
-9. Prototype overlay status remains honest about what is and is not complete:
-   - fixed overlay placement is compositor policy for the prototype, not proof that provider pane-geometry realization is already complete
+9. Overlay role status remains honest about what is and is not complete:
+   - fixed overlay placement is compositor policy for the current v1 slice, not proof that provider pane-geometry realization is already complete
    - overlay-bound role status is reported only for a concretely attached native surface, not merely for shortcut-open or launch intent
 
 ## Non-Goals
@@ -161,7 +161,7 @@ That same boundary applies to the shell/terminal overlay toggle shortcut: defaul
 
 That same boundary also applies to the fullscreen/main role. The compositor may own the launch-and-attach policy for the primary app, but that policy must be expressed as an explicit contract: exact process spec plus explicit expected surface binding identity, with the same action available at startup and through the control surface.
 
-That same prototype boundary also applies to overlay placement and status. In the first fullscreen-plus-overlay slice, the compositor uses fixed overlay placement relative to the active output in order to prove lifecycle, focus, and role ownership. Those prototype signals must not be read as evidence that the long-term provider-defined pane-rectangle realization contract is already complete.
+That same v1 boundary also applies to overlay placement and status. In the first fullscreen-plus-overlay slice, the compositor uses fixed overlay placement relative to the active output in order to prove lifecycle, focus, and role ownership. Those v1 role/lifecycle signals must not be read as evidence that the long-term provider-defined pane-rectangle realization contract is already complete.
 
 ## Content Model Impact
 
@@ -188,7 +188,7 @@ V1 rules:
    - explicit pane content mode/state for Surf Ace-rendered vs external/native-hosted content
 7. Discovery and pairing stay at the Surf Ace app/surface level, not per external app hosted inside a pane.
 8. Rotation remains a compositor/output concern, not a provider content concern.
-9. In the first overlay prototype, fixed native-overlay placement remains compositor output policy; it does not transfer pane geometry authority away from Surf Ace/provider or mean pane rectangles already drive native placement.
+9. In the first overlay product slice, fixed native-overlay placement remains compositor output policy; it does not transfer pane geometry authority away from Surf Ace/provider or mean pane rectangles already drive native placement.
 
 This spec does not fully define the final provider wire schema for `external/native surface`, but it does require that v1 implementation reserve an explicit provider-facing representation for it rather than reusing `html`.
 
@@ -237,7 +237,7 @@ V1 requires these subsystems:
 - startup/shutdown path
 - Smithay event loop integration
 - backend selection:
-  - `winit` for local prototype work
+  - `winit` for local development work
   - DRM/KMS path for host mode
 - explicit mode boundary:
   - `winit` and host/DRM paths are separate runtime modes with separate readiness criteria
@@ -306,8 +306,8 @@ V1 requires these subsystems:
 - Surf Ace should call into the compositor through the same underlying control surface used for bootstrap/recovery operations once Surf Ace is running
 - runtime role lifecycle and runtime status must stay reconcilable with pane lifecycle truth and host-backend readiness
 - runtime status for the fullscreen/main role must distinguish requested launch intent from concrete attachment
-- prototype overlay lifecycle status must distinguish launch intent from concrete attachment; any overlay-bound-pane signal is truthful only for attached state and must clear again on failure or exit
-- first-prototype fullscreen/overlay status proves compositor role/lifecycle truth only; it does not claim that provider-pane geometry already drives overlay placement
+- overlay role lifecycle status must distinguish launch intent from concrete attachment; any overlay-bound-pane signal is truthful only for attached state and must clear again on failure or exit
+- v1 fullscreen/overlay status proves compositor role/lifecycle truth only; it does not claim that provider-pane geometry already drives overlay placement
 
 For v1, the provider-facing bridge only needs to answer these questions:
 
@@ -322,7 +322,7 @@ For v1, the provider-facing bridge only needs to answer these questions:
 - which pane (if any) currently owns an attached overlay-native role binding
 - whether host backend readiness has acquired seat-scoped DRM device ownership
 
-For the first prototype, overlay role/binding answers are about concrete native attachment and lifecycle truth, not about shortcut-open intent, reserved launch state, or completion of provider-pane geometry realization.
+For the first product slice, overlay role/binding answers are about concrete native attachment and lifecycle truth, not about shortcut-open intent, reserved launch state, or completion of provider-pane geometry realization.
 
 ### 7. Control/recovery/status truth
 
@@ -340,9 +340,9 @@ For the first prototype, overlay role/binding answers are about concrete native 
 - startup configuration, control-surface request acceptance, capability, shortcut intent, reservation, and launch-in-progress must not be reported as equivalent to successful attachment or successful queued presentation
 - fail-closed transitions must clear stale route, present, and overlay-binding success claims
 
-## First Prototype Scope
+## First Product Slice Scope
 
-The first prototype is intentionally narrow and exists to prove the long-term pane-hosting seam without pretending the product is limited to one overlay forever.
+The first product slice is intentionally narrow and exists to prove the long-term pane-hosting seam without pretending the product is limited to one overlay forever.
 
 ### In scope
 
@@ -350,7 +350,7 @@ The first prototype is intentionally narrow and exists to prove the long-term pa
 - same compositor booting in DRM/KMS host mode
 - one fullscreen main app role, with Surf Ace as a required supported target
 - one overlay terminal/CLI app
-- fixed overlay placement derived from the active output; provider pane geometry is not yet the prototype placement driver
+- fixed overlay placement derived from the active output; provider pane geometry is not yet the current v1 placement driver
 - output rotation
 - explicit internal notion of external/native overlay content
 - explicit startup and control-surface selection of the fullscreen/main app
@@ -365,7 +365,7 @@ The first prototype is intentionally narrow and exists to prove the long-term pa
 - arbitrary native app catalog/registry
 - generalized provider UX for selecting among many external app types
 - annotation semantics inside the hosted terminal app
-- treating prototype fixed overlay placement as equivalent to final provider-pane-rectangle realization
+- treating v1 fixed overlay placement as equivalent to final provider-pane-rectangle realization
 
 ## Milestone Slices
 
@@ -423,7 +423,7 @@ Exit check:
 - at least one pane can switch from Surf Ace-rendered content to an external/native target and back at runtime
 - that pane remains under Surf Ace topology authority the whole time
 
-### Slice 4: Terminal overlay prototype
+### Slice 4: Terminal overlay product slice
 
 Goal:
 - prove the first honest native hosted target
@@ -432,7 +432,7 @@ Deliver:
 - launch a Wayland-native terminal/CLI app as the overlay
 - wire enough lifecycle handling for attach/detach/restart
 - name the provider-facing concept as external/native overlay content
-- keep fixed overlay placement explicit as compositor output policy for the prototype rather than final pane-rectangle realization
+- keep fixed overlay placement explicit as compositor output policy for the current v1 slice rather than final pane-rectangle realization
 - provide a compositor-owned default keyboard shortcut of Super+` that toggles the shell/terminal overlay open and closed
 - allow that default shortcut to be overridden from the compositor command line at startup
 - report overlay-bound attachment only after the admitted surface matches the expected pane/process request
@@ -490,7 +490,7 @@ To preserve the right long-term seam:
 3. Do not let hosted native apps enter the system as fake `html`.
 4. Do not widen v1 into app-compat/platform breadth before the terminal overlay path is honest and working.
 5. Do not change normal app mode behavior in order to make host mode work.
-6. Do not describe prototype fixed overlay placement as if provider pane geometry were already driving native-surface realization.
+6. Do not describe v1 fixed overlay placement as if provider pane geometry were already driving native-surface realization.
 7. Do not overload overlay-bound/runtime-status fields so they blur together shortcut intent, reservation, and actual native-surface attachment.
 8. Do not treat loose client matching or client arrival order as sufficient authority for the fullscreen/main role when an explicit primary launch-and-binding contract exists.
 
@@ -505,12 +505,12 @@ These are explicitly deferred beyond v1:
 - arbitrary overlay positioning rules
 - provider UX for selecting many external app classes
 - app-specific readback semantics for hosted native surfaces
-- richer native surface types beyond the terminal/CLI prototype target
+- richer native surface types beyond the terminal/CLI initial target
 - cross-platform compositor ambitions outside Linux
 
 ## Risks
 
-### Risk 1: Host-mode complexity swallows the prototype
+### Risk 1: Host-mode complexity swallows the current v1 slice
 
 Mitigation:
 - require `winit` bring-up first
@@ -545,6 +545,6 @@ Engineers can start from this spec if they preserve these boundaries:
 - keep `winit` development runtime and host DRM/KMS runtime as explicit, separate execution paths
 - keep normal Surf Ace Linux app mode unchanged
 - keep provider/protocol/topology ownership where it already belongs
-- treat the terminal overlay as the first real external/native surface target, not as a temporary `html` hack
+- treat the terminal overlay as the first real external/native surface target, not as a placeholder `html` path
 
 If implementation pressure pushes toward Electron-as-compositor, fake-HTML native hosting, or broad Xwayland/app-compat scope, that is a spec violation rather than a reasonable shortcut.

@@ -40,7 +40,7 @@ struct app_state {
 static struct app_state *g_app;
 
 static int create_tmp_shm(size_t size) {
-    char template[] = "/dev/shm/surf-ace-demo-XXXXXX";
+    char template[] = "/dev/shm/surf-ace-visible-verifier-XXXXXX";
     int fd = mkstemp(template);
     if (fd < 0) return -1;
     unlink(template);
@@ -289,8 +289,8 @@ int main(void) {
 
     app.xdg_toplevel = xdg_surface_get_toplevel(app.xdg_surface);
     xdg_toplevel_add_listener(app.xdg_toplevel, &toplevel_listener, &app);
-    xdg_toplevel_set_title(app.xdg_toplevel, "Surf Ace Visible Demo");
-    xdg_toplevel_set_app_id(app.xdg_toplevel, "surf-ace-demo");
+    xdg_toplevel_set_title(app.xdg_toplevel, "Surf Ace Visible Verifier");
+    xdg_toplevel_set_app_id(app.xdg_toplevel, "surf-ace-visible-verifier");
     xdg_toplevel_set_fullscreen(app.xdg_toplevel, NULL);
 
     wl_surface_commit(app.surface);

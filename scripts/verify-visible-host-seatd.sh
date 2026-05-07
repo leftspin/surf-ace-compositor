@@ -8,16 +8,16 @@ SOCKET_PATH="/tmp/surf-ace-compositor.sock"
 EVIDENCE_DIR="/tmp/surf-ace-visible-verify-$(date -u +%Y%m%dT%H%M%SZ)"
 TIMEOUT_SECONDS=60
 
-DEMO_SRC="$ROOT_DIR/scripts/surf-ace-visible-demo.c"
-DEMO_BUILD_DIR="$ROOT_DIR/target/visible-demo"
-DEMO_BIN="$DEMO_BUILD_DIR/surf-ace-visible-demo"
+VERIFIER_SRC="$ROOT_DIR/scripts/surf-ace-visible-verifier.c"
+VERIFIER_BUILD_DIR="$ROOT_DIR/target/visible-verifier"
+VERIFIER_BIN="$VERIFIER_BUILD_DIR/surf-ace-visible-verifier"
 
 usage() {
   cat <<'USAGE'
 Usage: verify-visible-host-seatd.sh [--socket-path <path>] [--evidence-dir <dir>] [--timeout-seconds <n>]
 
 Launches the compositor through the seatd host launcher, waits for running state,
-applies 90-degree CCW output rotation, selects a fullscreen visible Wayland demo
+applies 90-degree CCW output rotation, selects a fullscreen visible Wayland verifier
 through the compositor control surface's exact main-app launch contract, and keeps
 the session live for human verification.
 USAGE
@@ -72,8 +72,8 @@ if [[ ! -x "$CONTROL_BIN" ]]; then
   exit 2
 fi
 
-if [[ ! -f "$DEMO_SRC" ]]; then
-  echo "missing demo source: $DEMO_SRC" >&2
+if [[ ! -f "$VERIFIER_SRC" ]]; then
+  echo "missing verifier source: $VERIFIER_SRC" >&2
   exit 2
 fi
 
@@ -101,19 +101,19 @@ if [[ ! -f "$XDG_SHELL_XML" ]]; then
   exit 2
 fi
 
-mkdir -p "$EVIDENCE_DIR" "$DEMO_BUILD_DIR"
+mkdir -p "$EVIDENCE_DIR" "$VERIFIER_BUILD_DIR"
 COMPOSITOR_LOG="$EVIDENCE_DIR/compositor.log"
-DEMO_LOG="$EVIDENCE_DIR/demo.log"
+VERIFIER_LOG="$EVIDENCE_DIR/verifier.log"
 
 COMPOSITOR_PID=""
-DEMO_PID=""
+VERIFIER_PID=""
 STARTED_COMPOSITOR="false"
 
 cleanup() {
   local rc="$?"
-  if [[ -n "$DEMO_PID" ]] && kill -0 "$DEMO_PID" >/dev/null 2>&1; then
-    kill "$DEMO_PID" >/dev/null 2>&1 || true
-    wait "$DEMO_PID" >/dev/null 2>&1 || true
+  if [[ -n "$VERIFIER_PID" ]] && kill -0 "$VERIFIER_PID" >/dev/null 2>&1; then
+    kill "$VERIFIER_PID" >/dev/null 2>&1 || true
+    wait "$VERIFIER_PID" >/dev/null 2>&1 || true
   fi
   if [[ "$STARTED_COMPOSITOR" == "true" && -n "$COMPOSITOR_PID" ]] && kill -0 "$COMPOSITOR_PID" >/dev/null 2>&1; then
     kill "$COMPOSITOR_PID" >/dev/null 2>&1 || true
@@ -204,18 +204,18 @@ if [[ "$(printf '%s\n' "$rotation_response" | jq -r '.status.output_rotation // 
   exit 1
 fi
 
-wayland-scanner client-header "$XDG_SHELL_XML" "$DEMO_BUILD_DIR/xdg-shell-client-protocol.h"
-wayland-scanner private-code "$XDG_SHELL_XML" "$DEMO_BUILD_DIR/xdg-shell-protocol.c"
+wayland-scanner client-header "$XDG_SHELL_XML" "$VERIFIER_BUILD_DIR/xdg-shell-client-protocol.h"
+wayland-scanner private-code "$XDG_SHELL_XML" "$VERIFIER_BUILD_DIR/xdg-shell-protocol.c"
 gcc -std=c11 -O2 -Wall -Wextra \
-  -I"$DEMO_BUILD_DIR" \
-  "$DEMO_SRC" \
-  "$DEMO_BUILD_DIR/xdg-shell-protocol.c" \
-  -o "$DEMO_BIN" \
+  -I"$VERIFIER_BUILD_DIR" \
+  "$VERIFIER_SRC" \
+  "$VERIFIER_BUILD_DIR/xdg-shell-protocol.c" \
+  -o "$VERIFIER_BIN" \
   $(pkg-config --cflags --libs wayland-client)
 
 MAIN_APP_LAUNCH_INTENT_JSON="$(
   jq -nc \
-    --arg command "$DEMO_BIN" \
+    --arg command "$VERIFIER_BIN" \
     '{
       process: {
         command: $command,
@@ -224,7 +224,7 @@ MAIN_APP_LAUNCH_INTENT_JSON="$(
       },
       binding: {
         kind: "app_id",
-        app_id: "surf-ace-demo"
+        app_id: "surf-ace-visible-verifier"
       }
     }'
 )"
@@ -237,29 +237,29 @@ if [[ "$(printf '%s\n' "$main_app_response" | jq -r '.ok // false')" != "true" ]
   exit 1
 fi
 
-demo_bound="false"
+verifier_bound="false"
 deadline=$((SECONDS + 15))
 while (( SECONDS < deadline )); do
   status_json="$("$CONTROL_BIN" ctl --socket-path "$SOCKET_PATH" --request-json '{"type":"get_status"}')"
-  printf '%s\n' "$status_json" >"$EVIDENCE_DIR/status_after_demo_latest.json"
+  printf '%s\n' "$status_json" >"$EVIDENCE_DIR/status_after_verifier_latest.json"
 
   phase="$(printf '%s\n' "$status_json" | jq -r '.status.runtime.phase // empty')"
   rotation="$(printf '%s\n' "$status_json" | jq -r '.status.output_rotation // empty')"
   main_app_surface_id="$(printf '%s\n' "$status_json" | jq -r '.status.runtime.main_app_surface_id // empty')"
   main_app_state="$(printf '%s\n' "$status_json" | jq -r '.status.runtime.main_app_launch_state.state // empty')"
-  DEMO_PID="$(printf '%s\n' "$status_json" | jq -r '.status.runtime.main_app_launch_state.pid // empty')"
+  VERIFIER_PID="$(printf '%s\n' "$status_json" | jq -r '.status.runtime.main_app_launch_state.pid // empty')"
 
   if [[ "$phase" == "running" && "$rotation" == "deg90" && "$main_app_state" == "attached" && -n "$main_app_surface_id" && "$main_app_surface_id" != "null" ]]; then
     printf '%s\n' "$status_json" >"$EVIDENCE_DIR/status_visible_ready.json"
-    demo_bound="true"
+    verifier_bound="true"
     break
   fi
   sleep 0.25
 done
 
-if [[ "$demo_bound" != "true" ]]; then
-  echo "demo did not bind as main app in time; see evidence under $EVIDENCE_DIR" >&2
-  cat "$EVIDENCE_DIR/status_after_demo_latest.json" >&2 || true
+if [[ "$verifier_bound" != "true" ]]; then
+  echo "verifier did not bind as main app in time; see evidence under $EVIDENCE_DIR" >&2
+  cat "$EVIDENCE_DIR/status_after_verifier_latest.json" >&2 || true
   exit 1
 fi
 
@@ -268,21 +268,21 @@ phase=running
 output_rotation=deg90
 wayland_socket=$wayland_socket
 compositor_pid=$COMPOSITOR_PID
-main_app_pid=$DEMO_PID
+main_app_pid=$VERIFIER_PID
 evidence_dir=$EVIDENCE_DIR
 SUMMARY
 
 echo "visible verification live"
 echo "summary: $EVIDENCE_DIR/summary.txt"
-echo "press Ctrl-C to stop compositor + demo"
+echo "press Ctrl-C to stop compositor + verifier"
 
 while true; do
   if [[ "$STARTED_COMPOSITOR" == "true" && -n "$COMPOSITOR_PID" ]] && ! kill -0 "$COMPOSITOR_PID" >/dev/null 2>&1; then
     echo "compositor exited; see $COMPOSITOR_LOG" >&2
     exit 1
   fi
-  if [[ -n "$DEMO_PID" ]] && ! kill -0 "$DEMO_PID" >/dev/null 2>&1; then
-    echo "demo exited; see latest status under $EVIDENCE_DIR" >&2
+  if [[ -n "$VERIFIER_PID" ]] && ! kill -0 "$VERIFIER_PID" >/dev/null 2>&1; then
+    echo "verifier exited; see latest status under $EVIDENCE_DIR" >&2
     exit 1
   fi
   sleep 1

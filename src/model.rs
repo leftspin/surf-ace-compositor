@@ -420,7 +420,7 @@ pub struct PaneStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PrototypePolicyStatus {
+pub struct OverlayRolePolicyStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_overlay_pane: Option<PaneId>,
 }
@@ -663,7 +663,7 @@ pub struct StatusSnapshot {
     pub panes: Vec<PaneStatus>,
     #[serde(default)]
     pub overlay_regions: OverlayRegionsStatus,
-    pub prototype_policy: PrototypePolicyStatus,
+    pub overlay_role_policy: OverlayRolePolicyStatus,
     pub runtime: RuntimeStatus,
 }
 

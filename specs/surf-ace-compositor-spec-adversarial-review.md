@@ -18,8 +18,8 @@ This revision preserves the pass 4-6 truth that belongs in spec while compressin
    - Surf Ace/provider still own pane identity, geometry, topology, and pane mode truth.
    - Compositor remains display/output/input/runtime policy authority, not topology authority.
 
-2. ==Prototype policy vs long-term contract is preserved.==
-   - one fullscreen + one overlay remains explicit v1 prototype policy
+2. ==V1 overlay policy vs long-term contract is preserved.==
+   - one fullscreen + one overlay remains explicit v1 overlay policy
    - long-term per-pane dynamic hosting contract remains explicit and separate
 
 3. ==Runtime/product bridge is now better specified.==
@@ -50,7 +50,7 @@ The spec now contains stronger success criteria and subsystem constraints, but d
 
 ## What changed from the previous adversarial review
 
-1. Prior editorial concerns about prototype-vs-contract ambiguity were substantially improved.
+1. Prior editorial concerns about product-slice-vs-contract ambiguity were substantially improved.
 2. Control-plane narrowness remained intact and is still correctly constrained.
 3. The largest previous gap (explicit host backend path semantics) is now addressed at spec level.
 

@@ -9,7 +9,7 @@ use crate::model::{
     RuntimePhase, RuntimeSelectionMode, RuntimeStatus, StatusSnapshot, SurfaceBindingEvidence,
 };
 use crate::output_rotation_model::OutputRotationModel;
-use crate::policy::{PrototypeOverlayPolicy, PrototypePolicyError};
+use crate::overlay_role_policy::{OverlayRolePolicy, OverlayRolePolicyError};
 use crate::process_manager::ProcessController;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
@@ -80,7 +80,7 @@ pub enum StateError {
     #[error("cannot switch pane to external/native mode: {0:?}")]
     AlreadyExternalNative(PaneId),
     #[error("{0}")]
-    PrototypePolicy(#[from] PrototypePolicyError),
+    OverlayRolePolicy(#[from] OverlayRolePolicyError),
     #[error("{0}")]
     Process(String),
     #[error("{0}")]
@@ -107,7 +107,7 @@ pub struct CompositorState {
     overlay_regions: Option<OverlayRegionSnapshot>,
     topology_epoch_counter: u64,
     topology_epoch: String,
-    prototype_overlay_policy: PrototypeOverlayPolicy,
+    overlay_role_policy: OverlayRolePolicy,
     runtime: RuntimeStatus,
     process_controller: Box<dyn ProcessController>,
     launch_token_counter: u64,
@@ -176,7 +176,7 @@ impl CompositorState {
             overlay_regions: None,
             topology_epoch_counter: 0,
             topology_epoch: "topology-0".to_string(),
-            prototype_overlay_policy: PrototypeOverlayPolicy::default(),
+            overlay_role_policy: OverlayRolePolicy::default(),
             runtime: RuntimeStatus::default(),
             process_controller,
             launch_token_counter: 0,
@@ -822,11 +822,11 @@ impl CompositorState {
                     .terminate(pid)
                     .map_err(StateError::Process)?;
             }
-            self.prototype_overlay_policy.release_if_matches(old_id);
+            self.overlay_role_policy.release_if_matches(old_id);
         }
 
         self.panes = incoming;
-        self.prototype_overlay_policy.clear_if_removed(|pane_id| {
+        self.overlay_role_policy.clear_if_removed(|pane_id| {
             self.panes.contains_key(pane_id) || is_shell_overlay_pane_id(pane_id)
         });
         self.prune_stale_overlay_regions();
@@ -856,7 +856,7 @@ impl CompositorState {
             return Err(StateError::AlreadyExternalNative(pane_id.clone()));
         }
 
-        self.prototype_overlay_policy.reserve_for(pane_id)?;
+        self.overlay_role_policy.reserve_for(pane_id)?;
 
         let launch_token = self.next_launch_token(&format!("native:{}", pane_id.0));
         let mut extra_env = BTreeMap::new();
@@ -1179,7 +1179,7 @@ impl CompositorState {
         pane.external_native_surface_id = None;
         pane.external_native_binding_evidence = None;
         pane.external_native_launch_token = None;
-        self.prototype_overlay_policy.release_if_matches(pane_id);
+        self.overlay_role_policy.release_if_matches(pane_id);
         self.prune_stale_overlay_regions();
         Ok(())
     }
@@ -1205,7 +1205,7 @@ impl CompositorState {
                 .unwrap_or(false)
             {
                 self.panes.remove(&pane_id);
-                self.prototype_overlay_policy.release_if_matches(&pane_id);
+                self.overlay_role_policy.release_if_matches(&pane_id);
                 self.prune_stale_overlay_regions();
             }
         }
@@ -1224,7 +1224,7 @@ impl CompositorState {
     }
 
     pub fn active_overlay_pane_id(&self) -> Option<PaneId> {
-        self.prototype_overlay_policy.active_overlay_pane().cloned()
+        self.overlay_role_policy.active_overlay_pane().cloned()
     }
 
     pub fn runtime_expected_overlay_binding(&self) -> Option<(PaneId, u32)> {
@@ -1435,7 +1435,7 @@ impl CompositorState {
             output_rotation: self.output_rotation,
             panes,
             overlay_regions: self.overlay_regions_status(),
-            prototype_policy: self.prototype_overlay_policy.status(),
+            overlay_role_policy: self.overlay_role_policy.status(),
             runtime,
         }
     }
@@ -1530,7 +1530,7 @@ impl CompositorState {
             )
         })?;
         let pane_id = shell_overlay_pane_id();
-        self.prototype_overlay_policy.reserve_for(&pane_id)?;
+        self.overlay_role_policy.reserve_for(&pane_id)?;
 
         let mut extra_env = BTreeMap::new();
         extra_env.insert("SURF_ACE_COMPOSITOR_HOST_MODE".to_string(), "1".to_string());
@@ -1564,7 +1564,7 @@ impl CompositorState {
 
         self.shell_overlay_lifecycle = ExternalNativeLifecycleState::Absent;
         self.shell_overlay_focus_on_attach = false;
-        self.prototype_overlay_policy
+        self.overlay_role_policy
             .release_if_matches(&shell_overlay_pane_id());
         self.runtime.active_focus_target = self
             .runtime
@@ -2145,7 +2145,7 @@ mod tests {
     }
 
     #[test]
-    fn prototype_policy_allows_only_one_active_overlay_pane() {
+    fn overlay_role_policy_allows_only_one_active_overlay_pane() {
         let process = FakeProcessController::default();
         let mut state = CompositorState::new(true, Box::new(process));
         state
@@ -2170,7 +2170,7 @@ mod tests {
             )
             .expect_err("second concurrent overlay pane should be denied");
 
-        assert!(matches!(err, StateError::PrototypePolicy(_)));
+        assert!(matches!(err, StateError::OverlayRolePolicy(_)));
     }
 
     #[test]
@@ -2244,7 +2244,61 @@ mod tests {
             status.panes[2].render_mode,
             PaneRenderMode::SurfAceRendered
         ));
-        assert!(status.prototype_policy.active_overlay_pane.is_none());
+        assert!(status.overlay_role_policy.active_overlay_pane.is_none());
+    }
+
+    #[test]
+    fn shell_overlay_role_does_not_cap_provider_owned_native_pane_hosts() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            1280,
+            720,
+        );
+        state.configure_shell_overlay_process(Some(terminal_process()));
+
+        state
+            .toggle_shell_overlay()
+            .expect("shell overlay launch should reserve the overlay role");
+        assert_eq!(
+            state
+                .status_snapshot()
+                .overlay_role_policy
+                .active_overlay_pane,
+            Some(PaneId::new(SHELL_OVERLAY_PANE_ID))
+        );
+
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: PaneId::new("native-pane"),
+                content_id: Some("content-native".to_string()),
+                binding_id: Some("binding-native".to_string()),
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 640,
+                    height: 720,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+                target: NativeTargetClass::Terminal,
+                process: terminal_process(),
+            }])
+            .expect("provider-owned native pane host should not consume the shell overlay role");
+
+        let status = state.status_snapshot();
+        assert_eq!(
+            status.overlay_role_policy.active_overlay_pane,
+            Some(PaneId::new(SHELL_OVERLAY_PANE_ID))
+        );
+        assert_eq!(status.panes.len(), 1);
+        assert_eq!(status.panes[0].id, PaneId::new("native-pane"));
+        assert!(matches!(
+            status.panes[0].render_mode,
+            PaneRenderMode::ExternalNative { .. }
+        ));
     }
 
     #[test]
@@ -2829,7 +2883,7 @@ mod tests {
         assert!(
             state
                 .status_snapshot()
-                .prototype_policy
+                .overlay_role_policy
                 .active_overlay_pane
                 .is_none()
         );
@@ -2884,7 +2938,7 @@ mod tests {
 
         let status = state.status_snapshot();
         assert_eq!(
-            status.prototype_policy.active_overlay_pane,
+            status.overlay_role_policy.active_overlay_pane,
             Some(PaneId::new("p-1"))
         );
         assert!(status.runtime.overlay_bound_pane_id.is_none());
@@ -3700,7 +3754,7 @@ mod tests {
         assert!(
             state
                 .status_snapshot()
-                .prototype_policy
+                .overlay_role_policy
                 .active_overlay_pane
                 .is_none()
         );
@@ -3732,7 +3786,10 @@ mod tests {
             "Super+`"
         );
         assert_eq!(
-            state.status_snapshot().prototype_policy.active_overlay_pane,
+            state
+                .status_snapshot()
+                .overlay_role_policy
+                .active_overlay_pane,
             Some(PaneId::new(SHELL_OVERLAY_PANE_ID))
         );
         assert!(matches!(
@@ -3837,7 +3894,7 @@ mod tests {
         assert!(
             state
                 .status_snapshot()
-                .prototype_policy
+                .overlay_role_policy
                 .active_overlay_pane
                 .is_none()
         );

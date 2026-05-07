@@ -7,7 +7,7 @@ CONTROL_BIN="${SURF_ACE_COMPOSITOR_BIN:-$ROOT_DIR/target/debug/surf-ace-composit
 SOCKET_PATH="/tmp/surf-ace-compositor.sock"
 EVIDENCE_DIR="/tmp/surf-ace-zsh-main-verify-$(date -u +%Y%m%dT%H%M%SZ)"
 TIMEOUT_SECONDS=60
-APP_ID="surf-ace-zsh-demo"
+APP_ID="surf-ace-zsh-verifier"
 TERMINAL=""
 MAIN_APP_START_DELAY_SECONDS="${SURF_ACE_MAIN_APP_START_DELAY_SECONDS:-1}"
 

@@ -5326,8 +5326,8 @@ impl RuntimeWaylandState {
                 before.runtime.shell_overlay_toggle_shortcut,
                 before.runtime.active_focus_target,
                 after.runtime.active_focus_target,
-                before.prototype_policy.active_overlay_pane,
-                after.prototype_policy.active_overlay_pane,
+                before.overlay_role_policy.active_overlay_pane,
+                after.overlay_role_policy.active_overlay_pane,
                 before.runtime.overlay_surface_id,
                 after.runtime.overlay_surface_id,
                 before.runtime.overlay_bound_pane_id,
@@ -5338,8 +5338,8 @@ impl RuntimeWaylandState {
                 before.runtime.shell_overlay_toggle_shortcut,
                 before.runtime.active_focus_target,
                 after.runtime.active_focus_target,
-                before.prototype_policy.active_overlay_pane,
-                after.prototype_policy.active_overlay_pane,
+                before.overlay_role_policy.active_overlay_pane,
+                after.overlay_role_policy.active_overlay_pane,
                 before.runtime.overlay_surface_id,
                 after.runtime.overlay_surface_id,
                 before.runtime.overlay_bound_pane_id,
@@ -8481,7 +8481,7 @@ mod tests {
             Rectangle::<i32, Logical>::new((1080, 0).into(), (1080, 3840).into()),
         );
         let rotation = OutputRotationModel::new(OutputRotation::Deg90);
-        let samples = [
+        let cases = [
             (web_mapping, (540.0, 1920.0), (540.0, 1920.0)),
             (web_mapping, (542.0, 1921.0), (542.0, 1921.0)),
             (native_mapping, (1620.0, 1920.0), (540.0, 1920.0)),
@@ -8489,7 +8489,7 @@ mod tests {
             (web_mapping, (539.0, 1918.0), (539.0, 1918.0)),
         ];
 
-        for (mapping, (logical_x, logical_y), (expected_x, expected_y)) in samples {
+        for (mapping, (logical_x, logical_y), (expected_x, expected_y)) in cases {
             let physical = physical_point_for_logical_deg90(logical_x, logical_y);
             let compositor_point =
                 rotation.physical_point_to_logical(physical.x, physical.y, 3840, 2160);

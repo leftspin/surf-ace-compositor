@@ -1,30 +1,30 @@
-use crate::model::{PaneId, PrototypePolicyStatus};
+use crate::model::{OverlayRolePolicyStatus, PaneId};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
-pub enum PrototypePolicyError {
+pub enum OverlayRolePolicyError {
     #[error(
-        "prototype overlay policy allows only one active overlay pane (active: {active_overlay_pane:?})"
+        "overlay role policy allows only one active overlay pane (active: {active_overlay_pane:?})"
     )]
     OverlaySlotInUse { active_overlay_pane: PaneId },
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct PrototypeOverlayPolicy {
-    // This encodes only the temporary v1 prototype policy (single overlay layer).
-    // It is intentionally separate from pane mode/state so we do not hard-code it as
-    // the long-term pane-hosting contract.
+pub struct OverlayRolePolicy {
+    // This encodes the production v1 shell overlay role policy (single overlay layer).
+    // It is intentionally separate from provider-owned native pane hosting so the
+    // shell overlay role cannot cap pane-hosted native surfaces.
     active_overlay_pane: Option<PaneId>,
 }
 
-impl PrototypeOverlayPolicy {
+impl OverlayRolePolicy {
     pub fn active_overlay_pane(&self) -> Option<&PaneId> {
         self.active_overlay_pane.as_ref()
     }
 
-    pub fn reserve_for(&mut self, pane_id: &PaneId) -> Result<(), PrototypePolicyError> {
+    pub fn reserve_for(&mut self, pane_id: &PaneId) -> Result<(), OverlayRolePolicyError> {
         match &self.active_overlay_pane {
-            Some(active) if active != pane_id => Err(PrototypePolicyError::OverlaySlotInUse {
+            Some(active) if active != pane_id => Err(OverlayRolePolicyError::OverlaySlotInUse {
                 active_overlay_pane: active.clone(),
             }),
             _ => {
@@ -48,8 +48,8 @@ impl PrototypeOverlayPolicy {
         }
     }
 
-    pub fn status(&self) -> PrototypePolicyStatus {
-        PrototypePolicyStatus {
+    pub fn status(&self) -> OverlayRolePolicyStatus {
+        OverlayRolePolicyStatus {
             active_overlay_pane: self.active_overlay_pane.clone(),
         }
     }

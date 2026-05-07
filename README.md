@@ -9,7 +9,7 @@ The current implementation ships:
 - terminal-first external target with exec/process payload (never modeled as `html`)
 - reversible runtime switching with external process lifecycle states
 - a tiny Unix-socket control path for both bootstrap operations (rotation/status) and runtime pane mode operations
-- explicit prototype policy: one active overlay pane at a time, separated from the long-term per-pane hosting contract
+- explicit overlay role policy: one active overlay pane at a time, separated from the long-term per-pane hosting contract
 - Smithay-based local runtime bring-up path using `winit` (real compositor event loop + redraw loop + Wayland socket listener skeleton)
 - Smithay-based host runtime preflight path using `libseat` + `udev` + DRM device opening:
   - dedicated `host` runtime mode separate from `winit`
@@ -53,7 +53,7 @@ cargo run -- serve --runtime host --socket-path /tmp/surf-ace-compositor.sock
 Start host mode with an explicit fullscreen main-app launch contract:
 
 ```bash
-cargo run -- serve --runtime host --socket-path /tmp/surf-ace-compositor.sock --main-app-launch-intent-json '{"process":{"command":"foot","args":["--app-id","surf-ace-demo"]},"binding":{"kind":"app_id","app_id":"surf-ace-demo"}}'
+cargo run -- serve --runtime host --socket-path /tmp/surf-ace-compositor.sock --main-app-launch-intent-json '{"process":{"command":"foot","args":["--app-id","surf-ace-visible-verifier"]},"binding":{"kind":"app_id","app_id":"surf-ace-visible-verifier"}}'
 ```
 
 Note: `--runtime host` requires host-compositor permissions for seat-managed DRM device access (for example through seatd/systemd-logind policy). In restricted environments, startup may fail after detecting DRM nodes but before opening them.
@@ -69,13 +69,13 @@ Operator launcher (seatd, handles stale-shell group inheritance):
 ./scripts/launch-host-seatd.sh --socket-path /tmp/surf-ace-compositor.sock
 ```
 
-Operator visible verification (launch + 90-degree CCW rotation + fullscreen demo app):
+Operator visible verification (launch + 90-degree CCW rotation + fullscreen verifier app):
 
 ```bash
 ./scripts/verify-visible-host-seatd.sh --socket-path /tmp/surf-ace-compositor.sock
 ```
 
-This command keeps the compositor and demo running until `Ctrl-C`, so the physical
+This command keeps the compositor and verifier running until `Ctrl-C`, so the physical
 screen can be checked directly. Evidence files are written to `/tmp/surf-ace-visible-verify-*`.
 
 ## Operator Quick Path (Racter)
@@ -100,7 +100,7 @@ uses it, treat that note as wrong and fall back to `launch-host-seatd.sh` or the
 Do not wrap the verify command in `timeout` or another session-killer when a human is
 checking the screen.
 
-Launch only (no demo, no forced rotation):
+Launch only (no verifier, no forced rotation):
 
 ```bash
 ./scripts/launch-host-seatd.sh --socket-path "$SURF_ACE_SOCKET"
@@ -128,7 +128,7 @@ Stale same-socket recovery behavior:
 ```text
 If an earlier run on the same socket is paused/failed (for example host session paused),
 verify-visible-host-seatd.sh tears down that stale runtime and relaunches cleanly on the
-same socket before applying rotation and starting the demo.
+same socket before applying rotation and starting the verifier.
 ```
 
 ```text
@@ -141,7 +141,7 @@ Expected on screen (success criteria):
 
 ```text
 The display leaves the text console, rotates 90 degrees CCW, and shows a fullscreen
-animated "Surf Ace Visible Demo". The image stays visible until Ctrl-C is pressed in
+animated "Surf Ace Visible Verifier". The image stays visible until Ctrl-C is pressed in
 the verify command session.
 ```
 

@@ -656,7 +656,7 @@ mod tests {
             status.panes[1].render_mode,
             PaneRenderMode::ExternalNative { .. }
         ));
-        assert!(status.prototype_policy.active_overlay_pane.is_none());
+        assert!(status.overlay_role_policy.active_overlay_pane.is_none());
     }
 
     #[test]
@@ -807,7 +807,7 @@ mod tests {
         assert!(set_response.ok);
         let status = set_response.status.expect("status should be returned");
         assert_eq!(
-            status.prototype_policy.active_overlay_pane,
+            status.overlay_role_policy.active_overlay_pane,
             Some(PaneId::new("pane-a"))
         );
         assert!(status.runtime.active_focus_target.is_none());
@@ -1144,7 +1144,7 @@ mod tests {
             status.panes[0].external_native_state,
             ExternalNativeLifecycleState::Launching { pid: 42 }
         );
-        assert!(status.prototype_policy.active_overlay_pane.is_none());
+        assert!(status.overlay_role_policy.active_overlay_pane.is_none());
     }
 
     #[test]
@@ -1228,7 +1228,7 @@ mod tests {
         assert_eq!(native_host.revision, 1);
         assert_eq!(native_host.surface_id, Some(101));
         assert_eq!(status.panes[0].geometry.x, 10);
-        assert!(status.prototype_policy.active_overlay_pane.is_none());
+        assert!(status.overlay_role_policy.active_overlay_pane.is_none());
 
         let missing_response = handle_request(
             &mut state,
