@@ -8,6 +8,7 @@ use crate::model::{
     RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource, RuntimeHostSelectionState,
     RuntimePhase, RuntimeSelectionMode, RuntimeStatus, StatusSnapshot, SurfaceBindingEvidence,
 };
+use crate::output_rotation_memory::OutputRotationMemory;
 use crate::output_rotation_model::OutputRotationModel;
 use crate::overlay_role_policy::{OverlayRolePolicy, OverlayRolePolicyError};
 use crate::process_manager::ProcessController;
@@ -110,6 +111,7 @@ pub struct CompositorState {
     overlay_role_policy: OverlayRolePolicy,
     runtime: RuntimeStatus,
     process_controller: Box<dyn ProcessController>,
+    output_rotation_memory: Option<OutputRotationMemory>,
     launch_token_counter: u64,
 }
 
@@ -166,9 +168,17 @@ impl CompositorState {
     }
 
     pub fn new(host_mode_active: bool, process_controller: Box<dyn ProcessController>) -> Self {
+        Self::new_with_output_rotation(host_mode_active, process_controller, OutputRotation::Deg0)
+    }
+
+    pub fn new_with_output_rotation(
+        host_mode_active: bool,
+        process_controller: Box<dyn ProcessController>,
+        output_rotation: OutputRotation,
+    ) -> Self {
         Self {
             host_mode_active,
-            output_rotation: OutputRotation::Deg0,
+            output_rotation,
             panes: HashMap::new(),
             shell_overlay_process: None,
             shell_overlay_lifecycle: ExternalNativeLifecycleState::Absent,
@@ -179,8 +189,17 @@ impl CompositorState {
             overlay_role_policy: OverlayRolePolicy::default(),
             runtime: RuntimeStatus::default(),
             process_controller,
+            output_rotation_memory: None,
             launch_token_counter: 0,
         }
+    }
+
+    pub fn remember_output_rotation_with(&mut self, memory: OutputRotationMemory) {
+        self.output_rotation_memory = Some(memory);
+    }
+
+    pub fn persist_current_output_rotation(&self) {
+        self.persist_output_rotation(self.output_rotation);
     }
 
     pub fn host_mode_active(&self) -> bool {
@@ -189,15 +208,30 @@ impl CompositorState {
 
     pub fn set_output_rotation(&mut self, rotation: OutputRotation) {
         if self.output_rotation == rotation {
+            self.persist_output_rotation(rotation);
             return;
         }
         let previous_rotation = self.output_rotation;
         self.output_rotation = rotation;
         self.rotate_native_pane_viewports(previous_rotation, rotation);
+        self.persist_output_rotation(rotation);
     }
 
     pub fn output_rotation(&self) -> OutputRotation {
         self.output_rotation
+    }
+
+    fn persist_output_rotation(&self, rotation: OutputRotation) {
+        let Some(memory) = self.output_rotation_memory.as_ref() else {
+            return;
+        };
+        if let Err(err) = memory.store(rotation) {
+            eprintln!(
+                "failed to persist output rotation {:?} to {}: {err}",
+                rotation,
+                memory.path().display()
+            );
+        }
     }
 
     pub fn topology_epoch(&self) -> &str {
@@ -2081,6 +2115,55 @@ mod tests {
             cwd: None,
             env: BTreeMap::new(),
         }
+    }
+
+    fn temp_rotation_memory() -> OutputRotationMemory {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should work")
+            .as_nanos();
+        OutputRotationMemory::new(std::path::PathBuf::from(format!(
+            "/tmp/surf-ace-state-output-rotation-{}-{unique}.json",
+            std::process::id()
+        )))
+    }
+
+    #[test]
+    fn set_output_rotation_persists_last_chosen_rotation() {
+        let process = FakeProcessController::default();
+        let memory = temp_rotation_memory();
+        let path = memory.path().to_path_buf();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.remember_output_rotation_with(memory);
+
+        state.set_output_rotation(OutputRotation::Deg90);
+
+        let restored = OutputRotationMemory::new(path.clone())
+            .load()
+            .expect("remembered rotation should load");
+        assert_eq!(restored, Some(OutputRotation::Deg90));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn set_output_rotation_persists_explicit_same_rotation() {
+        let process = FakeProcessController::default();
+        let memory = temp_rotation_memory();
+        let path = memory.path().to_path_buf();
+        let mut state = CompositorState::new_with_output_rotation(
+            true,
+            Box::new(process),
+            OutputRotation::Deg90,
+        );
+        state.remember_output_rotation_with(memory);
+
+        state.set_output_rotation(OutputRotation::Deg90);
+
+        let restored = OutputRotationMemory::new(path.clone())
+            .load()
+            .expect("remembered rotation should load");
+        assert_eq!(restored, Some(OutputRotation::Deg90));
+        let _ = std::fs::remove_file(path);
     }
 
     fn overlay_region(

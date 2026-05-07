@@ -1,9 +1,9 @@
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -29,6 +29,28 @@ fn wait_for_socket(socket_path: &Path) {
         thread::sleep(Duration::from_millis(10));
     }
     panic!("socket not created at {}", socket_path.display());
+}
+
+fn stop_child(mut child: Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn send_control_request(socket_path: &Path, request: Value) -> Value {
+    let mut stream = UnixStream::connect(socket_path).expect("control socket should connect");
+    stream
+        .write_all(
+            serde_json::to_string(&request)
+                .expect("request should serialize")
+                .as_bytes(),
+        )
+        .expect("request should write");
+    stream.write_all(b"\n").expect("newline should write");
+    let mut response_line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut response_line)
+        .expect("response should read");
+    serde_json::from_str(&response_line).expect("response should parse")
 }
 
 fn serve_single_request(
@@ -160,6 +182,130 @@ fn capture_command_sends_capture_request_and_reports_path() {
 
     let _ = fs::remove_file(&capture_path);
     server.join().expect("server should finish");
+}
+
+#[test]
+fn serve_restores_remembered_output_rotation_when_unspecified() {
+    let state_path = unique_temp_path("surf-ace-output-rotation-state", ".json");
+    let first_socket = unique_temp_path("surf-ace-output-rotation-first", ".sock");
+    let first = Command::new(env!("CARGO_BIN_EXE_surf-ace-compositor"))
+        .args([
+            "serve",
+            "--runtime",
+            "none",
+            "--socket-path",
+            first_socket
+                .to_str()
+                .expect("socket path should be valid UTF-8"),
+            "--output-rotation",
+            "deg90",
+            "--output-rotation-state-path",
+            state_path
+                .to_str()
+                .expect("state path should be valid UTF-8"),
+        ])
+        .spawn()
+        .expect("first serve should start");
+    wait_for_socket(&first_socket);
+    let first_status = send_control_request(&first_socket, json!({ "type": "get_status" }));
+    assert_eq!(first_status["status"]["output_rotation"], json!("deg90"));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&state_path).expect("state should exist"))
+            .expect("state should parse"),
+        json!("deg90")
+    );
+    stop_child(first);
+    let _ = fs::remove_file(&first_socket);
+
+    let second_socket = unique_temp_path("surf-ace-output-rotation-second", ".sock");
+    let second = Command::new(env!("CARGO_BIN_EXE_surf-ace-compositor"))
+        .args([
+            "serve",
+            "--runtime",
+            "none",
+            "--socket-path",
+            second_socket
+                .to_str()
+                .expect("socket path should be valid UTF-8"),
+            "--output-rotation-state-path",
+            state_path
+                .to_str()
+                .expect("state path should be valid UTF-8"),
+        ])
+        .spawn()
+        .expect("second serve should start");
+    wait_for_socket(&second_socket);
+    let second_status = send_control_request(&second_socket, json!({ "type": "get_status" }));
+    assert_eq!(second_status["status"]["output_rotation"], json!("deg90"));
+    stop_child(second);
+
+    let _ = fs::remove_file(&second_socket);
+    let _ = fs::remove_file(&state_path);
+}
+
+#[test]
+fn failed_explicit_start_does_not_overwrite_remembered_output_rotation() {
+    let state_path = unique_temp_path("surf-ace-output-rotation-state-failed-start", ".json");
+    let socket_path = unique_temp_path("surf-ace-output-rotation-owned", ".sock");
+    fs::write(&state_path, b"\"deg90\"").expect("initial state should write");
+
+    let owner = Command::new(env!("CARGO_BIN_EXE_surf-ace-compositor"))
+        .args([
+            "serve",
+            "--runtime",
+            "none",
+            "--socket-path",
+            socket_path
+                .to_str()
+                .expect("socket path should be valid UTF-8"),
+            "--output-rotation-state-path",
+            state_path
+                .to_str()
+                .expect("state path should be valid UTF-8"),
+        ])
+        .spawn()
+        .expect("owner serve should start");
+    wait_for_socket(&socket_path);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_surf-ace-compositor"))
+        .args([
+            "serve",
+            "--runtime",
+            "none",
+            "--socket-path",
+            socket_path
+                .to_str()
+                .expect("socket path should be valid UTF-8"),
+            "--output-rotation",
+            "deg270",
+            "--output-rotation-state-path",
+            state_path
+                .to_str()
+                .expect("state path should be valid UTF-8"),
+        ])
+        .output()
+        .expect("second serve should run");
+
+    assert!(
+        !output.status.success(),
+        "second serve unexpectedly succeeded: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("control socket already active"),
+        "second serve stderr should report live socket ownership: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&state_path).expect("state should remain"))
+            .expect("state should parse"),
+        json!("deg90")
+    );
+
+    stop_child(owner);
+    let _ = fs::remove_file(&socket_path);
+    let _ = fs::remove_file(&state_path);
 }
 
 #[test]

@@ -8,11 +8,14 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use surf_ace_compositor::control::{
-    ControlRequest, RuntimeControlCommand, bind_control_listener, send_request, serve,
+    ControlRequest, RuntimeControlCommand, bind_control_listener, send_request,
     serve_listener_with_runtime_control,
 };
 use surf_ace_compositor::model::{
     HostRuntimeStartTrigger, MainAppLaunchIntent, OutputRotation, ProcessSpec,
+};
+use surf_ace_compositor::output_rotation_memory::{
+    OUTPUT_ROTATION_STATE_PATH_ENV, OutputRotationMemory,
 };
 use surf_ace_compositor::process_manager::LocalProcessController;
 use surf_ace_compositor::runtime::{
@@ -26,6 +29,7 @@ const RUNTIME_ENV: &str = "SURF_ACE_COMPOSITOR_RUNTIME";
 const HOST_DRM_DEVICE_ENV: &str = "SURF_ACE_COMPOSITOR_HOST_DRM_DEVICE";
 const HOST_OUTPUT_ENV: &str = "SURF_ACE_COMPOSITOR_HOST_OUTPUT";
 const CONTROL_SOCKET_ENV: &str = "SURF_ACE_COMPOSITOR_SOCKET";
+const OUTPUT_ROTATION_ENV: &str = "SURF_ACE_COMPOSITOR_OUTPUT_ROTATION";
 const TEST_HOST_RUNTIME_CAPABLE_ENV: &str = "SURF_ACE_COMPOSITOR_TEST_HOST_RUNTIME_CAPABLE";
 const SHELL_OVERLAY_TOGGLE_SHORTCUT_ENV: &str = "SURF_ACE_COMPOSITOR_SHELL_OVERLAY_TOGGLE_SHORTCUT";
 const SHELL_OVERLAY_APP_ID: &str = "surf-ace-shell-overlay";
@@ -67,6 +71,14 @@ enum Command {
         host_drm_device: Option<PathBuf>,
         #[arg(long, env = HOST_OUTPUT_ENV)]
         host_output: Option<String>,
+        #[arg(
+            long,
+            env = OUTPUT_ROTATION_ENV,
+            value_parser = ["deg0", "deg90", "deg180", "deg270"]
+        )]
+        output_rotation: Option<String>,
+        #[arg(long, env = OUTPUT_ROTATION_STATE_PATH_ENV)]
+        output_rotation_state_path: Option<PathBuf>,
         #[arg(long)]
         main_app_launch_intent_json: Option<String>,
         #[arg(
@@ -179,6 +191,8 @@ fn main() {
                 Some(launch),
                 "Super+`",
                 false,
+                None,
+                OutputRotationMemory::default_path(),
             )
         }
         Some(Command::Serve {
@@ -186,6 +200,8 @@ fn main() {
             runtime,
             host_drm_device,
             host_output,
+            output_rotation,
+            output_rotation_state_path,
             main_app_launch_intent_json,
             launch: serve_launch,
             shell_overlay_toggle_shortcut,
@@ -201,6 +217,8 @@ fn main() {
             serve_launch.as_deref().or(launch.as_deref()),
             &shell_overlay_toggle_shortcut,
             overlay_region_debug_borders,
+            output_rotation.as_deref(),
+            output_rotation_state_path,
         ),
         Some(Command::Ctl {
             socket_path,
@@ -253,8 +271,15 @@ fn run_server(
     launch: Option<&str>,
     shell_overlay_toggle_shortcut: &str,
     overlay_region_debug_borders: bool,
+    output_rotation: Option<&str>,
+    output_rotation_state_path: Option<PathBuf>,
 ) {
     let launch_plan = resolve_runtime_launch_plan(runtime, detect_host_runtime_capable());
+    let output_rotation_memory = output_rotation_state_path
+        .or_else(OutputRotationMemory::default_path)
+        .map(OutputRotationMemory::new);
+    let startup_output_rotation =
+        resolve_startup_output_rotation(output_rotation, output_rotation_memory.as_ref());
     let shell_overlay_toggle_shortcut =
         match parse_shell_overlay_toggle_shortcut(shell_overlay_toggle_shortcut) {
             Ok(shortcut) => shortcut,
@@ -271,10 +296,14 @@ fn run_server(
                 std::process::exit(2);
             }
         };
-    let state = CompositorState::new(
+    let mut state = CompositorState::new_with_output_rotation(
         launch_plan.host_mode_active,
         Box::new(LocalProcessController::default()),
+        startup_output_rotation,
     );
+    if let Some(memory) = output_rotation_memory {
+        state.remember_output_rotation_with(memory);
+    }
     let shared_state = Arc::new(Mutex::new(state));
     {
         let mut state = match shared_state.lock() {
@@ -296,7 +325,17 @@ fn run_server(
 
     match launch_plan.selected_runtime.as_str() {
         "none" => {
-            if let Err(err) = serve(&socket_path, shared_state, screen_capture) {
+            let listener = match bind_control_listener(&socket_path) {
+                Ok(listener) => listener,
+                Err(err) => {
+                    eprintln!("control server failed: {err}");
+                    std::process::exit(1);
+                }
+            };
+            persist_startup_output_rotation_if_explicit(&shared_state, output_rotation);
+            if let Err(err) =
+                serve_listener_with_runtime_control(listener, shared_state, None, screen_capture)
+            {
                 eprintln!("control server failed: {err}");
                 std::process::exit(1);
             }
@@ -309,6 +348,7 @@ fn run_server(
                     std::process::exit(1);
                 }
             };
+            persist_startup_output_rotation_if_explicit(&shared_state, output_rotation);
             let control_state = shared_state.clone();
             let control_screen_capture = screen_capture.clone();
             thread::spawn(move || {
@@ -336,6 +376,7 @@ fn run_server(
                     std::process::exit(1);
                 }
             };
+            persist_startup_output_rotation_if_explicit(&shared_state, output_rotation);
             let (runtime_control_tx, runtime_control_rx) = mpsc::channel::<RuntimeControlCommand>();
             let control_state = shared_state.clone();
             let control_runtime_tx = runtime_control_tx.clone();
@@ -408,6 +449,20 @@ fn run_server(
             std::process::exit(2);
         }
     };
+}
+
+fn persist_startup_output_rotation_if_explicit(
+    shared_state: &Arc<Mutex<CompositorState>>,
+    output_rotation: Option<&str>,
+) {
+    if output_rotation.is_none() {
+        return;
+    }
+    let state = match shared_state.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    state.persist_current_output_rotation();
 }
 
 fn apply_runtime_selection_status(
@@ -743,6 +798,35 @@ fn default_control_socket_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp/surf-ace-compositor.sock"))
 }
 
+fn resolve_startup_output_rotation(
+    explicit_rotation: Option<&str>,
+    memory: Option<&OutputRotationMemory>,
+) -> OutputRotation {
+    if let Some(rotation) = explicit_rotation {
+        return match parse_output_rotation(rotation) {
+            Ok(rotation) => rotation,
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(2);
+            }
+        };
+    }
+    let Some(memory) = memory else {
+        return OutputRotation::Deg0;
+    };
+    match memory.load() {
+        Ok(Some(rotation)) => rotation,
+        Ok(None) => OutputRotation::Deg0,
+        Err(err) => {
+            eprintln!(
+                "failed to load remembered output rotation from {}: {err}",
+                memory.path().display()
+            );
+            OutputRotation::Deg0
+        }
+    }
+}
+
 fn run_rotate(socket_path: PathBuf, rotation: &str) {
     let rotation = match parse_output_rotation(rotation) {
         Ok(rotation) => rotation,
@@ -799,11 +883,27 @@ mod tests {
     use super::{
         Cli, Command, parse_main_app_launch_intent, parse_main_app_launch_shorthand,
         resolve_main_app_launch_intent, resolve_runtime_launch_plan,
+        resolve_startup_output_rotation,
     };
     use clap::Parser;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use surf_ace_compositor::model::{
-        MainAppLaunchIntent, MainAppLaunchState, MainAppSurfaceBinding, RuntimeSelectionMode,
+        MainAppLaunchIntent, MainAppLaunchState, MainAppSurfaceBinding, OutputRotation,
+        RuntimeSelectionMode,
     };
+    use surf_ace_compositor::output_rotation_memory::OutputRotationMemory;
+
+    fn temp_rotation_path() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should work")
+            .as_nanos();
+        PathBuf::from(format!(
+            "/tmp/surf-ace-main-output-rotation-{}-{unique}.json",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn auto_runtime_prefers_host_when_host_capable() {
@@ -886,6 +986,60 @@ mod tests {
         );
         assert!(launch.is_none());
         assert_eq!(shell_overlay_toggle_shortcut, "super+f12");
+    }
+
+    #[test]
+    fn serve_cli_accepts_explicit_output_rotation_and_state_path() {
+        let cli = Cli::try_parse_from([
+            "surf-ace-compositor",
+            "serve",
+            "--output-rotation",
+            "deg90",
+            "--output-rotation-state-path",
+            "/tmp/surf-ace-rotation-state.json",
+        ])
+        .expect("serve command should parse");
+        let Some(Command::Serve {
+            output_rotation,
+            output_rotation_state_path,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected serve command");
+        };
+        assert_eq!(output_rotation.as_deref(), Some("deg90"));
+        assert_eq!(
+            output_rotation_state_path.as_deref(),
+            Some(std::path::Path::new("/tmp/surf-ace-rotation-state.json"))
+        );
+    }
+
+    #[test]
+    fn startup_output_rotation_restores_remembered_rotation_when_unspecified() {
+        let memory = OutputRotationMemory::new(temp_rotation_path());
+        memory
+            .store(OutputRotation::Deg90)
+            .expect("rotation should store");
+
+        assert_eq!(
+            resolve_startup_output_rotation(None, Some(&memory)),
+            OutputRotation::Deg90
+        );
+        let _ = std::fs::remove_file(memory.path());
+    }
+
+    #[test]
+    fn startup_output_rotation_explicit_override_wins_over_remembered_rotation() {
+        let memory = OutputRotationMemory::new(temp_rotation_path());
+        memory
+            .store(OutputRotation::Deg90)
+            .expect("rotation should store");
+
+        assert_eq!(
+            resolve_startup_output_rotation(Some("deg270"), Some(&memory)),
+            OutputRotation::Deg270
+        );
+        let _ = std::fs::remove_file(memory.path());
     }
 
     #[test]
