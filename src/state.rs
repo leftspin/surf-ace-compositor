@@ -428,6 +428,51 @@ impl CompositorState {
         }
     }
 
+    pub fn mark_runtime_host_output_reclaim_pending(&mut self, error: impl Into<String>) {
+        self.runtime.phase = RuntimePhase::Running;
+        self.runtime.host_start_request_pending = false;
+        self.runtime.last_error = Some(error.into());
+        self.runtime.runtime_operator_action_needed = false;
+        self.runtime.runtime_operator_action_reason = None;
+        self.runtime.host_output_ownership = false;
+        self.runtime.host_active_connector_name = None;
+        self.runtime.host_active_connector_id = None;
+        self.set_runtime_host_present_capabilities(RuntimeHostPresentOwnership::None, false, false);
+    }
+
+    pub fn mark_runtime_host_output_reclaimed(
+        &mut self,
+        window_width: i32,
+        window_height: i32,
+        active_connector_name: Option<String>,
+        active_connector_id: Option<u32>,
+        last_selection_attempt: Option<String>,
+        last_selection_result: Option<String>,
+        present_ownership: RuntimeHostPresentOwnership,
+        atomic_commit_enabled: bool,
+        overlay_plane_capable: bool,
+    ) {
+        self.runtime.phase = RuntimePhase::Running;
+        self.runtime.host_start_request_pending = false;
+        self.runtime.window_width = Some(window_width);
+        self.runtime.window_height = Some(window_height);
+        self.runtime.last_error = None;
+        self.runtime.runtime_operator_action_needed = false;
+        self.runtime.runtime_operator_action_reason = None;
+        self.runtime.host_output_ownership = true;
+        self.set_runtime_host_route_selection_status(
+            active_connector_name,
+            active_connector_id,
+            last_selection_attempt,
+            last_selection_result,
+        );
+        self.set_runtime_host_present_capabilities(
+            present_ownership,
+            atomic_commit_enabled,
+            overlay_plane_capable,
+        );
+    }
+
     pub fn set_runtime_last_queued_present(
         &mut self,
         source: RuntimeHostQueuedPresentSource,
@@ -4400,6 +4445,96 @@ mod tests {
             runtime.host_present_ownership,
             RuntimeHostPresentOwnership::None
         );
+    }
+
+    #[test]
+    fn host_output_reclaim_pending_preserves_runtime_session_without_operator_retry() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.mark_runtime_host_running(
+            "wayland-77".to_string(),
+            1280,
+            800,
+            Some("seat0".to_string()),
+            2,
+            2,
+            Some("/dev/dri/card0".to_string()),
+            Some("HDMI-A-3".to_string()),
+            Some(77),
+            Some("auto-selected device=/dev/dri/card0 output=HDMI-A-3".to_string()),
+            Some("auto-selected device=/dev/dri/card0 output=HDMI-A-3".to_string()),
+            RuntimeHostPresentOwnership::DirectGbm,
+            true,
+            false,
+        );
+        state.set_runtime_surface_roles(Some(101), Some(202), Some(PaneId::new("pane-1")));
+        state.set_runtime_focus_target(Some(RuntimeFocusTarget::MainApp));
+
+        state.mark_runtime_host_output_reclaim_pending("previous output disappeared");
+
+        let runtime = state.status_snapshot().runtime;
+        assert_eq!(runtime.phase, RuntimePhase::Running);
+        assert_eq!(
+            runtime.last_error.as_deref(),
+            Some("previous output disappeared")
+        );
+        assert!(!runtime.runtime_operator_action_needed);
+        assert_eq!(runtime.wayland_socket.as_deref(), Some("wayland-77"));
+        assert_eq!(runtime.main_app_surface_id, Some(101));
+        assert_eq!(runtime.overlay_surface_id, Some(202));
+        assert_eq!(
+            runtime.active_focus_target,
+            Some(RuntimeFocusTarget::MainApp)
+        );
+        assert!(!runtime.host_output_ownership);
+        assert_eq!(runtime.host_active_connector_name, None);
+        assert_eq!(
+            runtime.host_present_ownership,
+            RuntimeHostPresentOwnership::None
+        );
+    }
+
+    #[test]
+    fn host_output_reclaimed_clears_pending_error_and_restores_scanout_truth() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            1280,
+            800,
+        );
+        state.mark_runtime_host_output_reclaim_pending("previous output disappeared");
+
+        state.mark_runtime_host_output_reclaimed(
+            3840,
+            2160,
+            Some("HDMI-A-3".to_string()),
+            Some(77),
+            Some("auto recovery retry".to_string()),
+            Some("auto-selected device=/dev/dri/card0 output=HDMI-A-3".to_string()),
+            RuntimeHostPresentOwnership::DirectGbm,
+            true,
+            false,
+        );
+
+        let runtime = state.status_snapshot().runtime;
+        assert_eq!(runtime.phase, RuntimePhase::Running);
+        assert_eq!(runtime.last_error, None);
+        assert!(!runtime.runtime_operator_action_needed);
+        assert!(runtime.host_output_ownership);
+        assert_eq!(runtime.window_width, Some(3840));
+        assert_eq!(runtime.window_height, Some(2160));
+        assert_eq!(
+            runtime.host_active_connector_name.as_deref(),
+            Some("HDMI-A-3")
+        );
+        assert_eq!(runtime.host_active_connector_id, Some(77));
+        assert_eq!(
+            runtime.host_present_ownership,
+            RuntimeHostPresentOwnership::DirectGbm
+        );
+        assert!(runtime.host_atomic_commit_enabled);
     }
 
     #[test]

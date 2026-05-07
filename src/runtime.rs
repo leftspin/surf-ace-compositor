@@ -811,12 +811,11 @@ pub fn run_host(
                     &drm_events_source_token_for_timer,
                     reclaim_required_ownership,
                 ) {
-                    let mut state = lock_state(&data.shared_state);
-                    state.mark_runtime_failed(format!(
-                        "host backend has no claimed output and reclaim failed: {err}"
-                    ));
-                    data.loop_signal.stop();
-                    return TimeoutAction::Drop;
+                    mark_host_output_reclaim_pending(
+                        data,
+                        format!("host backend has no claimed output and reclaim failed: {err}"),
+                    );
+                    return TimeoutAction::ToDuration(Duration::from_millis(250));
                 }
                 return TimeoutAction::ToDuration(Duration::from_millis(16));
             }
@@ -836,13 +835,14 @@ pub fn run_host(
                             &drm_events_source_token_for_timer,
                             reclaim_required_ownership,
                         ) {
-                            let mut state = lock_state(&data.shared_state);
-                            state.mark_runtime_failed(format!(
+                            mark_host_output_reclaim_pending(
+                                data,
+                                format!(
                                 "host present/commit recovery failed after queue error ({}): {reclaim_err}",
                                 failure.error_ref()
-                            ));
-                            data.loop_signal.stop();
-                            return TimeoutAction::Drop;
+                                ),
+                            );
+                            return TimeoutAction::ToDuration(Duration::from_millis(250));
                         }
                         return TimeoutAction::ToDuration(Duration::from_millis(16));
                     }
@@ -923,17 +923,10 @@ pub fn run_host(
                     &drm_events_source_token_for_udev,
                     reclaim_required_ownership,
                 ) {
-                    let mut state = lock_state(&data.shared_state);
-                    state.set_runtime_host_backend_snapshot(
-                        Some(data.host_backend.seat_name.clone()),
-                        data.host_backend.detected_count(),
-                        data.host_backend.opened_count(),
-                        data.host_backend.primary_opened_path(),
+                    mark_host_output_reclaim_pending(
+                        data,
+                        format!("host backend lost claimed output and reclaim failed: {err}"),
                     );
-                    state.mark_runtime_failed(format!(
-                        "host backend lost claimed output and reclaim failed: {err}"
-                    ));
-                    data.loop_signal.stop();
                     return;
                 }
             } else {
@@ -1133,15 +1126,43 @@ fn reclaim_host_output_in_process(
     data.wayland_state
         .reconfigure_roles(mode_w as i32, mode_h as i32);
     data.wayland_state.sync_runtime_status_with_roles();
+    let (active_connector_name, active_connector_id) = data.host_backend.active_connector_status();
+    let (last_selection_attempt, last_selection_result) = data.host_backend.selection_logs();
+    let rotation = { lock_state(&data.shared_state).output_rotation() };
+    let (ownership, atomic_enabled, overlay_capable) =
+        runtime_host_present_capabilities_for_status(&data.host_backend, rotation);
     let mut state = lock_state(&data.shared_state);
-    state.mark_runtime_resize(mode_w as i32, mode_h as i32);
     state.set_runtime_host_backend_snapshot(
         Some(data.host_backend.seat_name.clone()),
         data.host_backend.detected_count(),
         data.host_backend.opened_count(),
         data.host_backend.primary_opened_path(),
     );
+    state.mark_runtime_host_output_reclaimed(
+        mode_w as i32,
+        mode_h as i32,
+        active_connector_name,
+        active_connector_id,
+        last_selection_attempt,
+        last_selection_result,
+        ownership,
+        atomic_enabled,
+        overlay_capable,
+    );
     Ok(())
+}
+
+fn mark_host_output_reclaim_pending(data: &mut HostRuntimeLoopData, error: String) {
+    sync_runtime_host_selection_status(&data.shared_state, &data.host_backend);
+    sync_runtime_host_present_capabilities(&data.shared_state, &data.host_backend);
+    let mut state = lock_state(&data.shared_state);
+    state.set_runtime_host_backend_snapshot(
+        Some(data.host_backend.seat_name.clone()),
+        data.host_backend.detected_count(),
+        data.host_backend.opened_count(),
+        data.host_backend.primary_opened_path(),
+    );
+    state.mark_runtime_host_output_reclaim_pending(error);
 }
 
 fn bind_claimed_drm_event_source(
