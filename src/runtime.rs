@@ -3769,6 +3769,28 @@ fn render_host_scene_with_gles_direct(
             wayland_state.cursor_render_location(),
             scene_render_size,
         )?;
+        let debug_borders_drawn = draw_overlay_region_debug_borders_to_gles_target(
+            &mut gles_state.renderer,
+            device_path,
+            &mut render_target,
+            wayland_state,
+            scene_render_size,
+            Size::<i32, Physical>::from((scanout_size.w, scanout_size.h)),
+            rotation,
+            "direct scanout overlay-region debug borders",
+        )?;
+        if debug_borders_drawn {
+            draw_software_cursor_to_gles_target(
+                &mut gles_state.renderer,
+                device_path,
+                &mut render_target,
+                wayland_state.cursor_render_location(),
+                scene_render_size,
+                Size::<i32, Physical>::from((scanout_size.w, scanout_size.h)),
+                rotation,
+                "direct scanout cursor",
+            )?;
+        }
         capture_screen_from_render_target(
             screen_capture,
             &mut gles_state.renderer,
@@ -3828,6 +3850,16 @@ fn render_host_scene_with_gles_direct(
             path: device_path.display().to_string(),
             error: format!("failed to finish direct gles render pass: {err}"),
         })?;
+    let _ = draw_overlay_region_debug_borders_to_gles_target(
+        &mut gles_state.renderer,
+        device_path,
+        &mut render_target,
+        wayland_state,
+        render_size,
+        render_size,
+        rotation,
+        "direct scanout overlay-region debug borders",
+    )?;
     draw_software_cursor_to_gles_target(
         &mut gles_state.renderer,
         device_path,
@@ -3979,6 +4011,28 @@ fn render_host_scene_with_gles_readback(
             wayland_state.cursor_render_location(),
             render_size,
         )?;
+        let debug_borders_drawn = draw_overlay_region_debug_borders_to_gles_target(
+            &mut gles_state.renderer,
+            device_path,
+            &mut render_target,
+            wayland_state,
+            render_size,
+            Size::<i32, Physical>::from((scanout_size.w, scanout_size.h)),
+            rotation,
+            "readback overlay-region debug borders",
+        )?;
+        if debug_borders_drawn {
+            draw_software_cursor_to_gles_target(
+                &mut gles_state.renderer,
+                device_path,
+                &mut render_target,
+                wayland_state.cursor_render_location(),
+                render_size,
+                Size::<i32, Physical>::from((scanout_size.w, scanout_size.h)),
+                rotation,
+                "readback scanout cursor",
+            )?;
+        }
         let readback_region = Rectangle::from_size(scanout_size);
         let mapping = gles_state
             .renderer
@@ -4054,6 +4108,16 @@ fn render_host_scene_with_gles_readback(
             path: device_path.display().to_string(),
             error: format!("failed to finish gles render pass: {err}"),
         })?;
+    let _ = draw_overlay_region_debug_borders_to_gles_target(
+        &mut gles_state.renderer,
+        device_path,
+        &mut render_target,
+        wayland_state,
+        render_size,
+        Size::<i32, Physical>::from((scanout_size.w, scanout_size.h)),
+        rotation,
+        "readback overlay-region debug borders",
+    )?;
     draw_software_cursor_to_gles_target(
         &mut gles_state.renderer,
         device_path,
@@ -4125,6 +4189,69 @@ fn draw_software_cursor_to_gles_target(
             path: device_path.display().to_string(),
             error: format!("failed to finish {target_name} render pass: {err}"),
         })?;
+    Ok(())
+}
+
+fn draw_overlay_region_debug_borders_to_gles_target(
+    renderer: &mut GlesRenderer,
+    device_path: &Path,
+    render_target: &mut smithay::backend::renderer::gles::GlesTarget<'_>,
+    wayland_state: &RuntimeWaylandState,
+    logical_size: Size<i32, Physical>,
+    scanout_size: Size<i32, Physical>,
+    rotation: OutputRotation,
+    target_name: &str,
+) -> Result<bool, RuntimeError> {
+    let (debug_enabled, regions) =
+        lock_state(&wayland_state.shared_state).overlay_region_debug_render_snapshot();
+    if !debug_enabled || regions.is_empty() {
+        return Ok(false);
+    }
+
+    let mut frame = renderer
+        .render(render_target, scanout_size, Transform::Normal)
+        .map_err(|err| RuntimeError::HostOutputClaim {
+            path: device_path.display().to_string(),
+            error: format!("failed to begin {target_name} render pass: {err}"),
+        })?;
+    draw_overlay_region_debug_borders_frame(
+        &mut frame,
+        &regions,
+        logical_size,
+        scanout_size,
+        rotation,
+    )
+    .map_err(|err| RuntimeError::HostOutputClaim {
+        path: device_path.display().to_string(),
+        error: format!("failed to draw {target_name}: {err}"),
+    })?;
+    let _ = frame
+        .finish()
+        .map_err(|err| RuntimeError::HostOutputClaim {
+            path: device_path.display().to_string(),
+            error: format!("failed to finish {target_name} render pass: {err}"),
+        })?;
+    Ok(true)
+}
+
+fn draw_overlay_region_debug_borders_frame<F: Frame>(
+    frame: &mut F,
+    regions: &[OverlayRegionStatus],
+    logical_size: Size<i32, Physical>,
+    scanout_size: Size<i32, Physical>,
+    rotation: OutputRotation,
+) -> Result<(), F::Error> {
+    let logical_size = Size::<i32, Logical>::from((logical_size.w, logical_size.h));
+    let output_bounds = Rectangle::from_size(scanout_size);
+    let output_damage = [output_bounds];
+    for rect in overlay_region_debug_border_rects(regions, logical_size.w, logical_size.h) {
+        let Some(rect) = cursor_rect_to_scanout(rect, logical_size, scanout_size, rotation)
+            .and_then(|rect| rect.intersection(output_bounds))
+        else {
+            continue;
+        };
+        frame.draw_solid(rect, &output_damage, Color32F::new(1.0, 0.0, 0.85, 1.0))?;
+    }
     Ok(())
 }
 
@@ -4501,7 +4628,7 @@ struct RuntimeWaylandState {
     shell_overlay_toggle_shortcut: ShellOverlayToggleShortcut,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RenderElementSource {
     MainOverlayRegion,
     Main,
@@ -4524,6 +4651,7 @@ render_elements! {
 struct RenderElementCapture {
     elements: Vec<SurfAceRenderElement>,
     counts: RenderElementCounts,
+    sources: Vec<RenderElementSource>,
 }
 
 impl RenderElementCapture {
@@ -4551,6 +4679,7 @@ impl RenderElementCapture {
             return;
         }
         self.elements.extend(new_elements);
+        self.sources.extend(std::iter::repeat(source).take(added));
         match source {
             RenderElementSource::MainOverlayRegion => self.counts.main_overlay_regions += added,
             RenderElementSource::Main => self.counts.main += added,
@@ -4564,9 +4693,17 @@ impl RenderElementCapture {
     }
 
     fn primary_plane_elements(&self) -> Vec<&SurfAceRenderElement> {
-        let primary_start =
-            (self.counts.overlay_popups + self.counts.overlay).min(self.elements.len());
-        self.elements[primary_start..].iter().collect()
+        self.elements
+            .iter()
+            .zip(self.sources.iter())
+            .filter_map(|(element, source)| {
+                (!matches!(
+                    source,
+                    RenderElementSource::Overlay | RenderElementSource::OverlayPopup
+                ))
+                .then_some(element)
+            })
+            .collect()
     }
 }
 
@@ -7969,6 +8106,96 @@ mod tests {
 
         assert_eq!(primary.len(), lifted_count);
         assert!(lifted_count > 0);
+    }
+
+    #[test]
+    fn primary_plane_elements_filter_dedicated_overlay_by_source_not_position() {
+        let mut capture = super::RenderElementCapture::default();
+        capture.push_elements(
+            super::RenderElementSource::NativePane,
+            super::overlay_region_debug_border_elements(
+                &[test_overlay_region(
+                    "native",
+                    vec![OverlayCaptureCapability::PointerHover],
+                )],
+                160,
+                100,
+            ),
+        );
+        let native_count = capture.counts.native_panes;
+        capture.push_elements(
+            super::RenderElementSource::Overlay,
+            super::overlay_region_debug_border_elements(
+                &[test_overlay_region(
+                    "overlay",
+                    vec![OverlayCaptureCapability::PointerHover],
+                )],
+                160,
+                100,
+            ),
+        );
+
+        let primary = capture.primary_plane_elements();
+
+        assert_eq!(primary.len(), native_count);
+        assert!(native_count > 0);
+    }
+
+    #[test]
+    fn overlay_region_chrome_orders_before_native_pane_content_for_smithay_z_order() {
+        let mut capture = super::RenderElementCapture::default();
+        capture.push_elements(
+            super::RenderElementSource::OverlayRegionDebug,
+            super::overlay_region_debug_border_elements(
+                &[test_overlay_region(
+                    "debug",
+                    vec![OverlayCaptureCapability::PointerHover],
+                )],
+                160,
+                100,
+            ),
+        );
+        capture.push_elements(
+            super::RenderElementSource::MainOverlayRegion,
+            super::overlay_region_debug_border_elements(
+                &[test_overlay_region(
+                    "chrome",
+                    vec![OverlayCaptureCapability::PointerHover],
+                )],
+                160,
+                100,
+            ),
+        );
+        capture.push_elements(
+            super::RenderElementSource::NativePane,
+            super::overlay_region_debug_border_elements(
+                &[test_overlay_region(
+                    "native",
+                    vec![OverlayCaptureCapability::PointerHover],
+                )],
+                160,
+                100,
+            ),
+        );
+
+        let first_native = capture
+            .sources
+            .iter()
+            .position(|source| *source == super::RenderElementSource::NativePane)
+            .expect("native pane source should be recorded");
+        let first_debug = capture
+            .sources
+            .iter()
+            .position(|source| *source == super::RenderElementSource::OverlayRegionDebug)
+            .expect("debug source should be recorded");
+        let first_lifted = capture
+            .sources
+            .iter()
+            .position(|source| *source == super::RenderElementSource::MainOverlayRegion)
+            .expect("lifted source should be recorded");
+
+        assert!(first_debug < first_native);
+        assert!(first_lifted < first_native);
     }
 
     #[test]

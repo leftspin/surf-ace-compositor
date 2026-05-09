@@ -684,6 +684,18 @@ impl CompositorState {
         self.runtime.overlay_region_debug_borders = enabled;
     }
 
+    pub fn overlay_region_debug_render_snapshot(&self) -> (bool, Vec<OverlayRegionStatus>) {
+        if !self.runtime.overlay_region_debug_borders {
+            return (false, Vec::new());
+        }
+        let regions = self
+            .overlay_regions
+            .as_ref()
+            .map(|snapshot| snapshot.regions.clone())
+            .unwrap_or_default();
+        (true, regions)
+    }
+
     pub fn runtime_expected_main_app_binding(&self) -> Option<(u32, MainAppSurfaceBinding)> {
         self.runtime_expected_main_app_binding_with_token()
             .map(|expectation| (expectation.pid, expectation.binding))
