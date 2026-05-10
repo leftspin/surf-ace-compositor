@@ -453,3 +453,55 @@ fn ctl_launch_shorthand_sends_main_app_launch_intent_request() {
 
     server.join().expect("server should finish");
 }
+
+#[test]
+fn serve_launch_shorthand_reuses_active_control_socket_instead_of_rebinding() {
+    let socket_path = unique_temp_path("surf-ace-serve-launch-active", ".sock");
+    let server = serve_single_request(&socket_path, |request| {
+        assert_eq!(
+            request,
+            json!({
+                "type": "set_main_app_launch_intent",
+                "intent": {
+                    "process": {
+                        "command": "ghostty",
+                        "args": ["--class=surf-ace-main-app", "-e", "top"]
+                    },
+                    "binding": {
+                        "kind": "app_id",
+                        "app_id": "surf-ace-main-app"
+                    }
+                }
+            })
+        );
+        json!({ "ok": true })
+    });
+
+    wait_for_socket(&socket_path);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_surf-ace-compositor"))
+        .args([
+            "serve",
+            "--runtime",
+            "none",
+            "--socket-path",
+            socket_path
+                .to_str()
+                .expect("socket path should be valid UTF-8"),
+            "--launch",
+            "ghostty -e top",
+        ])
+        .output()
+        .expect("serve launch command should run");
+
+    assert!(
+        output.status.success(),
+        "serve launch command should dispatch to active socket instead of failing bind: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = serde_json::from_slice::<Value>(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(stdout, json!({ "ok": true }));
+
+    server.join().expect("server should finish");
+}

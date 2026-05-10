@@ -206,20 +206,26 @@ fn main() {
             launch: serve_launch,
             shell_overlay_toggle_shortcut,
             overlay_region_debug_borders,
-        }) => run_server(
-            socket_path,
-            &runtime,
-            HostRuntimeOptions {
-                forced_drm_path: host_drm_device,
-                forced_output_name: host_output,
-            },
-            main_app_launch_intent_json.as_deref(),
-            serve_launch.as_deref().or(launch.as_deref()),
-            &shell_overlay_toggle_shortcut,
-            overlay_region_debug_borders,
-            output_rotation.as_deref(),
-            output_rotation_state_path,
-        ),
+        }) => {
+            let launch = serve_launch.as_deref().or(launch.as_deref());
+            if launch.is_some() && main_app_launch_intent_json.is_none() {
+                dispatch_launch_to_active_socket_or_continue(&socket_path, launch.unwrap());
+            }
+            run_server(
+                socket_path,
+                &runtime,
+                HostRuntimeOptions {
+                    forced_drm_path: host_drm_device,
+                    forced_output_name: host_output,
+                },
+                main_app_launch_intent_json.as_deref(),
+                launch,
+                &shell_overlay_toggle_shortcut,
+                overlay_region_debug_borders,
+                output_rotation.as_deref(),
+                output_rotation_state_path,
+            )
+        }
         Some(Command::Ctl {
             socket_path,
             request_json,
@@ -252,6 +258,38 @@ fn main() {
         }) => {
             reject_launch_without_serve(launch.as_deref());
             run_capture(socket_path, &output_path)
+        }
+    }
+}
+
+fn dispatch_launch_to_active_socket_or_continue(socket_path: &Path, launch: &str) {
+    if !control_socket_is_active(socket_path) {
+        return;
+    }
+
+    let request = match build_launch_control_request(launch) {
+        Ok(request) => request,
+        Err(err) => {
+            eprintln!("invalid --launch command: {err}");
+            std::process::exit(2);
+        }
+    };
+    match send_request(socket_path, &request) {
+        Ok(response) => {
+            print_control_response(response);
+            std::process::exit(0);
+        }
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            let _ = fs::remove_file(socket_path);
+        }
+        Err(err) => {
+            eprintln!("control request failed: {err}");
+            std::process::exit(4);
         }
     }
 }
