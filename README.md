@@ -118,6 +118,17 @@ zsh main-app verification (rotated 90 degrees CCW):
 ./scripts/verify-zsh-main-host-seatd.sh --socket-path "$SURF_ACE_SOCKET"
 ```
 
+Active-socket relaunch-control verification (safe: requires an already-running compositor; does not start/stop/restart it):
+
+```bash
+./scripts/verify-active-socket-relaunch-control.sh --socket-path "$SURF_ACE_SOCKET"
+```
+
+This verifies that `serve --launch ... --socket-path <active>` dispatches through the active
+control socket instead of rebinding/failing, waits for the relaunched main app to attach,
+captures the compositor output, and writes evidence to `/tmp/surf-ace-relaunch-control-verify-*`.
+Use `--launch <command>` to override the default `foot --app-id surf-ace-main-app sh -lc top`.
+
 This path launches a supported Wayland terminal as the compositor `main_app`, runs
 `zsh` inside it through the compositor startup launch contract, and waits until
 runtime status shows the terminal attached in the fullscreen slot after the
