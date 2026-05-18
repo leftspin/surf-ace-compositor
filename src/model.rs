@@ -454,6 +454,15 @@ pub enum RuntimeFocusTarget {
     NativePane { pane_id: PaneId },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentAppearance {
+    Light,
+    Dark,
+    #[default]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostRuntimeStartTrigger {
@@ -507,6 +516,8 @@ pub struct RuntimeDmabufFormatStatus {
 pub struct RuntimeStatus {
     pub backend: RuntimeBackend,
     pub phase: RuntimePhase,
+    #[serde(default)]
+    pub appearance: EnvironmentAppearance,
     pub runtime_selection_mode: RuntimeSelectionMode,
     pub runtime_operator_action_needed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -599,6 +610,7 @@ impl Default for RuntimeStatus {
         Self {
             backend: RuntimeBackend::None,
             phase: RuntimePhase::Inactive,
+            appearance: EnvironmentAppearance::Unknown,
             runtime_selection_mode: RuntimeSelectionMode::Automatic,
             runtime_operator_action_needed: false,
             runtime_operator_action_reason: None,

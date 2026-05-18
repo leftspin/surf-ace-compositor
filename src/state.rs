@@ -1,12 +1,13 @@
 use crate::model::{
-    ExternalNativeEventContract, ExternalNativeLifecycleState, HostRuntimeStartTrigger,
-    MainAppLaunchIntent, MainAppLaunchState, MainAppSurfaceBinding, NativePaneHostRequest,
-    NativePaneHostStatus, NativeTargetClass, OutputRotation, OverlayCoordinateSpace, OverlayRect,
-    OverlayRegionRequest, OverlayRegionStatus, OverlayRegionUpdateReason, OverlayRegionsStatus,
-    PaneGeometry, PaneGeometryCoordinateSpace, PaneId, PaneRenderMode, PaneStatus, ProcessSpec,
-    ProviderPaneSnapshot, RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeFocusTarget,
-    RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource, RuntimeHostSelectionState,
-    RuntimePhase, RuntimeSelectionMode, RuntimeStatus, StatusSnapshot, SurfaceBindingEvidence,
+    EnvironmentAppearance, ExternalNativeEventContract, ExternalNativeLifecycleState,
+    HostRuntimeStartTrigger, MainAppLaunchIntent, MainAppLaunchState, MainAppSurfaceBinding,
+    NativePaneHostRequest, NativePaneHostStatus, NativeTargetClass, OutputRotation,
+    OverlayCoordinateSpace, OverlayRect, OverlayRegionRequest, OverlayRegionStatus,
+    OverlayRegionUpdateReason, OverlayRegionsStatus, PaneGeometry, PaneGeometryCoordinateSpace,
+    PaneId, PaneRenderMode, PaneStatus, ProcessSpec, ProviderPaneSnapshot, RuntimeBackend,
+    RuntimeDmabufFormatStatus, RuntimeFocusTarget, RuntimeHostPresentOwnership,
+    RuntimeHostQueuedPresentSource, RuntimeHostSelectionState, RuntimePhase, RuntimeSelectionMode,
+    RuntimeStatus, StatusSnapshot, SurfaceBindingEvidence,
 };
 use crate::output_rotation_memory::OutputRotationMemory;
 use crate::output_rotation_model::OutputRotationModel;
@@ -678,6 +679,10 @@ impl CompositorState {
 
     pub fn set_runtime_focus_target(&mut self, target: Option<RuntimeFocusTarget>) {
         self.runtime.active_focus_target = target;
+    }
+
+    pub fn set_runtime_appearance(&mut self, appearance: EnvironmentAppearance) {
+        self.runtime.appearance = appearance;
     }
 
     pub fn set_overlay_region_debug_borders(&mut self, enabled: bool) {

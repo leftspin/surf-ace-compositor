@@ -338,6 +338,7 @@ fn ctl_command_passes_exact_main_app_launch_intent_request_through() {
                 "runtime": {
                     "backend": "none",
                     "phase": "inactive",
+                    "appearance": "unknown",
                     "runtime_selection_mode": "automatic",
                     "runtime_operator_action_needed": false,
                     "main_app_launch_intent": {

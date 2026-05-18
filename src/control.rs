@@ -1,8 +1,8 @@
 use crate::model::{
-    HostRuntimeStartTrigger, MainAppLaunchIntent, NativePaneHostRequest, NativeTargetClass,
-    OutputRotation, OverlayCoordinateSpace, OverlayRegionRequest, OverlayRegionUpdateReason,
-    PaneId, ProcessSpec, ProviderPaneSnapshot, RuntimeBackend, RuntimeFocusTarget, RuntimePhase,
-    StatusSnapshot, SurfaceBindingEvidence,
+    EnvironmentAppearance, HostRuntimeStartTrigger, MainAppLaunchIntent, NativePaneHostRequest,
+    NativeTargetClass, OutputRotation, OverlayCoordinateSpace, OverlayRegionRequest,
+    OverlayRegionUpdateReason, PaneId, ProcessSpec, ProviderPaneSnapshot, RuntimeBackend,
+    RuntimeFocusTarget, RuntimePhase, StatusSnapshot, SurfaceBindingEvidence,
 };
 use crate::screen_capture::ScreenCaptureStore;
 use crate::state::CompositorState;
@@ -19,6 +19,9 @@ use std::sync::{Arc, Mutex};
 pub enum ControlRequest {
     GetStatus,
     GetHostMode,
+    SetAppearance {
+        appearance: EnvironmentAppearance,
+    },
     SetOutputRotation {
         rotation: OutputRotation,
     },
@@ -325,6 +328,10 @@ fn handle_request_with_capture(
     let result = match request {
         ControlRequest::GetStatus => Ok(Some(state.status_snapshot())),
         ControlRequest::GetHostMode => Ok(Some(state.status_snapshot())),
+        ControlRequest::SetAppearance { appearance } => {
+            state.set_runtime_appearance(appearance);
+            Ok(Some(state.status_snapshot()))
+        }
         ControlRequest::SetOutputRotation { rotation } => {
             state.set_output_rotation(rotation);
             Ok(Some(state.status_snapshot()))
@@ -495,9 +502,9 @@ fn handle_request_with_capture(
 mod tests {
     use super::*;
     use crate::model::{
-        CompositorOverlayKind, ExternalNativeLifecycleState, HostRuntimeStartTrigger,
-        NativePaneHostRequest, OverlayCaptureCapability, OverlayRect, PaneGeometry,
-        PaneGeometryCoordinateSpace, PaneRenderMode, ProcessSpec, RuntimeBackend,
+        CompositorOverlayKind, EnvironmentAppearance, ExternalNativeLifecycleState,
+        HostRuntimeStartTrigger, NativePaneHostRequest, OverlayCaptureCapability, OverlayRect,
+        PaneGeometry, PaneGeometryCoordinateSpace, PaneRenderMode, ProcessSpec, RuntimeBackend,
         RuntimeDmabufFormatStatus, RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource,
         SurfaceBindingEvidence, SurfaceBindingEvidenceOutcome,
     };
@@ -586,6 +593,51 @@ mod tests {
         prepare_control_socket_path(&socket_path)
             .expect("stale socket file should be removed for fresh bind");
         assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn get_status_exposes_unknown_appearance_by_default() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+
+        let response = handle_request(&mut state, ControlRequest::GetStatus, None);
+
+        assert!(response.ok);
+        let status = response.status.expect("status should be returned");
+        assert_eq!(status.runtime.appearance, EnvironmentAppearance::Unknown);
+
+        let serialized =
+            serde_json::to_value(&status).expect("status snapshot should serialize to JSON");
+        assert_eq!(
+            serialized.pointer("/runtime/appearance"),
+            Some(&serde_json::json!("unknown"))
+        );
+    }
+
+    #[test]
+    fn set_appearance_updates_runtime_status_without_styling_policy() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+
+        let response = handle_request(
+            &mut state,
+            ControlRequest::SetAppearance {
+                appearance: EnvironmentAppearance::Dark,
+            },
+            None,
+        );
+
+        assert!(response.ok);
+        assert_eq!(
+            response
+                .status
+                .expect("status should be returned")
+                .runtime
+                .appearance,
+            EnvironmentAppearance::Dark
+        );
+        assert_eq!(
+            state.status_snapshot().runtime.appearance,
+            EnvironmentAppearance::Dark
+        );
     }
 
     #[test]

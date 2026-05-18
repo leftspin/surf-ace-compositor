@@ -246,6 +246,7 @@ V1 requires these subsystems:
 - preflight-only device/session success is not enough to claim running host mode; host-ready/running truth requires real output ownership
 - once host-runtime selection/start has begun, later host failure must remain explicit failed host mode rather than collapsing back into backend selection
 - post-selection host failure must keep the local control path alive for status and explicit recovery on the same underlying control surface
+- runtime status must publish environment appearance as signal state (`light`, `dark`, or `unknown` when concrete platform truth is unavailable); Surf Ace/apps own all rendering and styling decisions derived from that signal
 
 ### 2. Output management
 
@@ -334,6 +335,7 @@ For the first product slice, overlay role/binding answers are about concrete nat
   - configured/requested runtime intent
   - configured/requested fullscreen/main launch intent
   - active host route ownership/readiness truth
+  - current environment appearance signal
   - actual fullscreen/main attachment truth
   - current present/fallback truth
   - actual overlay attachment truth
