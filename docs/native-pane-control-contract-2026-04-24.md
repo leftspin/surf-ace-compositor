@@ -30,6 +30,12 @@ Example: on Racter with physical mode `3840x2160` and `output_rotation: "deg90"`
 
 When the runtime logical surface is known, `native_pane.host`, `native_pane.update`, and provider snapshots reject pane rectangles that are empty, negative/outside the logical surface, sized from the unrotated physical mode, or tagged with any unsupported `geometry.coordinateSpace`. For migration, missing `geometry.coordinateSpace` defaults to `compositor_logical`; clients should still send it explicitly. Overlay regions also use `surface_logical` coordinates and clamp to the same logical surface bounds.
 
+Surf Ace may publish overlay capture regions for a hosted native pane with
+`kind: "native_pane"`. That kind is part of the product path contract: it marks
+the provider-owned native pane rectangle as an input capture region and must be
+accepted by the compositor. It is not app styling policy and does not make the
+compositor a pane topology authority.
+
 ## Requests
 
 Host or relaunch pane-native content:

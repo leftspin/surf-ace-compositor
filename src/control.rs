@@ -1033,6 +1033,87 @@ mod tests {
     }
 
     #[test]
+    fn overlay_regions_control_accepts_native_pane_kind_from_product_path() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            640,
+            480,
+        );
+        state
+            .apply_provider_snapshot(vec![ProviderPaneSnapshot {
+                id: PaneId::new("pane-a"),
+                geometry: PaneGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 320,
+                    height: 240,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+            }])
+            .expect("provider pane should apply");
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: PaneId::new("pane-a"),
+                content_id: Some("target-egl".to_string()),
+                binding_id: Some("pane-a:target-egl".to_string()),
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 320,
+                    height: 240,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+                target: NativeTargetClass::Terminal,
+                process: ProcessSpec {
+                    command: "/usr/bin/weston-simple-egl".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                },
+            }])
+            .expect("native pane plan should apply");
+        state
+            .launch_native_pane_hosts(vec![PaneId::new("pane-a")])
+            .expect("native pane host should launch");
+        state
+            .mark_external_surface_attached(&PaneId::new("pane-a"))
+            .expect("native pane host should attach");
+        let topology_epoch = state.topology_epoch().to_string();
+
+        let request: ControlRequest = serde_json::from_str(&format!(
+            r#"{{
+                "type": "overlay_regions.set",
+                "surfaceId": "sf-test",
+                "revision": 2,
+                "topologyEpoch": "{topology_epoch}",
+                "coordinateSpace": "surface_logical",
+                "regions": [{{
+                    "regionId": "pane-a:target-egl",
+                    "paneId": "pane-a",
+                    "paneInstanceId": "pane-a:target-egl",
+                    "kind": "native_pane",
+                    "rect": {{ "x": 0, "y": 0, "width": 320, "height": 240 }},
+                    "captures": ["pointer_hover", "pointer_button", "pointer_axis"]
+                }}]
+            }}"#
+        ))
+        .expect("Surf Ace native_pane overlay region should parse");
+
+        let response = handle_request(&mut state, request, None);
+
+        assert!(response.ok, "{:?}", response.error);
+        let status = response.status.expect("status should be returned");
+        assert_eq!(status.overlay_regions.regions.len(), 1);
+        assert_eq!(
+            status.overlay_regions.regions[0].kind,
+            CompositorOverlayKind::NativePane
+        );
+    }
+
+    #[test]
     fn overlay_regions_status_exposes_current_topology_epoch_before_first_set() {
         let mut state = CompositorState::new(true, Box::new(NoopProcessController));
         state
