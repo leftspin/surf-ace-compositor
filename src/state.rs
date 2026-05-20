@@ -1,13 +1,13 @@
 use crate::model::{
-    EnvironmentAppearance, ExternalNativeEventContract, ExternalNativeLifecycleState,
-    HostRuntimeStartTrigger, MainAppLaunchIntent, MainAppLaunchState, MainAppSurfaceBinding,
-    NativePaneHostRequest, NativePaneHostStatus, NativeTargetClass, OutputRotation,
-    OverlayCoordinateSpace, OverlayRect, OverlayRegionRequest, OverlayRegionStatus,
+    EnvironmentAppearance, EnvironmentAppearanceSource, ExternalNativeEventContract,
+    ExternalNativeLifecycleState, HostRuntimeStartTrigger, MainAppLaunchIntent, MainAppLaunchState,
+    MainAppSurfaceBinding, NativePaneHostRequest, NativePaneHostStatus, NativeTargetClass,
+    OutputRotation, OverlayCoordinateSpace, OverlayRect, OverlayRegionRequest, OverlayRegionStatus,
     OverlayRegionUpdateReason, OverlayRegionsStatus, PaneGeometry, PaneGeometryCoordinateSpace,
     PaneId, PaneRenderMode, PaneStatus, ProcessSpec, ProviderPaneSnapshot, RuntimeBackend,
     RuntimeDmabufFormatStatus, RuntimeFocusTarget, RuntimeHostPresentOwnership,
     RuntimeHostQueuedPresentSource, RuntimeHostSelectionState, RuntimePhase, RuntimeSelectionMode,
-    RuntimeStatus, StatusSnapshot, SurfaceBindingEvidence,
+    RuntimeStatus, StatusSnapshot, SunScheduleAppearanceStatus, SurfaceBindingEvidence,
 };
 use crate::output_rotation_memory::OutputRotationMemory;
 use crate::output_rotation_model::OutputRotationModel;
@@ -683,6 +683,14 @@ impl CompositorState {
 
     pub fn set_runtime_appearance(&mut self, appearance: EnvironmentAppearance) {
         self.runtime.appearance = appearance;
+        self.runtime.appearance_source = EnvironmentAppearanceSource::Manual;
+        self.runtime.sun_schedule = None;
+    }
+
+    pub fn set_runtime_sun_schedule_appearance(&mut self, status: SunScheduleAppearanceStatus) {
+        self.runtime.appearance = status.appearance;
+        self.runtime.appearance_source = EnvironmentAppearanceSource::SunSchedule;
+        self.runtime.sun_schedule = Some(status);
     }
 
     pub fn set_overlay_region_debug_borders(&mut self, enabled: bool) {

@@ -463,6 +463,56 @@ pub enum EnvironmentAppearance {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentAppearanceSource {
+    Manual,
+    SunSchedule,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeSunScheduleProfile {
+    pub node_id: String,
+    pub timezone: String,
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SunScheduleAppearanceReason {
+    BeforeSunrise,
+    Daylight,
+    AfterSunset,
+    MissingProfile,
+    InvalidProfile,
+    PolarDay,
+    PolarNight,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SunScheduleAppearanceStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<NodeSunScheduleProfile>,
+    pub evaluated_at_unix_seconds: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sunrise_unix_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sunset_unix_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_transition_unix_seconds: Option<i64>,
+    pub appearance: EnvironmentAppearance,
+    pub reason: SunScheduleAppearanceReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostRuntimeStartTrigger {
@@ -512,12 +562,16 @@ pub struct RuntimeDmabufFormatStatus {
     pub modifier: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeStatus {
     pub backend: RuntimeBackend,
     pub phase: RuntimePhase,
     #[serde(default)]
     pub appearance: EnvironmentAppearance,
+    #[serde(default)]
+    pub appearance_source: EnvironmentAppearanceSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sun_schedule: Option<SunScheduleAppearanceStatus>,
     pub runtime_selection_mode: RuntimeSelectionMode,
     pub runtime_operator_action_needed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -611,6 +665,8 @@ impl Default for RuntimeStatus {
             backend: RuntimeBackend::None,
             phase: RuntimePhase::Inactive,
             appearance: EnvironmentAppearance::Unknown,
+            appearance_source: EnvironmentAppearanceSource::Unknown,
+            sun_schedule: None,
             runtime_selection_mode: RuntimeSelectionMode::Automatic,
             runtime_operator_action_needed: false,
             runtime_operator_action_reason: None,

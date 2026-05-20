@@ -7,3 +7,4 @@ pub mod process_manager;
 pub mod runtime;
 pub mod screen_capture;
 pub mod state;
+pub mod sun_schedule;

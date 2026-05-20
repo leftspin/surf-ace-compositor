@@ -1,11 +1,12 @@
 use crate::model::{
     EnvironmentAppearance, HostRuntimeStartTrigger, MainAppLaunchIntent, NativePaneHostRequest,
-    NativeTargetClass, OutputRotation, OverlayCoordinateSpace, OverlayRegionRequest,
-    OverlayRegionUpdateReason, PaneId, ProcessSpec, ProviderPaneSnapshot, RuntimeBackend,
-    RuntimeFocusTarget, RuntimePhase, StatusSnapshot, SurfaceBindingEvidence,
+    NativeTargetClass, NodeSunScheduleProfile, OutputRotation, OverlayCoordinateSpace,
+    OverlayRegionRequest, OverlayRegionUpdateReason, PaneId, ProcessSpec, ProviderPaneSnapshot,
+    RuntimeBackend, RuntimeFocusTarget, RuntimePhase, StatusSnapshot, SurfaceBindingEvidence,
 };
 use crate::screen_capture::ScreenCaptureStore;
 use crate::state::CompositorState;
+use crate::sun_schedule::{evaluate_sun_schedule, missing_profile_status};
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::FileTypeExt;
@@ -21,6 +22,16 @@ pub enum ControlRequest {
     GetHostMode,
     SetAppearance {
         appearance: EnvironmentAppearance,
+    },
+    ApplySunScheduleAppearance {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<NodeSunScheduleProfile>,
+        #[serde(
+            rename = "evaluatedAtUnixSeconds",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        evaluated_at_unix_seconds: Option<i64>,
     },
     SetOutputRotation {
         rotation: OutputRotation,
@@ -332,6 +343,19 @@ fn handle_request_with_capture(
             state.set_runtime_appearance(appearance);
             Ok(Some(state.status_snapshot()))
         }
+        ControlRequest::ApplySunScheduleAppearance {
+            profile,
+            evaluated_at_unix_seconds,
+        } => {
+            let evaluated_at_unix_seconds =
+                evaluated_at_unix_seconds.unwrap_or_else(current_unix_seconds);
+            let status = match profile {
+                Some(profile) => evaluate_sun_schedule(profile, evaluated_at_unix_seconds),
+                None => missing_profile_status(evaluated_at_unix_seconds),
+            };
+            state.set_runtime_sun_schedule_appearance(status);
+            Ok(Some(state.status_snapshot()))
+        }
         ControlRequest::SetOutputRotation { rotation } => {
             state.set_output_rotation(rotation);
             Ok(Some(state.status_snapshot()))
@@ -498,15 +522,23 @@ fn handle_request_with_capture(
     }
 }
 
+fn current_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().try_into().unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{
         CompositorOverlayKind, EnvironmentAppearance, ExternalNativeLifecycleState,
-        HostRuntimeStartTrigger, NativePaneHostRequest, OverlayCaptureCapability, OverlayRect,
-        PaneGeometry, PaneGeometryCoordinateSpace, PaneRenderMode, ProcessSpec, RuntimeBackend,
-        RuntimeDmabufFormatStatus, RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource,
-        SurfaceBindingEvidence, SurfaceBindingEvidenceOutcome,
+        HostRuntimeStartTrigger, NativePaneHostRequest, NodeSunScheduleProfile,
+        OverlayCaptureCapability, OverlayRect, PaneGeometry, PaneGeometryCoordinateSpace,
+        PaneRenderMode, ProcessSpec, RuntimeBackend, RuntimeDmabufFormatStatus,
+        RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource, SurfaceBindingEvidence,
+        SurfaceBindingEvidenceOutcome,
     };
     use crate::process_manager::{ProcessController, ProcessExit};
     use crate::screen_capture::ScreenCaptureStore;
@@ -637,6 +669,67 @@ mod tests {
         assert_eq!(
             state.status_snapshot().runtime.appearance,
             EnvironmentAppearance::Dark
+        );
+    }
+
+    #[test]
+    fn sun_schedule_control_sets_appearance_and_exposes_calculation_status() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+
+        let response = handle_request(
+            &mut state,
+            ControlRequest::ApplySunScheduleAppearance {
+                profile: Some(NodeSunScheduleProfile {
+                    node_id: "racter".to_string(),
+                    timezone: "America/Los_Angeles".to_string(),
+                    latitude: 37.7749,
+                    longitude: -122.4194,
+                }),
+                evaluated_at_unix_seconds: Some(1_718_992_800),
+            },
+            None,
+        );
+
+        assert!(response.ok);
+        let status = response.status.expect("status should be returned");
+        assert_eq!(status.runtime.appearance, EnvironmentAppearance::Light);
+        assert_eq!(
+            serde_json::to_value(&status)
+                .expect("status should serialize")
+                .pointer("/runtime/sun_schedule/profile/nodeId"),
+            Some(&serde_json::json!("racter"))
+        );
+        assert_eq!(
+            status
+                .runtime
+                .sun_schedule
+                .expect("sun schedule should be visible")
+                .sunset_unix_seconds,
+            Some(1_719_027_316)
+        );
+    }
+
+    #[test]
+    fn sun_schedule_control_without_profile_fails_closed_to_unknown() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+
+        let response = handle_request(
+            &mut state,
+            ControlRequest::ApplySunScheduleAppearance {
+                profile: None,
+                evaluated_at_unix_seconds: Some(1_718_992_800),
+            },
+            None,
+        );
+
+        assert!(response.ok);
+        let status = response.status.expect("status should be returned");
+        assert_eq!(status.runtime.appearance, EnvironmentAppearance::Unknown);
+        assert_eq!(
+            serde_json::to_value(&status)
+                .expect("status should serialize")
+                .pointer("/runtime/sun_schedule/reason"),
+            Some(&serde_json::json!("missing_profile"))
         );
     }
 
