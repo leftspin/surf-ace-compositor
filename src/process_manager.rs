@@ -32,8 +32,6 @@ impl ProcessController for LocalProcessController {
         let mut command = Command::new(&spec.command);
         command.args(&spec.args);
         command.stdin(Stdio::null());
-        command.stdout(Stdio::null());
-        command.stderr(Stdio::null());
 
         if let Some(cwd) = &spec.cwd {
             command.current_dir(cwd);
@@ -94,5 +92,72 @@ impl ProcessController for LocalProcessController {
         }
 
         exited
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn local_process_controller_preserves_child_stdout_and_stderr_diagnostics() {
+        let started_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let output_path = std::env::temp_dir().join(format!(
+            "surf-ace-process-fds-{}-{started_at}.txt",
+            std::process::id()
+        ));
+        let script = format!(
+            "readlink /proc/$$/fd/1 > {path}; readlink /proc/$$/fd/2 >> {path}",
+            path = shell_quote(output_path.to_string_lossy().as_ref())
+        );
+        let process = ProcessSpec {
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), script],
+            cwd: None,
+            env: BTreeMap::new(),
+        };
+        let mut controller = LocalProcessController::default();
+
+        let pid = controller
+            .spawn(&process, &BTreeMap::new())
+            .expect("diagnostic child should spawn");
+
+        let mut contents = String::new();
+        for _ in 0..50 {
+            controller.reap_exited();
+            if let Ok(value) = fs::read_to_string(&output_path) {
+                contents = value;
+                if contents.lines().count() >= 2 {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let _ = fs::remove_file(&output_path);
+        let fds: Vec<&str> = contents.lines().collect();
+        assert_eq!(
+            fds.len(),
+            2,
+            "child {pid} should record stdout and stderr fds: {contents:?}"
+        );
+        assert_ne!(
+            fds[0], "/dev/null",
+            "child stdout must not discard diagnostics"
+        );
+        assert_ne!(
+            fds[1], "/dev/null",
+            "child stderr must not discard diagnostics"
+        );
+    }
+
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
     }
 }
