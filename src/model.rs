@@ -24,6 +24,7 @@ pub enum OutputRotation {
 #[serde(rename_all = "snake_case")]
 pub enum NativeTargetClass {
     Terminal,
+    NativeApp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -740,7 +741,8 @@ pub struct StatusSnapshot {
 mod tests {
     use super::{
         MainAppLaunchIntent, MainAppLaunchState, MainAppSurfaceBinding, MainAppSurfaceBindingMatch,
-        PaneGeometry, PaneGeometryCoordinateSpace, ProcessSpec,
+        NativePaneHostRequest, NativeTargetClass, PaneGeometry, PaneGeometryCoordinateSpace,
+        PaneId, ProcessSpec,
     };
     use std::collections::BTreeMap;
 
@@ -826,6 +828,36 @@ mod tests {
             MainAppLaunchState::default(),
             MainAppLaunchState::NotRequested
         );
+    }
+
+    #[test]
+    fn native_pane_host_request_accepts_native_app_target_class() {
+        let request = serde_json::from_str::<NativePaneHostRequest>(
+            r#"{
+                "id":"surface:top",
+                "content_id":"tg_kolourpaint",
+                "binding_id":"surface:top:tg_kolourpaint:1",
+                "revision":1,
+                "geometry":{
+                    "x":0,
+                    "y":0,
+                    "width":640,
+                    "height":480,
+                    "coordinateSpace":"compositor_logical"
+                },
+                "target":"native_app",
+                "process":{
+                    "command":"/usr/bin/kolourpaint",
+                    "args":[],
+                    "env":{"QT_QPA_PLATFORM":"wayland"}
+                }
+            }"#,
+        )
+        .expect("native_app target class should parse");
+
+        assert_eq!(request.id, PaneId::new("surface:top"));
+        assert_eq!(request.target, NativeTargetClass::NativeApp);
+        assert_eq!(request.process.command, "/usr/bin/kolourpaint");
     }
 
     #[test]
