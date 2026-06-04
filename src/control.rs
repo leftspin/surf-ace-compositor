@@ -3,6 +3,7 @@ use crate::model::{
     NativeTargetClass, NodeSunScheduleProfile, OutputRotation, OverlayCoordinateSpace,
     OverlayRegionRequest, OverlayRegionUpdateReason, PaneId, ProcessSpec, ProviderPaneSnapshot,
     RuntimeBackend, RuntimeFocusTarget, RuntimePhase, StatusSnapshot, SurfaceBindingEvidence,
+    SurfaceBindingEvidenceOutcome,
 };
 use crate::screen_capture::ScreenCaptureStore;
 use crate::state::CompositorState;
@@ -15,11 +16,62 @@ use std::path::Path;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MainAppBindProcessEvidence {
+    pub pid: u32,
+    pub ppid: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MainAppBindEvidence {
+    pub expected_bundle_id: String,
+    pub expected_package_name: String,
+    pub expected_runtime_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_token: Option<String>,
+    pub observed_ui_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_wayland_app_id: Option<String>,
+    pub observed_window_title: String,
+    pub process: MainAppBindProcessEvidence,
+    pub reported_bundle_id: String,
+    pub reported_package_name: String,
+    pub reported_runtime_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeAppBindingDiagnostics {
+    pub binding_authority: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_block_reason: Option<String>,
+    pub binding_degraded_reasons: Vec<String>,
+    pub diagnostic_drift: Vec<String>,
+    pub expected_bundle_id: Option<String>,
+    pub expected_package_name: Option<String>,
+    pub expected_runtime_id: String,
+    pub launch_token_status: String,
+    pub observed_ui_label: Option<String>,
+    pub observed_wayland_app_id: Option<String>,
+    pub observed_window_title: Option<String>,
+    pub process_lineage_status: String,
+    pub ready: bool,
+    pub reported_bundle_id: Option<String>,
+    pub reported_package_name: Option<String>,
+    pub reported_runtime_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlRequest {
     GetStatus,
     GetHostMode,
+    #[serde(rename = "main_app.bind")]
+    MainAppBind {
+        evidence: MainAppBindEvidence,
+    },
     SetAppearance {
         appearance: EnvironmentAppearance,
     },
@@ -138,6 +190,12 @@ pub struct ControlResponse {
     pub status: Option<StatusSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_path: Option<String>,
+    #[serde(
+        rename = "runtimeAppBinding",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub runtime_app_binding: Option<RuntimeAppBindingDiagnostics>,
 }
 
 impl ControlResponse {
@@ -147,6 +205,7 @@ impl ControlResponse {
             error: None,
             status,
             capture_path: None,
+            runtime_app_binding: None,
         }
     }
 
@@ -156,6 +215,7 @@ impl ControlResponse {
             error: Some(message.into()),
             status: None,
             capture_path: None,
+            runtime_app_binding: None,
         }
     }
 
@@ -165,6 +225,20 @@ impl ControlResponse {
             error: None,
             status: None,
             capture_path: Some(path),
+            runtime_app_binding: None,
+        }
+    }
+
+    fn runtime_app_binding(
+        diagnostics: RuntimeAppBindingDiagnostics,
+        status: Option<StatusSnapshot>,
+    ) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            status,
+            capture_path: None,
+            runtime_app_binding: Some(diagnostics),
         }
     }
 }
@@ -339,6 +413,13 @@ fn handle_request_with_capture(
     let result = match request {
         ControlRequest::GetStatus => Ok(Some(state.status_snapshot())),
         ControlRequest::GetHostMode => Ok(Some(state.status_snapshot())),
+        ControlRequest::MainAppBind { evidence } => {
+            let diagnostics = main_app_binding_diagnostics(state, &evidence);
+            return ControlResponse::runtime_app_binding(
+                diagnostics,
+                Some(state.status_snapshot()),
+            );
+        }
         ControlRequest::SetAppearance { appearance } => {
             state.set_runtime_appearance(appearance);
             Ok(Some(state.status_snapshot()))
@@ -522,6 +603,118 @@ fn handle_request_with_capture(
     }
 }
 
+fn main_app_binding_diagnostics(
+    state: &CompositorState,
+    evidence: &MainAppBindEvidence,
+) -> RuntimeAppBindingDiagnostics {
+    let expected = state.runtime_expected_main_app_binding_with_token();
+    let launch_token_status = match (
+        expected
+            .as_ref()
+            .and_then(|expectation| expectation.launch_token.as_ref()),
+        evidence.launch_token.as_ref(),
+    ) {
+        (Some(expected), Some(actual)) if expected == actual => "matched",
+        (Some(_), Some(_)) => "mismatched",
+        _ => "missing",
+    }
+    .to_string();
+    let process_lineage_status = match expected.as_ref().map(|expectation| expectation.pid) {
+        Some(expected_pid)
+            if evidence.process.pid == expected_pid || evidence.process.ppid == expected_pid =>
+        {
+            "matched"
+        }
+        Some(_) => "mismatched",
+        None => "missing",
+    }
+    .to_string();
+    let mut diagnostic_drift = Vec::new();
+    push_drift(
+        &mut diagnostic_drift,
+        "package_name_mismatch",
+        Some(&evidence.expected_package_name),
+        Some(&evidence.reported_package_name),
+    );
+    push_drift(
+        &mut diagnostic_drift,
+        "bundle_id_mismatch",
+        Some(&evidence.expected_bundle_id),
+        Some(&evidence.reported_bundle_id),
+    );
+    let binding_match = expected.as_ref().map(|expectation| {
+        expectation.binding.match_identity(
+            evidence.observed_wayland_app_id.as_deref(),
+            Some(&evidence.observed_window_title),
+        )
+    });
+    let binding_outcome = binding_match.map(SurfaceBindingEvidenceOutcome::from);
+    if binding_outcome == Some(SurfaceBindingEvidenceOutcome::MismatchesIntent) {
+        diagnostic_drift.push("main_app_binding_mismatch".to_string());
+    }
+    let binding_block_reason = if evidence.expected_runtime_id != evidence.reported_runtime_id {
+        Some("runtime_id_mismatch".to_string())
+    } else if launch_token_status == "mismatched" {
+        Some("launch_token_mismatch".to_string())
+    } else if process_lineage_status == "mismatched" {
+        Some("process_lineage_mismatch".to_string())
+    } else {
+        None
+    };
+    let mut binding_degraded_reasons = Vec::new();
+    if launch_token_status == "missing" {
+        binding_degraded_reasons.push("launch_token_missing".to_string());
+    }
+    if process_lineage_status == "missing" {
+        binding_degraded_reasons.push("process_lineage_missing".to_string());
+    }
+    if binding_outcome == Some(SurfaceBindingEvidenceOutcome::PendingIdentity) {
+        binding_degraded_reasons.push("main_app_binding_pending".to_string());
+    }
+    let binding_authority = if binding_block_reason.is_some() {
+        "blocked"
+    } else if binding_degraded_reasons.is_empty() {
+        "trusted"
+    } else {
+        "degraded"
+    }
+    .to_string();
+    let ready = binding_authority == "trusted"
+        && launch_token_status == "matched"
+        && process_lineage_status == "matched";
+    RuntimeAppBindingDiagnostics {
+        binding_authority,
+        binding_block_reason,
+        binding_degraded_reasons,
+        diagnostic_drift,
+        expected_bundle_id: Some(evidence.expected_bundle_id.clone()),
+        expected_package_name: Some(evidence.expected_package_name.clone()),
+        expected_runtime_id: evidence.expected_runtime_id.clone(),
+        launch_token_status,
+        observed_ui_label: Some(evidence.observed_ui_label.clone()),
+        observed_wayland_app_id: evidence.observed_wayland_app_id.clone(),
+        observed_window_title: Some(evidence.observed_window_title.clone()),
+        process_lineage_status,
+        ready,
+        reported_bundle_id: Some(evidence.reported_bundle_id.clone()),
+        reported_package_name: Some(evidence.reported_package_name.clone()),
+        reported_runtime_id: evidence.reported_runtime_id.clone(),
+    }
+}
+
+fn push_drift(
+    diagnostic_drift: &mut Vec<String>,
+    reason: &str,
+    expected: Option<&String>,
+    observed: Option<&String>,
+) {
+    if let (Some(expected), Some(observed)) = (expected, observed) {
+        if expected != observed {
+            diagnostic_drift.push(reason.to_string());
+        }
+    }
+}
+
 fn current_unix_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -534,11 +727,11 @@ mod tests {
     use super::*;
     use crate::model::{
         CompositorOverlayKind, EnvironmentAppearance, ExternalNativeLifecycleState,
-        HostRuntimeStartTrigger, NativePaneHostRequest, NodeSunScheduleProfile,
-        OverlayCaptureCapability, OverlayRect, PaneGeometry, PaneGeometryCoordinateSpace,
-        PaneRenderMode, ProcessSpec, RuntimeBackend, RuntimeDmabufFormatStatus,
-        RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource, SurfaceBindingEvidence,
-        SurfaceBindingEvidenceOutcome,
+        HostRuntimeStartTrigger, MainAppLaunchIntent, MainAppSurfaceBinding, NativePaneHostRequest,
+        NodeSunScheduleProfile, OverlayCaptureCapability, OverlayRect, PaneGeometry,
+        PaneGeometryCoordinateSpace, PaneRenderMode, ProcessSpec, RuntimeBackend,
+        RuntimeDmabufFormatStatus, RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource,
+        SurfaceBindingEvidence, SurfaceBindingEvidenceOutcome,
     };
     use crate::process_manager::{ProcessController, ProcessExit};
     use crate::screen_capture::ScreenCaptureStore;
@@ -600,6 +793,67 @@ mod tests {
                 OverlayCaptureCapability::PointerAxis,
             ],
         }
+    }
+
+    #[test]
+    fn main_app_bind_returns_explicit_trusted_runtime_diagnostics() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state
+            .select_main_app_launch_intent(MainAppLaunchIntent {
+                process: ProcessSpec {
+                    command: "electron".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                },
+                binding: MainAppSurfaceBinding::AppId {
+                    app_id: "@surf-ace/electron".to_string(),
+                },
+            })
+            .expect("main app intent should be accepted");
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".into()),
+            1280,
+            720,
+        );
+        let launch_token = state
+            .status_snapshot()
+            .runtime
+            .main_app_launch_token
+            .expect("main app launch should carry a token");
+        let response = handle_request(
+            &mut state,
+            ControlRequest::MainAppBind {
+                evidence: MainAppBindEvidence {
+                    expected_bundle_id: "ai.surf-ace.electron".to_string(),
+                    expected_package_name: "@surf-ace/electron".to_string(),
+                    expected_runtime_id: "surf-ace.runtime.electron".to_string(),
+                    launch_token: Some(launch_token),
+                    observed_ui_label: "racter Surf Ace".to_string(),
+                    observed_wayland_app_id: Some("surf-ace-main-app".to_string()),
+                    observed_window_title: "racter Surf Ace".to_string(),
+                    process: MainAppBindProcessEvidence { pid: 42, ppid: 1 },
+                    reported_bundle_id: "ai.surf-ace.electron".to_string(),
+                    reported_package_name: "@surf-ace/electron".to_string(),
+                    reported_runtime_id: "surf-ace.runtime.electron".to_string(),
+                },
+            },
+            None,
+        );
+        assert!(response.ok);
+        let diagnostics = response
+            .runtime_app_binding
+            .expect("runtime binding diagnostics should be returned");
+        assert!(diagnostics.ready);
+        assert_eq!(diagnostics.binding_authority, "trusted");
+        assert_eq!(diagnostics.launch_token_status, "matched");
+        assert_eq!(diagnostics.process_lineage_status, "matched");
+        assert_eq!(
+            diagnostics.diagnostic_drift,
+            vec!["main_app_binding_mismatch".to_string()]
+        );
+        assert!(diagnostics.binding_degraded_reasons.is_empty());
     }
 
     #[test]

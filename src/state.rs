@@ -1993,7 +1993,8 @@ fn pane_allows_overlay_regions(pane: &PaneRuntimeState) -> bool {
     matches!(pane.render_mode, PaneRenderMode::ExternalNative { .. })
         && matches!(
             pane.external_native_state,
-            ExternalNativeLifecycleState::Attached { .. }
+            ExternalNativeLifecycleState::Launching { .. }
+                | ExternalNativeLifecycleState::Attached { .. }
         )
 }
 
@@ -3039,6 +3040,68 @@ mod tests {
                 .overlay_role_policy
                 .active_overlay_pane
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn overlay_regions_accept_planned_native_pane_while_launching() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            800,
+            600,
+        );
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: PaneId::new("p-1"),
+                content_id: Some("content-1".to_string()),
+                binding_id: Some("p-1:content-1".to_string()),
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 300,
+                    height: 200,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+                target: NativeTargetClass::NativeApp,
+                process: terminal_process(),
+            }])
+            .expect("native pane host plan should apply");
+        state
+            .launch_native_pane_hosts(vec![PaneId::new("p-1")])
+            .expect("native pane host should launch");
+        let topology_epoch = state.topology_epoch().to_string();
+
+        state
+            .set_overlay_regions(
+                "main-surface".to_string(),
+                Some("window-1".to_string()),
+                1,
+                topology_epoch,
+                Some(OverlayRegionUpdateReason::Initial),
+                OverlayCoordinateSpace::SurfaceLogical,
+                vec![overlay_region(
+                    "badge",
+                    "p-1",
+                    "p-1:content-1",
+                    OverlayRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 300.0,
+                        height: 40.0,
+                    },
+                )],
+            )
+            .expect("provider overlay regions should be staged while native pane is launching");
+
+        let status = state.status_snapshot();
+        assert_eq!(status.overlay_regions.region_count, 1);
+        assert_eq!(
+            status.panes[0].external_native_state,
+            ExternalNativeLifecycleState::Launching { pid: 1 }
         );
     }
 
