@@ -14,6 +14,7 @@ use surf_ace_compositor::control::{
 use surf_ace_compositor::model::{
     HostRuntimeStartTrigger, MainAppLaunchIntent, OutputRotation, ProcessSpec,
 };
+use surf_ace_compositor::node_sun_schedule_profiles::{profile_for_node, supported_node_ids};
 use surf_ace_compositor::output_rotation_memory::{
     OUTPUT_ROTATION_STATE_PATH_ENV, OutputRotationMemory,
 };
@@ -24,12 +25,14 @@ use surf_ace_compositor::runtime::{
 };
 use surf_ace_compositor::screen_capture::ScreenCaptureStore;
 use surf_ace_compositor::state::CompositorState;
+use surf_ace_compositor::sun_schedule::evaluate_sun_schedule;
 
 const RUNTIME_ENV: &str = "SURF_ACE_COMPOSITOR_RUNTIME";
 const HOST_DRM_DEVICE_ENV: &str = "SURF_ACE_COMPOSITOR_HOST_DRM_DEVICE";
 const HOST_OUTPUT_ENV: &str = "SURF_ACE_COMPOSITOR_HOST_OUTPUT";
 const CONTROL_SOCKET_ENV: &str = "SURF_ACE_COMPOSITOR_SOCKET";
 const OUTPUT_ROTATION_ENV: &str = "SURF_ACE_COMPOSITOR_OUTPUT_ROTATION";
+const SUN_SCHEDULE_NODE_ENV: &str = "SURF_ACE_COMPOSITOR_SUN_SCHEDULE_NODE";
 const TEST_HOST_RUNTIME_CAPABLE_ENV: &str = "SURF_ACE_COMPOSITOR_TEST_HOST_RUNTIME_CAPABLE";
 const SHELL_OVERLAY_TOGGLE_SHORTCUT_ENV: &str = "SURF_ACE_COMPOSITOR_SHELL_OVERLAY_TOGGLE_SHORTCUT";
 const SHELL_OVERLAY_APP_ID: &str = "surf-ace-shell-overlay";
@@ -79,6 +82,8 @@ enum Command {
         output_rotation: Option<String>,
         #[arg(long, env = OUTPUT_ROTATION_STATE_PATH_ENV)]
         output_rotation_state_path: Option<PathBuf>,
+        #[arg(long, env = SUN_SCHEDULE_NODE_ENV)]
+        sun_schedule_node: Option<String>,
         #[arg(long)]
         main_app_launch_intent_json: Option<String>,
         #[arg(
@@ -193,6 +198,7 @@ fn main() {
                 false,
                 None,
                 OutputRotationMemory::default_path(),
+                None,
             )
         }
         Some(Command::Serve {
@@ -206,6 +212,7 @@ fn main() {
             launch: serve_launch,
             shell_overlay_toggle_shortcut,
             overlay_region_debug_borders,
+            sun_schedule_node,
         }) => {
             let launch = serve_launch.as_deref().or(launch.as_deref());
             if launch.is_some() && main_app_launch_intent_json.is_none() {
@@ -224,6 +231,7 @@ fn main() {
                 overlay_region_debug_borders,
                 output_rotation.as_deref(),
                 output_rotation_state_path,
+                sun_schedule_node.as_deref(),
             )
         }
         Some(Command::Ctl {
@@ -311,6 +319,7 @@ fn run_server(
     overlay_region_debug_borders: bool,
     output_rotation: Option<&str>,
     output_rotation_state_path: Option<PathBuf>,
+    sun_schedule_node: Option<&str>,
 ) {
     let launch_plan = resolve_runtime_launch_plan(runtime, detect_host_runtime_capable());
     let output_rotation_memory = output_rotation_state_path
@@ -334,6 +343,13 @@ fn run_server(
                 std::process::exit(2);
             }
         };
+    let sun_schedule_profile = match resolve_sun_schedule_node_profile(sun_schedule_node) {
+        Ok(profile) => profile,
+        Err(err) => {
+            eprintln!("invalid sun schedule node: {err}");
+            std::process::exit(2);
+        }
+    };
     let mut state = CompositorState::new_with_output_rotation(
         launch_plan.host_mode_active,
         Box::new(LocalProcessController::default()),
@@ -356,6 +372,11 @@ fn run_server(
                 eprintln!("invalid main app launch intent: {err}");
                 std::process::exit(2);
             }
+        }
+        if let Some(profile) = sun_schedule_profile {
+            state.configure_sun_schedule_profile(profile.clone());
+            let status = evaluate_sun_schedule(profile, current_unix_seconds());
+            state.set_runtime_sun_schedule_appearance(status);
         }
     }
     apply_runtime_selection_status(&shared_state, &launch_plan);
@@ -886,6 +907,31 @@ fn run_capture(socket_path: PathBuf, output_path: &str) {
     );
 }
 
+fn resolve_sun_schedule_node_profile(
+    sun_schedule_node: Option<&str>,
+) -> Result<Option<surf_ace_compositor::model::NodeSunScheduleProfile>, String> {
+    let Some(node_id) = sun_schedule_node else {
+        return Ok(None);
+    };
+    let node_id = node_id.trim();
+    if node_id.is_empty() {
+        return Ok(None);
+    }
+    profile_for_node(node_id).map(Some).ok_or_else(|| {
+        format!(
+            "unsupported node '{node_id}'; supported nodes: {}",
+            supported_node_ids().join(", ")
+        )
+    })
+}
+
+fn current_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
+
 fn run_control_request(socket_path: PathBuf, request: ControlRequest) {
     match send_request(&socket_path, &request) {
         Ok(response) => print_control_response(response),
@@ -1050,6 +1096,42 @@ mod tests {
             output_rotation_state_path.as_deref(),
             Some(std::path::Path::new("/tmp/surf-ace-rotation-state.json"))
         );
+    }
+
+    #[test]
+    fn serve_cli_accepts_sun_schedule_node() {
+        let cli = Cli::try_parse_from([
+            "surf-ace-compositor",
+            "serve",
+            "--sun-schedule-node",
+            "racter",
+        ])
+        .expect("serve command should parse");
+        let Some(Command::Serve {
+            sun_schedule_node, ..
+        }) = cli.command
+        else {
+            panic!("expected serve command");
+        };
+        assert_eq!(sun_schedule_node.as_deref(), Some("racter"));
+    }
+
+    #[test]
+    fn resolves_owned_sun_schedule_node_profiles() {
+        let racter = super::resolve_sun_schedule_node_profile(Some("racter"))
+            .expect("racter should resolve")
+            .expect("racter should have a profile");
+        assert_eq!(racter.timezone, "America/Los_Angeles");
+
+        let shrdlu = super::resolve_sun_schedule_node_profile(Some("shrdlu"))
+            .expect("shrdlu should resolve")
+            .expect("shrdlu should have a profile");
+        assert_eq!(shrdlu.timezone, "America/New_York");
+
+        let error = super::resolve_sun_schedule_node_profile(Some("unknown-node"))
+            .expect_err("unknown node should fail");
+        assert!(error.contains("racter"));
+        assert!(error.contains("shrdlu"));
     }
 
     #[test]

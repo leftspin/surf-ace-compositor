@@ -430,7 +430,7 @@ fn handle_request_with_capture(
         } => {
             let evaluated_at_unix_seconds =
                 evaluated_at_unix_seconds.unwrap_or_else(current_unix_seconds);
-            let status = match profile {
+            let status = match profile.or_else(|| state.configured_sun_schedule_profile()) {
                 Some(profile) => evaluate_sun_schedule(profile, evaluated_at_unix_seconds),
                 None => missing_profile_status(evaluated_at_unix_seconds),
             };
@@ -984,6 +984,36 @@ mod tests {
                 .expect("status should serialize")
                 .pointer("/runtime/sun_schedule/reason"),
             Some(&serde_json::json!("missing_profile"))
+        );
+    }
+
+    #[test]
+    fn sun_schedule_control_without_inline_profile_uses_configured_node_profile() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.configure_sun_schedule_profile(NodeSunScheduleProfile {
+            node_id: "shrdlu".to_string(),
+            timezone: "America/New_York".to_string(),
+            latitude: 40.7128,
+            longitude: -74.0060,
+        });
+
+        let response = handle_request(
+            &mut state,
+            ControlRequest::ApplySunScheduleAppearance {
+                profile: None,
+                evaluated_at_unix_seconds: Some(1_718_955_000),
+            },
+            None,
+        );
+
+        assert!(response.ok);
+        let status = response.status.expect("status should be returned");
+        assert_eq!(status.runtime.appearance, EnvironmentAppearance::Dark);
+        assert_eq!(
+            serde_json::to_value(&status)
+                .expect("status should serialize")
+                .pointer("/runtime/sun_schedule/profile/nodeId"),
+            Some(&serde_json::json!("shrdlu"))
         );
     }
 

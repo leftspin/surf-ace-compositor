@@ -309,6 +309,53 @@ fn failed_explicit_start_does_not_overwrite_remembered_output_rotation() {
 }
 
 #[test]
+fn serve_with_sun_schedule_node_publishes_profile_status_on_startup() {
+    let socket_path = unique_temp_path("surf-ace-sun-schedule-node", ".sock");
+    let child = Command::new(env!("CARGO_BIN_EXE_surf-ace-compositor"))
+        .args([
+            "serve",
+            "--runtime",
+            "none",
+            "--socket-path",
+            socket_path
+                .to_str()
+                .expect("socket path should be valid UTF-8"),
+            "--sun-schedule-node",
+            "racter",
+        ])
+        .spawn()
+        .expect("serve should start");
+    wait_for_socket(&socket_path);
+
+    let status = send_control_request(&socket_path, json!({ "type": "get_status" }));
+
+    assert_eq!(
+        status["status"]["runtime"]["appearance_source"],
+        json!("sun_schedule")
+    );
+    assert_eq!(
+        status["status"]["runtime"]["sun_schedule"]["profile"],
+        json!({
+            "nodeId": "racter",
+            "timezone": "America/Los_Angeles",
+            "latitude": 37.7749,
+            "longitude": -122.4194
+        })
+    );
+    assert!(
+        status["status"]["runtime"]["sun_schedule"]["sunriseUnixSeconds"].is_number(),
+        "status should expose evaluated sunrise"
+    );
+    assert!(
+        status["status"]["runtime"]["sun_schedule"]["sunsetUnixSeconds"].is_number(),
+        "status should expose evaluated sunset"
+    );
+
+    stop_child(child);
+    let _ = fs::remove_file(&socket_path);
+}
+
+#[test]
 fn ctl_command_passes_exact_main_app_launch_intent_request_through() {
     let socket_path = unique_temp_path("surf-ace-main-app-ctl-command", ".sock");
     let server = serve_single_request(&socket_path, |request| {

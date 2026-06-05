@@ -2,12 +2,13 @@ use crate::model::{
     EnvironmentAppearance, EnvironmentAppearanceSource, ExternalNativeEventContract,
     ExternalNativeLifecycleState, HostRuntimeStartTrigger, MainAppLaunchIntent, MainAppLaunchState,
     MainAppSurfaceBinding, NativePaneHostRequest, NativePaneHostStatus, NativeTargetClass,
-    OutputRotation, OverlayCoordinateSpace, OverlayRect, OverlayRegionRequest, OverlayRegionStatus,
-    OverlayRegionUpdateReason, OverlayRegionsStatus, PaneGeometry, PaneGeometryCoordinateSpace,
-    PaneId, PaneRenderMode, PaneStatus, ProcessSpec, ProviderPaneSnapshot, RuntimeBackend,
-    RuntimeDmabufFormatStatus, RuntimeFocusTarget, RuntimeHostPresentOwnership,
-    RuntimeHostQueuedPresentSource, RuntimeHostSelectionState, RuntimePhase, RuntimeSelectionMode,
-    RuntimeStatus, StatusSnapshot, SunScheduleAppearanceStatus, SurfaceBindingEvidence,
+    NodeSunScheduleProfile, OutputRotation, OverlayCoordinateSpace, OverlayRect,
+    OverlayRegionRequest, OverlayRegionStatus, OverlayRegionUpdateReason, OverlayRegionsStatus,
+    PaneGeometry, PaneGeometryCoordinateSpace, PaneId, PaneRenderMode, PaneStatus, ProcessSpec,
+    ProviderPaneSnapshot, RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeFocusTarget,
+    RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource, RuntimeHostSelectionState,
+    RuntimePhase, RuntimeSelectionMode, RuntimeStatus, StatusSnapshot, SunScheduleAppearanceStatus,
+    SurfaceBindingEvidence,
 };
 use crate::output_rotation_memory::OutputRotationMemory;
 use crate::output_rotation_model::OutputRotationModel;
@@ -111,6 +112,7 @@ pub struct CompositorState {
     topology_epoch: String,
     overlay_role_policy: OverlayRolePolicy,
     runtime: RuntimeStatus,
+    configured_sun_schedule_profile: Option<NodeSunScheduleProfile>,
     process_controller: Box<dyn ProcessController>,
     output_rotation_memory: Option<OutputRotationMemory>,
     launch_token_counter: u64,
@@ -189,6 +191,7 @@ impl CompositorState {
             topology_epoch: "topology-0".to_string(),
             overlay_role_policy: OverlayRolePolicy::default(),
             runtime: RuntimeStatus::default(),
+            configured_sun_schedule_profile: None,
             process_controller,
             output_rotation_memory: None,
             launch_token_counter: 0,
@@ -679,6 +682,14 @@ impl CompositorState {
 
     pub fn set_runtime_focus_target(&mut self, target: Option<RuntimeFocusTarget>) {
         self.runtime.active_focus_target = target;
+    }
+
+    pub fn configure_sun_schedule_profile(&mut self, profile: NodeSunScheduleProfile) {
+        self.configured_sun_schedule_profile = Some(profile);
+    }
+
+    pub fn configured_sun_schedule_profile(&self) -> Option<NodeSunScheduleProfile> {
+        self.configured_sun_schedule_profile.clone()
     }
 
     pub fn set_runtime_appearance(&mut self, appearance: EnvironmentAppearance) {
