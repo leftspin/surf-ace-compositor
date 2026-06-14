@@ -5583,12 +5583,17 @@ impl RuntimeWaylandState {
         let evidence = self.native_pane_binding_evidence_for_surface(&surface, launch_pid);
         self.configure_toplevel_for_role(&surface, RuntimeSurfaceRole::NativePane(pane_id.clone()));
         let surface_id = surface_id(surface.wl_surface());
-        self.native_pane_toplevels.insert(pane_id, surface);
+        self.native_pane_toplevels.insert(pane_id.clone(), surface);
         self.bridge_native_pane_surface_attached(
             launch_pid,
             client_pid,
             Some(surface_id),
             evidence,
+        );
+        self.bridge_native_pane_window_group_observed(
+            &pane_id,
+            surface_id.to_string(),
+            Some(surface_id),
         );
         self.promote_pending_toplevels();
         self.sync_runtime_status_with_roles();
@@ -6556,6 +6561,20 @@ impl RuntimeWaylandState {
         let mut state = lock_state(&self.shared_state);
         let _ = state.runtime_mark_native_pane_surface_attached_for_launch_pid_with_evidence(
             launch_pid, client_pid, surface_id, evidence,
+        );
+    }
+
+    fn bridge_native_pane_window_group_observed(
+        &self,
+        pane_id: &PaneId,
+        primary_window_id: String,
+        surface_id: Option<u32>,
+    ) {
+        let mut state = lock_state(&self.shared_state);
+        let _ = state.runtime_mark_native_pane_window_group_observed(
+            pane_id,
+            primary_window_id,
+            surface_id,
         );
     }
 

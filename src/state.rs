@@ -1,7 +1,8 @@
 use crate::model::{
     EnvironmentAppearance, EnvironmentAppearanceSource, ExternalNativeEventContract,
     ExternalNativeLifecycleState, HostRuntimeStartTrigger, MainAppLaunchIntent, MainAppLaunchState,
-    MainAppSurfaceBinding, NativePaneHostRequest, NativePaneHostStatus, NativeTargetClass,
+    MainAppSurfaceBinding, NativePaneHostRequest, NativePaneHostStatus,
+    NativePaneWindowGroupMemberStatus, NativePaneWindowGroupStatus, NativeTargetClass,
     NodeSunScheduleProfile, OutputRotation, OverlayCoordinateSpace, OverlayRect,
     OverlayRegionRequest, OverlayRegionStatus, OverlayRegionUpdateReason, OverlayRegionsStatus,
     PaneGeometry, PaneGeometryCoordinateSpace, PaneId, PaneRenderMode, PaneStatus, ProcessSpec,
@@ -34,10 +35,12 @@ struct PaneRuntimeState {
     external_native_state: ExternalNativeLifecycleState,
     native_host_content_id: Option<String>,
     native_host_binding_id: Option<String>,
+    native_host_launch_token: Option<String>,
     native_host_revision: u64,
     external_native_surface_id: Option<u32>,
     external_native_binding_evidence: Option<SurfaceBindingEvidence>,
     external_native_launch_token: Option<String>,
+    native_pane_window_group: Option<NativePaneWindowGroupStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -907,10 +910,12 @@ impl CompositorState {
                     external_native_state: prev.external_native_state.clone(),
                     native_host_content_id: prev.native_host_content_id.clone(),
                     native_host_binding_id: prev.native_host_binding_id.clone(),
+                    native_host_launch_token: prev.native_host_launch_token.clone(),
                     native_host_revision: prev.native_host_revision,
                     external_native_surface_id: prev.external_native_surface_id,
                     external_native_binding_evidence: prev.external_native_binding_evidence.clone(),
                     external_native_launch_token: prev.external_native_launch_token.clone(),
+                    native_pane_window_group: prev.native_pane_window_group.clone(),
                 },
                 None => PaneRuntimeState {
                     provider_owned: true,
@@ -919,10 +924,12 @@ impl CompositorState {
                     external_native_state: ExternalNativeLifecycleState::Absent,
                     native_host_content_id: None,
                     native_host_binding_id: None,
+                    native_host_launch_token: None,
                     native_host_revision: 0,
                     external_native_surface_id: None,
                     external_native_binding_evidence: None,
                     external_native_launch_token: None,
+                    native_pane_window_group: None,
                 },
             };
             incoming.insert(pane.id, runtime);
@@ -1037,10 +1044,12 @@ impl CompositorState {
                     external_native_state: ExternalNativeLifecycleState::Absent,
                     native_host_content_id: None,
                     native_host_binding_id: None,
+                    native_host_launch_token: None,
                     native_host_revision: 0,
                     external_native_surface_id: None,
                     external_native_binding_evidence: None,
                     external_native_launch_token: None,
+                    native_pane_window_group: None,
                 });
             let next_mode = PaneRenderMode::ExternalNative {
                 target: request.target,
@@ -1049,7 +1058,8 @@ impl CompositorState {
             pane.geometry = request.geometry;
             let host_identity_changed = pane.render_mode != next_mode
                 || pane.native_host_content_id != request.content_id
-                || pane.native_host_binding_id != request.binding_id;
+                || pane.native_host_binding_id != request.binding_id
+                || pane.native_host_launch_token != request.launch_token;
             if host_identity_changed {
                 if let Some(pid) = running_pid(&pane.external_native_state) {
                     self.process_controller
@@ -1060,10 +1070,12 @@ impl CompositorState {
                 pane.external_native_surface_id = None;
                 pane.external_native_binding_evidence = None;
                 pane.external_native_launch_token = None;
+                pane.native_pane_window_group = None;
             }
             pane.render_mode = next_mode;
             pane.native_host_content_id = request.content_id;
             pane.native_host_binding_id = request.binding_id;
+            pane.native_host_launch_token = request.launch_token;
             pane.native_host_revision = request.revision;
         }
 
@@ -1109,7 +1121,7 @@ impl CompositorState {
                 continue;
             }
 
-            let (content_id, binding_id, revision) = {
+            let (content_id, binding_id, requested_launch_token, revision) = {
                 let pane = self
                     .panes
                     .get(&pane_id)
@@ -1117,6 +1129,7 @@ impl CompositorState {
                 (
                     pane.native_host_content_id.clone(),
                     pane.native_host_binding_id.clone(),
+                    pane.native_host_launch_token.clone(),
                     pane.native_host_revision,
                 )
             };
@@ -1127,7 +1140,8 @@ impl CompositorState {
                 binding_id.as_deref().unwrap_or(""),
                 revision
             );
-            let launch_token = self.next_launch_token(&token_scope);
+            let launch_token =
+                requested_launch_token.unwrap_or_else(|| self.next_launch_token(&token_scope));
             let mut extra_env = BTreeMap::new();
             extra_env.insert("SURF_ACE_COMPOSITOR_HOST_MODE".to_string(), "1".to_string());
             extra_env.insert("SURF_ACE_PANE_ID".to_string(), pane_id.0.clone());
@@ -1153,6 +1167,7 @@ impl CompositorState {
                     pane.external_native_surface_id = None;
                     pane.external_native_binding_evidence = None;
                     pane.external_native_launch_token = Some(launch_token);
+                    pane.native_pane_window_group = None;
                 }
                 Err(err) => {
                     let pane = self
@@ -1163,6 +1178,7 @@ impl CompositorState {
                         reason: err.clone(),
                     };
                     pane.external_native_launch_token = None;
+                    pane.native_pane_window_group = None;
                     return Err(StateError::Process(err));
                 }
             }
@@ -1222,6 +1238,7 @@ impl CompositorState {
                         ExternalNativeLifecycleState::Attached { pid: client_pid };
                     pane.external_native_surface_id = surface_id;
                     pane.external_native_binding_evidence = evidence;
+                    pane.native_pane_window_group = None;
                     return Some(pane_id.clone());
                 }
                 ExternalNativeLifecycleState::Exited { pid, .. }
@@ -1231,11 +1248,13 @@ impl CompositorState {
                         ExternalNativeLifecycleState::Attached { pid: client_pid };
                     pane.external_native_surface_id = surface_id;
                     pane.external_native_binding_evidence = evidence;
+                    pane.native_pane_window_group = None;
                     return Some(pane_id.clone());
                 }
                 ExternalNativeLifecycleState::Attached { pid } if pid == client_pid => {
                     pane.external_native_surface_id = surface_id;
                     pane.external_native_binding_evidence = evidence;
+                    pane.native_pane_window_group = None;
                     return Some(pane_id.clone());
                 }
                 ExternalNativeLifecycleState::Absent
@@ -1248,6 +1267,50 @@ impl CompositorState {
         None
     }
 
+    pub fn runtime_mark_native_pane_window_group_observed(
+        &mut self,
+        pane_id: &PaneId,
+        primary_window_id: String,
+        surface_id: Option<u32>,
+    ) -> bool {
+        let Some(pane) = self.panes.get_mut(pane_id) else {
+            return false;
+        };
+        if !matches!(pane.render_mode, PaneRenderMode::ExternalNative { .. })
+            || !matches!(pane.external_native_state, ExternalNativeLifecycleState::Attached { .. })
+        {
+            return false;
+        }
+        if surface_id.is_some() && pane.external_native_surface_id != surface_id {
+            return false;
+        }
+        let focused = matches!(
+            &self.runtime.active_focus_target,
+            Some(RuntimeFocusTarget::NativePane { pane_id: focused_pane }) if focused_pane == pane_id
+        );
+        pane.native_pane_window_group = Some(NativePaneWindowGroupStatus {
+            pane_id: pane_id.clone(),
+            pane_instance_id: pane.native_host_binding_id.clone(),
+            launch_token: pane.external_native_launch_token.clone(),
+            primary_window_id: Some(primary_window_id.clone()),
+            focused_window_id: focused.then_some(primary_window_id.clone()),
+            accepted_secondary_count: 0,
+            denied_toplevel_count: 0,
+            denied_reasons: Vec::new(),
+            pane_local_bounds: Some(pane.geometry),
+            clipping_status: "clipped".to_string(),
+            members: vec![NativePaneWindowGroupMemberStatus {
+                id: primary_window_id,
+                role: "primary".to_string(),
+                bounds: Some(pane.geometry),
+                focused,
+                lifecycle: "live".to_string(),
+                clipped_to_pane: Some(true),
+            }],
+        });
+        true
+    }
+
     pub fn runtime_mark_native_pane_surface_detached_for_pid(&mut self, client_pid: u32) -> bool {
         for pane in self.panes.values_mut() {
             match pane.external_native_state {
@@ -1255,12 +1318,14 @@ impl CompositorState {
                     pane.external_native_state = ExternalNativeLifecycleState::Launching { pid };
                     pane.external_native_surface_id = None;
                     pane.external_native_binding_evidence = None;
+                    pane.native_pane_window_group = None;
                     self.prune_stale_overlay_regions();
                     return true;
                 }
                 ExternalNativeLifecycleState::Launching { pid } if pid == client_pid => {
                     pane.external_native_surface_id = None;
                     pane.external_native_binding_evidence = None;
+                    pane.native_pane_window_group = None;
                     self.prune_stale_overlay_regions();
                     return true;
                 }
@@ -1294,6 +1359,7 @@ impl CompositorState {
         pane.external_native_surface_id = None;
         pane.external_native_binding_evidence = None;
         pane.external_native_launch_token = None;
+        pane.native_pane_window_group = None;
         self.overlay_role_policy.release_if_matches(pane_id);
         self.prune_stale_overlay_regions();
         Ok(())
@@ -1487,6 +1553,7 @@ impl CompositorState {
                     ExternalNativeLifecycleState::Exited { pid, exit_code };
                 pane.external_native_surface_id = None;
                 pane.external_native_binding_evidence = None;
+                pane.native_pane_window_group = None;
             }
         }
         self.prune_stale_overlay_regions();
@@ -1545,14 +1612,48 @@ impl CompositorState {
             runtime.logical_surface_height = None;
         }
 
+        let native_pane_window_groups = self.native_pane_window_groups_status();
+
         StatusSnapshot {
             host_mode_active: self.host_mode_active,
             output_rotation: self.output_rotation,
             panes,
+            native_pane_window_groups,
             overlay_regions: self.overlay_regions_status(),
             overlay_role_policy: self.overlay_role_policy.status(),
             runtime,
         }
+    }
+
+    fn native_pane_window_groups_status(&self) -> Vec<NativePaneWindowGroupStatus> {
+        let mut groups: Vec<NativePaneWindowGroupStatus> = self
+            .panes
+            .iter()
+            .filter_map(|(pane_id, pane)| {
+                if !matches!(pane.render_mode, PaneRenderMode::ExternalNative { .. }) {
+                    return None;
+                }
+                let ExternalNativeLifecycleState::Attached { .. } = pane.external_native_state
+                else {
+                    return None;
+                };
+                let mut group = pane.native_pane_window_group.clone()?;
+                let focused = matches!(
+                    &self.runtime.active_focus_target,
+                    Some(RuntimeFocusTarget::NativePane { pane_id: focused_pane }) if focused_pane == pane_id
+                );
+                group.focused_window_id = focused.then(|| group.primary_window_id.clone()).flatten();
+                for member in &mut group.members {
+                    member.focused = group
+                        .focused_window_id
+                        .as_deref()
+                        .is_some_and(|focused_id| focused_id == member.id);
+                }
+                Some(group)
+            })
+            .collect();
+        groups.sort_by(|left, right| left.pane_id.cmp(&right.pane_id));
+        groups
     }
 
     fn runtime_logical_surface_size(&self) -> Option<(i32, i32)> {
@@ -2352,6 +2453,7 @@ mod tests {
                     id: PaneId::new("left"),
                     content_id: Some("content-left".to_string()),
                     binding_id: Some("binding-left".to_string()),
+                    launch_token: None,
                     revision: 1,
                     geometry: PaneGeometry {
                         x: 0,
@@ -2367,6 +2469,7 @@ mod tests {
                     id: PaneId::new("right"),
                     content_id: Some("content-right".to_string()),
                     binding_id: Some("binding-right".to_string()),
+                    launch_token: None,
                     revision: 1,
                     geometry: PaneGeometry {
                         x: 640,
@@ -2440,6 +2543,7 @@ mod tests {
                 id: PaneId::new("native-pane"),
                 content_id: Some("content-native".to_string()),
                 binding_id: Some("binding-native".to_string()),
+                launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
                     x: 0,
@@ -2483,6 +2587,7 @@ mod tests {
                     id: PaneId::new("left"),
                     content_id: Some("content-left".to_string()),
                     binding_id: Some("binding-left".to_string()),
+                    launch_token: None,
                     revision: 1,
                     geometry: PaneGeometry {
                         x: 0,
@@ -2498,6 +2603,7 @@ mod tests {
                     id: PaneId::new("right"),
                     content_id: Some("content-right".to_string()),
                     binding_id: Some("binding-right".to_string()),
+                    launch_token: None,
                     revision: 1,
                     geometry: PaneGeometry {
                         x: 640,
@@ -2622,6 +2728,7 @@ mod tests {
                 id: PaneId::new("full"),
                 content_id: None,
                 binding_id: None,
+                launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
                     x: 0,
@@ -2648,6 +2755,7 @@ mod tests {
                 id: PaneId::new("full"),
                 content_id: None,
                 binding_id: None,
+                launch_token: None,
                 revision: 2,
                 geometry: PaneGeometry {
                     x: 0,
@@ -2687,6 +2795,7 @@ mod tests {
                 id: PaneId::new("top"),
                 content_id: Some("target-top".to_string()),
                 binding_id: Some("top:target-top".to_string()),
+                launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
                     x: 0,
@@ -2766,6 +2875,7 @@ mod tests {
     #[test]
     fn native_pane_surface_reconciles_by_launched_pid_and_reports_evidence() {
         let process = FakeProcessController::default();
+        let process_view = process.clone();
         let mut state = CompositorState::new(true, Box::new(process));
         state.mark_runtime_running(
             RuntimeBackend::HostDrm,
@@ -2778,6 +2888,7 @@ mod tests {
                 id: PaneId::new("left"),
                 content_id: Some("content-left".to_string()),
                 binding_id: Some("binding-left".to_string()),
+                launch_token: Some("provider-token-left".to_string()),
                 revision: 1,
                 geometry: PaneGeometry {
                     x: 0,
@@ -2793,6 +2904,10 @@ mod tests {
         state
             .launch_native_pane_hosts(Vec::new())
             .expect("native pane should launch");
+        assert_eq!(
+            process_view.spawned_env()[0].get(LAUNCH_TOKEN_ENV),
+            Some(&"provider-token-left".to_string())
+        );
 
         let evidence = SurfaceBindingEvidence {
             app_id: Some("unexpected-terminal-id".to_string()),
@@ -2828,6 +2943,29 @@ mod tests {
         assert_eq!(native_host.revision, 1);
         assert_eq!(native_host.surface_id, Some(101));
         assert!(
+            status.native_pane_window_groups.is_empty(),
+            "attachment evidence alone must not synthesize a window group"
+        );
+        assert!(state.runtime_mark_native_pane_window_group_observed(
+            &PaneId::new("left"),
+            "101".to_string(),
+            Some(101),
+        ));
+        let status = state.status_snapshot();
+        assert_eq!(status.native_pane_window_groups.len(), 1);
+        let group = &status.native_pane_window_groups[0];
+        assert_eq!(group.pane_id, PaneId::new("left"));
+        assert_eq!(group.pane_instance_id.as_deref(), Some("binding-left"));
+        assert_eq!(group.launch_token.as_deref(), Some("provider-token-left"));
+        assert_eq!(group.primary_window_id.as_deref(), Some("101"));
+        assert_eq!(group.accepted_secondary_count, 0);
+        assert_eq!(group.denied_toplevel_count, 0);
+        assert_eq!(group.clipping_status, "clipped");
+        assert_eq!(group.members.len(), 1);
+        assert_eq!(group.members[0].id, "101");
+        assert_eq!(group.members[0].role, "primary");
+        assert_eq!(group.members[0].bounds, Some(status.panes[0].geometry));
+        assert!(
             state
                 .runtime_mark_native_pane_surface_attached_for_pid(99, None, None)
                 .is_none()
@@ -2843,6 +2981,7 @@ mod tests {
                 id: PaneId::new("surface:2"),
                 content_id: Some("ct_top".to_string()),
                 binding_id: Some("surface:2:ct_top".to_string()),
+                launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
                     x: 0,
@@ -2893,6 +3032,7 @@ mod tests {
                 id: PaneId::new("surface:2"),
                 content_id: Some("ct_top".to_string()),
                 binding_id: Some("surface:2:ct_top:7".to_string()),
+                launch_token: None,
                 revision: 7,
                 geometry: PaneGeometry {
                     x: 0,
@@ -2962,6 +3102,7 @@ mod tests {
                 id: PaneId::new("surface:2"),
                 content_id: Some("ct_top".to_string()),
                 binding_id: Some("surface:2:ct_top".to_string()),
+                launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
                     x: 0,
@@ -3000,6 +3141,7 @@ mod tests {
         assert_eq!(native_host.surface_id, None);
         assert_eq!(native_host.content_id.as_deref(), Some("ct_top"));
         assert_eq!(native_host.binding_id.as_deref(), Some("surface:2:ct_top"));
+        assert!(status.native_pane_window_groups.is_empty());
     }
 
     #[test]
@@ -3069,6 +3211,7 @@ mod tests {
                 id: PaneId::new("p-1"),
                 content_id: Some("content-1".to_string()),
                 binding_id: Some("p-1:content-1".to_string()),
+                launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
                     x: 0,
@@ -3217,6 +3360,7 @@ mod tests {
                 id: PaneId::new("full"),
                 content_id: None,
                 binding_id: None,
+                launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
                     x: 0,
@@ -3547,6 +3691,7 @@ mod tests {
                     id: PaneId::new("left"),
                     content_id: None,
                     binding_id: None,
+                    launch_token: None,
                     revision: 0,
                     geometry: PaneGeometry {
                         x: 0,
@@ -3562,6 +3707,7 @@ mod tests {
                     id: PaneId::new("right"),
                     content_id: None,
                     binding_id: None,
+                    launch_token: None,
                     revision: 0,
                     geometry: PaneGeometry {
                         x: 100,
@@ -3666,6 +3812,7 @@ mod tests {
                     id: PaneId::new("1"),
                     content_id: Some("target_top_full_41".to_string()),
                     binding_id: Some("1:target_top_full_41".to_string()),
+                    launch_token: None,
                     revision: 1,
                     geometry: PaneGeometry {
                         x: 0,
@@ -3681,6 +3828,7 @@ mod tests {
                     id: PaneId::new("top-proof"),
                     content_id: Some("target-top-proof".to_string()),
                     binding_id: Some("top-proof:target".to_string()),
+                    launch_token: None,
                     revision: 1,
                     geometry: PaneGeometry {
                         x: 1080,
@@ -3790,6 +3938,7 @@ mod tests {
                 id: PaneId::new("1"),
                 content_id: Some("target_top_full_41".to_string()),
                 binding_id: Some("1:target_top_full_41".to_string()),
+                launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
                     x: 0,
@@ -3836,6 +3985,7 @@ mod tests {
                 id: PaneId::new("top-proof"),
                 content_id: Some("target-top-proof".to_string()),
                 binding_id: Some("top-proof:target".to_string()),
+                launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
                     x: 1080,
@@ -3876,6 +4026,7 @@ mod tests {
                 id: PaneId::new("1"),
                 content_id: Some("target_top_full_41".to_string()),
                 binding_id: Some("1:target_top_full_41".to_string()),
+                launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
                     x: 0,

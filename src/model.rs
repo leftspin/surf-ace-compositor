@@ -379,6 +379,12 @@ pub struct NativePaneHostRequest {
     pub content_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding_id: Option<String>,
+    #[serde(
+        rename = "launchToken",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub launch_token: Option<String>,
     #[serde(default)]
     pub revision: u64,
     pub geometry: PaneGeometry,
@@ -401,6 +407,40 @@ pub struct NativePaneHostStatus {
     pub process: ProcessSpec,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding_evidence: Option<SurfaceBindingEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativePaneWindowGroupMemberStatus {
+    pub id: String,
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<PaneGeometry>,
+    pub focused: bool,
+    pub lifecycle: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clipped_to_pane: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativePaneWindowGroupStatus {
+    pub pane_id: PaneId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_window_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_window_id: Option<String>,
+    pub accepted_secondary_count: u32,
+    pub denied_toplevel_count: u32,
+    pub denied_reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_local_bounds: Option<PaneGeometry>,
+    pub clipping_status: String,
+    pub members: Vec<NativePaneWindowGroupMemberStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -731,6 +771,8 @@ pub struct StatusSnapshot {
     pub host_mode_active: bool,
     pub output_rotation: OutputRotation,
     pub panes: Vec<PaneStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub native_pane_window_groups: Vec<NativePaneWindowGroupStatus>,
     #[serde(default)]
     pub overlay_regions: OverlayRegionsStatus,
     pub overlay_role_policy: OverlayRolePolicyStatus,
@@ -837,6 +879,7 @@ mod tests {
                 "id":"surface:top",
                 "content_id":"tg_kolourpaint",
                 "binding_id":"surface:top:tg_kolourpaint:1",
+                "launchToken":"provider-token",
                 "revision":1,
                 "geometry":{
                     "x":0,
@@ -858,6 +901,7 @@ mod tests {
         assert_eq!(request.id, PaneId::new("surface:top"));
         assert_eq!(request.target, NativeTargetClass::NativeApp);
         assert_eq!(request.process.command, "/usr/bin/kolourpaint");
+        assert_eq!(request.launch_token.as_deref(), Some("provider-token"));
     }
 
     #[test]

@@ -1029,6 +1029,7 @@ mod tests {
                         id: PaneId::new("pane-a"),
                         content_id: None,
                         binding_id: None,
+                        launch_token: None,
                         revision: 0,
                         geometry: PaneGeometry {
                             x: 10,
@@ -1049,6 +1050,7 @@ mod tests {
                         id: PaneId::new("pane-b"),
                         content_id: None,
                         binding_id: None,
+                        launch_token: None,
                         revision: 0,
                         geometry: PaneGeometry {
                             x: 320,
@@ -1342,6 +1344,7 @@ mod tests {
                 id: PaneId::new("pane-a"),
                 content_id: Some("target-egl".to_string()),
                 binding_id: Some("pane-a:target-egl".to_string()),
+                launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
                     x: 0,
@@ -1618,6 +1621,7 @@ mod tests {
                     id: PaneId::new("pane-a"),
                     content_id: None,
                     binding_id: None,
+                    launch_token: None,
                     revision: 0,
                     geometry: PaneGeometry {
                         x: 10,
@@ -1673,6 +1677,7 @@ mod tests {
                     id: PaneId::new("pane-a"),
                     content_id: Some("content-a".to_string()),
                     binding_id: Some("binding-a".to_string()),
+                    launch_token: None,
                     revision: 1,
                     geometry: PaneGeometry {
                         x: 10,
@@ -1773,6 +1778,7 @@ mod tests {
                     id: PaneId::new("pane-a"),
                     content_id: Some("content-a".to_string()),
                     binding_id: Some("binding-a".to_string()),
+                    launch_token: None,
                     revision: 1,
                     geometry: PaneGeometry {
                         x: 10,
@@ -1806,6 +1812,7 @@ mod tests {
                     id: PaneId::new("pane-a"),
                     content_id: Some("content-a".to_string()),
                     binding_id: Some("binding-a".to_string()),
+                    launch_token: None,
                     revision: 2,
                     geometry: PaneGeometry {
                         x: 30,
@@ -1888,6 +1895,7 @@ mod tests {
                     id: PaneId::new("pane-a"),
                     content_id: Some("content-a".to_string()),
                     binding_id: Some("binding-a".to_string()),
+                    launch_token: None,
                     revision: 1,
                     geometry: PaneGeometry {
                         x: 10,
