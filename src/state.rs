@@ -26,6 +26,13 @@ pub const LAUNCH_TOKEN_ENV: &str = "SURF_ACE_COMPOSITOR_LAUNCH_TOKEN";
 pub const NATIVE_PANE_CONTENT_ID_ENV: &str = "SURF_ACE_NATIVE_PANE_CONTENT_ID";
 pub const NATIVE_PANE_BINDING_ID_ENV: &str = "SURF_ACE_NATIVE_PANE_BINDING_ID";
 pub const NATIVE_PANE_REVISION_ENV: &str = "SURF_ACE_NATIVE_PANE_REVISION";
+const WAYLAND_TOOLKIT_DEFAULTS: &[(&str, &str)] = &[
+    ("GDK_BACKEND", "wayland"),
+    ("QT_QPA_PLATFORM", "wayland"),
+    ("SDL_VIDEODRIVER", "wayland"),
+    ("CLUTTER_BACKEND", "wayland"),
+    ("MOZ_ENABLE_WAYLAND", "1"),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PaneRuntimeState {
@@ -987,6 +994,7 @@ impl CompositorState {
         extra_env.insert(LAUNCH_TOKEN_ENV.to_string(), launch_token.clone());
         if let Some(wayland_socket) = self.runtime.wayland_socket.clone() {
             extra_env.insert("WAYLAND_DISPLAY".to_string(), wayland_socket);
+            apply_wayland_toolkit_defaults(&process, &mut extra_env);
         }
 
         match self.process_controller.spawn(&process, &extra_env) {
@@ -1155,6 +1163,7 @@ impl CompositorState {
             extra_env.insert(NATIVE_PANE_REVISION_ENV.to_string(), revision.to_string());
             if let Some(wayland_socket) = self.runtime.wayland_socket.clone() {
                 extra_env.insert("WAYLAND_DISPLAY".to_string(), wayland_socket);
+                apply_wayland_toolkit_defaults(&process, &mut extra_env);
             }
 
             match self.process_controller.spawn(&process, &extra_env) {
@@ -1277,7 +1286,10 @@ impl CompositorState {
             return false;
         };
         if !matches!(pane.render_mode, PaneRenderMode::ExternalNative { .. })
-            || !matches!(pane.external_native_state, ExternalNativeLifecycleState::Attached { .. })
+            || !matches!(
+                pane.external_native_state,
+                ExternalNativeLifecycleState::Attached { .. }
+            )
         {
             return false;
         }
@@ -2119,6 +2131,14 @@ fn pane_retains_overlay_regions(pane: &PaneRuntimeState) -> bool {
         )
 }
 
+fn apply_wayland_toolkit_defaults(process: &ProcessSpec, extra_env: &mut BTreeMap<String, String>) {
+    for (key, value) in WAYLAND_TOOLKIT_DEFAULTS {
+        if !process.env.contains_key(*key) {
+            extra_env.insert((*key).to_string(), (*value).to_string());
+        }
+    }
+}
+
 fn pane_instance_id(pane_id: &PaneId, pane: &PaneRuntimeState) -> String {
     pane.native_host_binding_id
         .clone()
@@ -2645,6 +2665,26 @@ mod tests {
             process_view.spawned_env()[0].get("WAYLAND_DISPLAY"),
             Some(&"wayland-77".to_string())
         );
+        assert_eq!(
+            process_view.spawned_env()[0].get("QT_QPA_PLATFORM"),
+            Some(&"wayland".to_string())
+        );
+        assert_eq!(
+            process_view.spawned_env()[0].get("GDK_BACKEND"),
+            Some(&"wayland".to_string())
+        );
+        assert_eq!(
+            process_view.spawned_env()[0].get("SDL_VIDEODRIVER"),
+            Some(&"wayland".to_string())
+        );
+        assert_eq!(
+            process_view.spawned_env()[0].get("CLUTTER_BACKEND"),
+            Some(&"wayland".to_string())
+        );
+        assert_eq!(
+            process_view.spawned_env()[0].get("MOZ_ENABLE_WAYLAND"),
+            Some(&"1".to_string())
+        );
         assert!(
             process_view.spawned_env()[0]
                 .get(LAUNCH_TOKEN_ENV)
@@ -2666,6 +2706,10 @@ mod tests {
             process_view.spawned_env()[1].get("SURF_ACE_PANE_ID"),
             Some(&"right".to_string())
         );
+        assert_eq!(
+            process_view.spawned_env()[1].get("QT_QPA_PLATFORM"),
+            Some(&"wayland".to_string())
+        );
         assert_ne!(
             process_view.spawned_env()[0].get(LAUNCH_TOKEN_ENV),
             process_view.spawned_env()[1].get(LAUNCH_TOKEN_ENV)
@@ -2682,6 +2726,60 @@ mod tests {
         assert_eq!(
             status.panes[1].external_native_state,
             ExternalNativeLifecycleState::Launching { pid: 2 }
+        );
+    }
+
+    #[test]
+    fn native_pane_wayland_toolkit_defaults_do_not_override_process_env() {
+        let process = FakeProcessController::default();
+        let process_view = process.clone();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            1280,
+            720,
+        );
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: PaneId::new("paint"),
+                content_id: Some("content-paint".to_string()),
+                binding_id: Some("binding-paint".to_string()),
+                launch_token: None,
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 640,
+                    height: 720,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+                target: NativeTargetClass::NativeApp,
+                process: ProcessSpec {
+                    command: "kolourpaint".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: BTreeMap::from([("QT_QPA_PLATFORM".to_string(), "offscreen".to_string())]),
+                },
+            }])
+            .expect("native pane host plan should apply");
+
+        state
+            .launch_native_pane_hosts(Vec::new())
+            .expect("native pane should launch");
+
+        assert_eq!(
+            process_view.spawned_env()[0].get("WAYLAND_DISPLAY"),
+            Some(&"wayland-77".to_string())
+        );
+        assert_eq!(
+            process_view.spawned_env()[0].get("QT_QPA_PLATFORM"),
+            None,
+            "process env must remain authoritative over compositor defaults"
+        );
+        assert_eq!(
+            process_view.spawned_env()[0].get("GDK_BACKEND"),
+            Some(&"wayland".to_string())
         );
     }
 
