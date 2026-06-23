@@ -1033,6 +1033,9 @@ fn process_claimed_drm_event_source(
             state.mark_runtime_redraw();
         }
         state.poll_processes();
+        drop(state);
+        data.host_backend
+            .queue_claimed_presentation_tick(&mut data.wayland_state)?;
     }
     Ok(())
 }
