@@ -1,3 +1,4 @@
+use crate::control::RuntimeControlCommand;
 use crate::model::{
     LaunchTokenEvidence, OutputRotation, OverlayCaptureCapability, OverlayRegionStatus,
     PaneGeometry, PaneId, RuntimeBackend, RuntimeDmabufFormatStatus, RuntimeFocusTarget,
@@ -24,15 +25,18 @@ use smithay::backend::input::{
 };
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::element::surface::{
-    WaylandSurfaceRenderElement, render_elements_from_surface_tree,
+    WaylandSurfaceRenderElement, WaylandSurfaceTexture, render_elements_from_surface_tree,
 };
 use smithay::backend::renderer::element::{
-    Id, Kind, render_elements, solid::SolidColorRenderElement, utils::CropRenderElement,
+    Element, Id, Kind, RenderElement, UnderlyingStorage, render_elements,
+    solid::SolidColorRenderElement, utils::CropRenderElement,
 };
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
+use smithay::backend::renderer::gles::{
+    GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform, UniformName, UniformType,
+};
 use smithay::backend::renderer::utils::{
-    CommitCounter, RendererSurfaceStateUserData, draw_render_elements, import_surface_tree,
-    on_commit_buffer_handler,
+    CommitCounter, DamageSet, OpaqueRegions, RendererSurfaceStateUserData, draw_render_elements,
+    import_surface_tree, on_commit_buffer_handler,
 };
 use smithay::backend::renderer::{
     Bind, Color32F, ExportMem, Frame, ImportDma, Offscreen, Renderer, Texture, TextureMapping,
@@ -45,9 +49,11 @@ use smithay::backend::winit::{self, WinitEvent};
 use smithay::delegate_compositor;
 use smithay::delegate_data_device;
 use smithay::delegate_dmabuf;
+use smithay::delegate_fractional_scale;
 use smithay::delegate_output;
 use smithay::delegate_seat;
 use smithay::delegate_shm;
+use smithay::delegate_viewporter;
 use smithay::delegate_xdg_decoration;
 use smithay::delegate_xdg_shell;
 use smithay::input::keyboard::{FilterResult, Keysym, ModifiersState, keysyms, xkb};
@@ -96,6 +102,9 @@ use smithay::wayland::compositor::{
 use smithay::wayland::dmabuf::{
     DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf,
 };
+use smithay::wayland::fractional_scale::{
+    self, FractionalScaleHandler, FractionalScaleManagerState,
+};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::selection::data_device::{
@@ -109,13 +118,15 @@ use smithay::wayland::shell::xdg::{
 };
 use smithay::wayland::shm::{BufferAccessError, ShmHandler, ShmState, with_buffer_contents};
 use smithay::wayland::socket::ListeningSocketSource;
+use smithay::wayland::viewporter::ViewporterState;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::OpenOptions;
 use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
@@ -415,8 +426,9 @@ pub fn run_winit(shared_state: Arc<Mutex<CompositorState>>) -> Result<(), Runtim
     let display: Display<RuntimeWaylandState> =
         Display::new().map_err(|err| RuntimeError::WaylandDisplay(err.to_string()))?;
     let display_handle = display.handle();
+    let mut wayland_state = RuntimeWaylandState::new(display_handle.clone(), shared_state.clone())
+        .map_err(|err| RuntimeError::WaylandDisplay(err.code().to_string()))?;
 
-    let mut wayland_state = RuntimeWaylandState::new(display_handle.clone(), shared_state.clone());
     let listening_socket = ListeningSocketSource::new_auto()
         .map_err(|err| RuntimeError::WaylandSocket(err.to_string()))?;
     let socket_name = listening_socket
@@ -479,7 +491,11 @@ pub fn run_winit(shared_state: Arc<Mutex<CompositorState>>) -> Result<(), Runtim
                 data.wayland_state.prune_dead_surfaces();
                 let size = backend.window_size();
                 let damage = Rectangle::from_size(size);
-                let rotation = { lock_state(&data.shared_state).output_rotation() };
+                let rotation = data
+                    .wayland_state
+                    .root_geometry_snapshot()
+                    .map(|snapshot| snapshot.rotation)
+                    .unwrap_or_else(|| lock_state(&data.shared_state).output_rotation());
                 let transform = transform_from_rotation(rotation);
 
                 let render_result = (|| {
@@ -488,17 +504,28 @@ pub fn run_winit(shared_state: Arc<Mutex<CompositorState>>) -> Result<(), Runtim
                             .bind()
                             .map_err(|err| format!("failed to bind winit frame: {err}"))?;
 
-                        let capture = data
-                            .wayland_state
-                            .collect_render_elements(renderer, size.w, size.h);
+                        let logical_size = data.wayland_state.runtime_output_size();
+                        let capture = data.wayland_state.collect_render_elements(
+                            renderer,
+                            logical_size.w,
+                            logical_size.h,
+                        );
+                        if let Some(failure) = capture.failure.as_ref() {
+                            return Err(failure.clone());
+                        }
                         let mut frame = renderer
                             .render(&mut framebuffer, size, transform)
                             .map_err(|err| format!("failed to start render pass: {err}"))?;
                         frame
                             .clear(Color32F::new(0.08, 0.08, 0.1, 1.0), &[damage])
                             .map_err(|err| format!("failed to clear frame: {err}"))?;
-                        draw_render_elements(&mut frame, 1.0, &capture.elements, &[damage])
-                            .map_err(|err| format!("failed to draw surface elements: {err}"))?;
+                        draw_render_elements(
+                            &mut frame,
+                            data.wayland_state.root_display_scale(),
+                            &capture.elements,
+                            &[damage],
+                        )
+                        .map_err(|err| format!("failed to draw surface elements: {err}"))?;
                         let _ = frame
                             .finish()
                             .map_err(|err| format!("failed to finish render pass: {err}"))?;
@@ -508,8 +535,9 @@ pub fn run_winit(shared_state: Arc<Mutex<CompositorState>>) -> Result<(), Runtim
                         draw_software_cursor_frame(
                             &mut cursor_frame,
                             data.wayland_state.cursor_render_location(),
+                            Size::<i32, Physical>::from((logical_size.w, logical_size.h)),
                             size,
-                            size,
+                            data.wayland_state.root_display_scale(),
                             rotation,
                         )
                         .map_err(|err| format!("failed to draw software cursor: {err}"))?;
@@ -580,6 +608,15 @@ pub fn run_host(
     screen_capture: ScreenCaptureStore,
     options: HostRuntimeOptions,
 ) -> Result<(), RuntimeError> {
+    run_host_with_control(shared_state, screen_capture, options, None)
+}
+
+pub fn run_host_with_control(
+    shared_state: Arc<Mutex<CompositorState>>,
+    screen_capture: ScreenCaptureStore,
+    options: HostRuntimeOptions,
+    runtime_control: Option<Arc<Mutex<Receiver<RuntimeControlCommand>>>>,
+) -> Result<(), RuntimeError> {
     {
         let mut state = lock_state(&shared_state);
         state.mark_runtime_starting(RuntimeBackend::HostDrm);
@@ -620,11 +657,6 @@ pub fn run_host(
     let loop_signal = event_loop.get_signal();
     let loop_handle = event_loop.handle();
 
-    let display: Display<RuntimeWaylandState> =
-        Display::new().map_err(|err| RuntimeError::WaylandDisplay(err.to_string()))?;
-    let display_handle = display.handle();
-
-    let mut wayland_state = RuntimeWaylandState::new(display_handle.clone(), shared_state.clone());
     let listening_socket = ListeningSocketSource::new_auto()
         .map_err(|err| RuntimeError::WaylandSocket(err.to_string()))?;
     let socket_name = listening_socket
@@ -632,21 +664,6 @@ pub fn run_host(
         .to_str()
         .map(ToString::to_string)
         .unwrap_or_else(|| "wayland-unknown".to_string());
-
-    loop_handle
-        .insert_source(
-            Generic::new(display, Interest::READ, CalloopMode::Level),
-            |_, display, data| {
-                // Safety: display is pinned in this event source for the runtime lifetime.
-                let dispatch_result =
-                    unsafe { display.get_mut().dispatch_clients(&mut data.wayland_state) };
-                if dispatch_result.is_err() {
-                    data.loop_signal.stop();
-                }
-                Ok(PostAction::Continue)
-            },
-        )
-        .map_err(|err| RuntimeError::RegisterSource(err.to_string()))?;
 
     let (session, session_notifier) =
         LibSeatSession::new().map_err(|err| RuntimeError::HostSession(err.to_string()))?;
@@ -719,13 +736,60 @@ pub fn run_host(
     }
     sync_runtime_host_selection_status(&shared_state, &host_backend);
 
-    let claimed_output = match host_backend.claim_output_ownership(None) {
-        Ok(claimed_output) => claimed_output,
-        Err(err) => {
-            sync_runtime_host_selection_status(&shared_state, &host_backend);
-            return Err(err);
+    let display: Display<RuntimeWaylandState> =
+        Display::new().map_err(|err| RuntimeError::WaylandDisplay(err.to_string()))?;
+    let display_handle = display.handle();
+    let mut startup_wayland_state = None;
+    let claimed_output = {
+        let mut stage_startup_geometry = |width: u16, height: u16| {
+            let prepared = lock_state(&shared_state)
+                .prepare_initial_root4_geometry(width as i32, height as i32)
+                .map_err(|err| RuntimeError::HostOutputClaim {
+                    path: "root4".to_string(),
+                    error: err.code().to_string(),
+                })?;
+            startup_wayland_state = Some(
+                RuntimeWaylandState::new_with_initial_root_geometry(
+                    display_handle.clone(),
+                    shared_state.clone(),
+                    Some(prepared),
+                )
+                .map_err(|err| RuntimeError::HostOutputClaim {
+                    path: "root4".to_string(),
+                    error: err.code().to_string(),
+                })?,
+            );
+            Ok(())
+        };
+        match host_backend.claim_output_ownership(None, Some(&mut stage_startup_geometry), false) {
+            Ok(claimed_output) => claimed_output,
+            Err(err) => {
+                sync_runtime_host_selection_status(&shared_state, &host_backend);
+                return Err(err);
+            }
         }
     };
+    let mut wayland_state =
+        startup_wayland_state
+            .take()
+            .ok_or_else(|| RuntimeError::HostOutputClaim {
+                path: "root4".to_string(),
+                error: "display_scale_apply_failed".to_string(),
+            })?;
+    loop_handle
+        .insert_source(
+            Generic::new(display, Interest::READ, CalloopMode::Level),
+            |_, display, data| {
+                // Safety: display is pinned in this event source for the runtime lifetime.
+                let dispatch_result =
+                    unsafe { display.get_mut().dispatch_clients(&mut data.wayland_state) };
+                if dispatch_result.is_err() {
+                    data.loop_signal.stop();
+                }
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|err| RuntimeError::RegisterSource(err.to_string()))?;
     sync_runtime_host_selection_status(&shared_state, &host_backend);
     sync_runtime_host_present_capabilities(&shared_state, &host_backend);
     wayland_state
@@ -819,14 +883,24 @@ pub fn run_host(
                 }
                 return TimeoutAction::ToDuration(Duration::from_millis(16));
             }
-            match data
-                .host_backend
-                .queue_claimed_presentation_tick(&mut data.wayland_state)
-            {
-                Ok(_) => {}
+            data.stage_next_root_geometry_mutation();
+            if !data.wayland_state.staged_native_materializations_ready() {
+                return TimeoutAction::ToDuration(Duration::from_millis(16));
+            }
+            let presentation = data.queue_pinned_presentation_tick();
+            match presentation {
+                Ok(Some(_)) => {}
+                Ok(None) => {}
                 Err(failure) => {
+                    data.discard_staged_root_geometry(
+                        crate::root_geometry::RootGeometryError::DisplayScaleApplyFailed,
+                    );
+                    if failure.is_transaction() {
+                        eprintln!("root4 geometry transaction rejected: {}", failure.error_ref());
+                        return TimeoutAction::ToDuration(Duration::from_millis(16));
+                    }
                     if failure.is_reclaimable() {
-                        data.host_backend.claimed_output = None;
+                        data.host_backend.mark_claim_lost();
                         sync_runtime_host_present_capabilities(&data.shared_state, &data.host_backend);
                         data.wayland_state.sync_dmabuf_protocol_formats(None);
                         if let Err(reclaim_err) = reclaim_host_output_in_process(
@@ -884,6 +958,14 @@ pub fn run_host(
         .insert_source(udev, move |event, _, data| {
             match event {
                 UdevEvent::Added { device_id, path } => {
+                    if data
+                        .host_backend
+                        .forced_drm_path
+                        .as_deref()
+                        .is_some_and(|forced| forced != path.as_path())
+                    {
+                        return;
+                    }
                     if let Err(err) = data.host_backend.upsert_device(device_id as u64, path) {
                         eprintln!("host backend failed to open added drm device: {err}");
                     }
@@ -947,6 +1029,14 @@ pub fn run_host(
         loop_signal,
         wayland_state,
         host_backend,
+        runtime_control,
+        pending_rotation_response: None,
+        root_geometry_queue: RuntimeGeometryMutationQueue::default(),
+        pending_geometry_mutation: None,
+        root_geometry_flip_boundary: RootGeometryFlipBoundary::default(),
+        pending_reclaim_publication: None,
+        #[cfg(test)]
+        root_geometry_stage_failure: None,
     };
 
     let run_result = event_loop.run(None, &mut runtime_data, |_| {});
@@ -973,11 +1063,472 @@ struct HostRuntimeLoopData {
     loop_signal: LoopSignal,
     wayland_state: RuntimeWaylandState,
     host_backend: HostBackendState,
+    runtime_control: Option<Arc<Mutex<Receiver<RuntimeControlCommand>>>>,
+    pending_rotation_response:
+        Option<std::sync::mpsc::SyncSender<Result<(), crate::root_geometry::RootGeometryError>>>,
+    root_geometry_queue: RuntimeGeometryMutationQueue,
+    pending_geometry_mutation: Option<(u64, &'static str)>,
+    root_geometry_flip_boundary: RootGeometryFlipBoundary,
+    pending_reclaim_publication: Option<PendingReclaimPublication>,
+    #[cfg(test)]
+    root_geometry_stage_failure: Option<Root4ConsumerStage>,
+}
+
+struct PendingReclaimPublication {
+    mode_width: i32,
+    mode_height: i32,
+    active_connector_name: Option<String>,
+    active_connector_id: Option<u32>,
+    last_selection_attempt: Option<String>,
+    last_selection_result: Option<String>,
+    ownership: RuntimeHostPresentOwnership,
+    atomic_enabled: bool,
+    overlay_capable: bool,
+}
+
+#[derive(Default)]
+struct RootGeometryFlipBoundary {
+    queued: Option<PresentationToken>,
+}
+
+impl RootGeometryFlipBoundary {
+    fn mark_queued(&mut self, token: PresentationToken) {
+        self.queued = Some(token);
+    }
+
+    fn take_completed(&mut self, completed: &[PresentationToken]) -> bool {
+        self.queued
+            .take_if(|queued| completed.contains(queued))
+            .is_some()
+    }
+
+    fn discard(&mut self) {
+        self.queued = None;
+    }
+}
+
+/// The narrow side-effect boundary used by the root4 transaction engine.
+/// Production delegates this to the host capture store; tests can drive the
+/// same staging/activation code without opening a seat or a DRM device.
+trait RootGeometryStageStore {
+    fn begin_stage(&mut self, generation: u64);
+    fn commit_stage(&mut self, generation: u64);
+    fn discard_stage(&mut self, generation: u64);
+}
+
+impl RootGeometryStageStore for HostBackendState {
+    fn begin_stage(&mut self, generation: u64) {
+        self.screen_capture.begin_root4_stage(generation);
+    }
+
+    fn commit_stage(&mut self, generation: u64) {
+        self.screen_capture.commit_root4_stage(generation);
+    }
+
+    fn discard_stage(&mut self, generation: u64) {
+        self.screen_capture.discard_root4_stage(generation);
+    }
+}
+
+fn install_root_geometry_stage(
+    wayland_state: &mut RuntimeWaylandState,
+    stage_store: &mut impl RootGeometryStageStore,
+    staged: StagedRuntimeRootGeometry,
+) {
+    stage_store.begin_stage(staged.committed.snapshot.generation);
+    wayland_state.staged_root_geometry = Some(staged.clone());
+    wayland_state.presentation_root_geometry = Some(staged);
+    wayland_state.stage_role_configures();
+    wayland_state.presentation_root_geometry = None;
+}
+
+fn activate_root_geometry_stage(
+    shared_state: &Arc<Mutex<CompositorState>>,
+    wayland_state: &mut RuntimeWaylandState,
+    stage_store: &mut impl RootGeometryStageStore,
+    publish: impl FnOnce(&mut CompositorState),
+) -> Option<StagedRuntimeRootGeometry> {
+    let prepared = wayland_state.staged_root_geometry.take()?;
+    let mut state = lock_state(shared_state);
+    state.mark_runtime_root4_dimensions_committed(
+        prepared.committed.snapshot.physical_size_px.width,
+        prepared.committed.snapshot.physical_size_px.height,
+    );
+    state.commit_root4_geometry_consumers(
+        prepared.committed,
+        prepared.root_layout.clone(),
+        &prepared.viewports,
+    );
+    publish(&mut state);
+    stage_store.commit_stage(prepared.committed.snapshot.generation);
+    wayland_state.backend_output_size = Size::<i32, Physical>::from((
+        prepared.committed.snapshot.physical_size_px.width,
+        prepared.committed.snapshot.physical_size_px.height,
+    ));
+    wayland_state.activate_output_global(prepared.output_global.clone());
+    wayland_state.active_root_geometry_consumers = Some(prepared.clone());
+    wayland_state.applied_output_rotation = prepared.committed.snapshot.rotation;
+    wayland_state.applied_root_geometry_generation = prepared.committed.snapshot.generation;
+    Some(prepared)
+}
+
+struct QueuedRuntimeGeometryMutation {
+    sequence: u64,
+    mutation: RuntimeGeometryMutation,
+}
+
+#[derive(Default)]
+struct RuntimeGeometryMutationQueue {
+    next_sequence: u64,
+    pending: VecDeque<QueuedRuntimeGeometryMutation>,
+}
+
+impl RuntimeGeometryMutationQueue {
+    fn push(&mut self, mutation: RuntimeGeometryMutation) -> u64 {
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        let sequence = self.next_sequence;
+        self.pending
+            .push_back(QueuedRuntimeGeometryMutation { sequence, mutation });
+        sequence
+    }
+
+    fn pop(&mut self) -> Option<QueuedRuntimeGeometryMutation> {
+        self.pending.pop_front()
+    }
+}
+
+enum RuntimeGeometryMutation {
+    Scale {
+        factor: f64,
+        source: crate::root_geometry::DisplayScaleSource,
+    },
+    Rotation {
+        rotation: OutputRotation,
+        response: std::sync::mpsc::SyncSender<Result<(), crate::root_geometry::RootGeometryError>>,
+    },
+    Mode {
+        width: i32,
+        height: i32,
+    },
+}
+
+impl HostRuntimeLoopData {
+    fn complete_root_geometry_presentations(&mut self, completed: &[PresentationToken]) -> bool {
+        if self.root_geometry_flip_boundary.take_completed(completed) {
+            self.commit_staged_root_geometry();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn queue_pinned_presentation_tick(
+        &mut self,
+    ) -> Result<Option<PresentationToken>, HostPresentFailure> {
+        let material_identity = self.wayland_state.accepted_material_identity();
+        let identity_accepted =
+            self.wayland_state
+                .staged_root_geometry
+                .as_mut()
+                .is_none_or(|staged| {
+                    staged.accept_or_validate_material_identity(material_identity.clone())
+                });
+        if !identity_accepted {
+            return Err(self.material_identity_changed_failure());
+        }
+        self.wayland_state.presentation_root_geometry =
+            self.wayland_state.staged_root_geometry.clone();
+        let queued = self
+            .host_backend
+            .queue_claimed_presentation_tick(&mut self.wayland_state);
+        let materials_unchanged = self
+            .wayland_state
+            .presentation_root_geometry
+            .as_ref()
+            .is_none_or(|presentation| {
+                presentation.accepted_material_identity.as_ref()
+                    == Some(&self.wayland_state.accepted_material_identity())
+            });
+        self.wayland_state.presentation_root_geometry = None;
+        if !materials_unchanged {
+            return Err(self.material_identity_changed_failure());
+        }
+        if let Ok(Some(token)) = queued
+            && self.wayland_state.staged_root_geometry.is_some()
+        {
+            self.root_geometry_flip_boundary.mark_queued(token);
+        }
+        queued
+    }
+
+    fn material_identity_changed_failure(&self) -> HostPresentFailure {
+        HostPresentFailure::transaction(RuntimeError::HostOutputClaim {
+            path: self
+                .host_backend
+                .primary_opened_path()
+                .unwrap_or_else(|| "<selected-root4-device>".to_string()),
+            error: "root4 surface material changed during the pinned presentation".to_string(),
+        })
+    }
+
+    fn install_staged_root_geometry(&mut self, staged: StagedRuntimeRootGeometry) {
+        install_root_geometry_stage(&mut self.wayland_state, &mut self.host_backend, staged);
+    }
+
+    fn stage_root4_mode_if_changed(
+        &mut self,
+        width: i32,
+        height: i32,
+    ) -> Result<(), crate::root_geometry::RootGeometryError> {
+        let staged = {
+            let state = lock_state(&self.shared_state);
+            state
+                .prepare_root4_mode(width, height)
+                .and_then(|prepared| {
+                    #[cfg(test)]
+                    {
+                        stage_runtime_root_geometry_consumers(
+                            &state,
+                            prepared,
+                            self.root_geometry_stage_failure,
+                        )
+                    }
+                    #[cfg(not(test))]
+                    {
+                        stage_runtime_root_geometry_consumers(&state, prepared)
+                    }
+                })?
+        };
+        self.install_staged_root_geometry(staged);
+        Ok(())
+    }
+
+    fn ingest_root_geometry_commands(&mut self) {
+        let commands = self.runtime_control.as_ref().map(|receiver| {
+            let receiver = match receiver.lock() {
+                Ok(receiver) => receiver,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let mut commands = Vec::new();
+            while let Ok(command) = receiver.try_recv() {
+                commands.push(command);
+            }
+            commands
+        });
+        for command in commands.into_iter().flatten() {
+            match command {
+                RuntimeControlCommand::Root4ConfigScaleSet { factor, source } => {
+                    self.root_geometry_queue
+                        .push(RuntimeGeometryMutation::Scale { factor, source });
+                }
+                RuntimeControlCommand::SetOutputRotation { rotation, response } => {
+                    self.root_geometry_queue
+                        .push(RuntimeGeometryMutation::Rotation { rotation, response });
+                }
+                RuntimeControlCommand::StartHostRuntime => {}
+            }
+        }
+    }
+
+    fn stage_next_root_geometry_mutation(&mut self) {
+        if self.wayland_state.staged_root_geometry.is_some() {
+            return;
+        }
+        self.ingest_root_geometry_commands();
+        let command = self.root_geometry_queue.pop();
+        match command {
+            Some(QueuedRuntimeGeometryMutation {
+                sequence,
+                mutation: RuntimeGeometryMutation::Scale { factor, source },
+            }) => {
+                let staged = {
+                    let state = lock_state(&self.shared_state);
+                    state
+                        .prepare_root4_display_scale_from_config(factor, source)
+                        .and_then(|prepared| {
+                            #[cfg(test)]
+                            {
+                                stage_runtime_root_geometry_consumers(
+                                    &state,
+                                    prepared,
+                                    self.root_geometry_stage_failure,
+                                )
+                            }
+                            #[cfg(not(test))]
+                            {
+                                stage_runtime_root_geometry_consumers(&state, prepared)
+                            }
+                        })
+                };
+                match staged {
+                    Ok(prepared) => {
+                        self.install_staged_root_geometry(prepared);
+                        self.pending_geometry_mutation = Some((sequence, "scale"));
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "{{\"ok\":false,\"error\":\"{}\",\"mutation\":\"scale\",\"sequence\":{sequence}}}",
+                            err.code()
+                        );
+                    }
+                }
+            }
+            Some(QueuedRuntimeGeometryMutation {
+                sequence,
+                mutation: RuntimeGeometryMutation::Rotation { rotation, response },
+            }) => {
+                let staged = {
+                    let state = lock_state(&self.shared_state);
+                    state.prepare_root4_rotation(rotation).and_then(|prepared| {
+                        #[cfg(test)]
+                        {
+                            stage_runtime_root_geometry_consumers(
+                                &state,
+                                prepared,
+                                self.root_geometry_stage_failure,
+                            )
+                        }
+                        #[cfg(not(test))]
+                        {
+                            stage_runtime_root_geometry_consumers(&state, prepared)
+                        }
+                    })
+                };
+                match staged {
+                    Ok(prepared) => {
+                        self.install_staged_root_geometry(prepared);
+                        self.pending_rotation_response = Some(response);
+                        self.pending_geometry_mutation = Some((sequence, "rotation"));
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "{{\"ok\":false,\"error\":\"{}\",\"mutation\":\"rotation\",\"sequence\":{sequence}}}",
+                            err.code()
+                        );
+                        let _ = response.send(Err(err));
+                    }
+                }
+            }
+            Some(QueuedRuntimeGeometryMutation {
+                sequence,
+                mutation: RuntimeGeometryMutation::Mode { width, height },
+            }) => match self
+                .host_backend
+                .arm_prepared_reclaim_for_presentation()
+                .and_then(|()| {
+                    self.stage_root4_mode_if_changed(width, height)
+                        .map_err(|err| RuntimeError::HostOutputClaim {
+                            path: "root4".to_string(),
+                            error: err.code().to_string(),
+                        })
+                }) {
+                Ok(()) => self.pending_geometry_mutation = Some((sequence, "mode")),
+                Err(_err) => {
+                    self.host_backend.discard_unactivated_reclaim();
+                    eprintln!(
+                        "{{\"ok\":false,\"error\":\"display_scale_apply_failed\",\"mutation\":\"mode\",\"sequence\":{sequence}}}"
+                    );
+                }
+            },
+            None => {}
+        }
+    }
+
+    fn commit_staged_root_geometry(&mut self) {
+        self.root_geometry_flip_boundary.discard();
+        let activated_reclaim = self
+            .pending_geometry_mutation
+            .is_some_and(|(_, mutation)| mutation == "mode");
+        let reclaim_publication = if activated_reclaim {
+            self.pending_reclaim_publication.take().map(|publication| {
+                (
+                    publication,
+                    self.host_backend.seat_name.clone(),
+                    self.host_backend.detected_count(),
+                    self.host_backend.opened_count(),
+                    self.host_backend.primary_opened_path(),
+                )
+            })
+        } else {
+            None
+        };
+        let Some(prepared) = activate_root_geometry_stage(
+            &self.shared_state,
+            &mut self.wayland_state,
+            &mut self.host_backend,
+            |state| {
+                if let Some((publication, seat_name, detected, opened, path)) = reclaim_publication
+                {
+                    state.set_runtime_host_backend_snapshot(
+                        Some(seat_name),
+                        detected,
+                        opened,
+                        path,
+                    );
+                    state.mark_runtime_host_output_reclaimed(
+                        publication.mode_width,
+                        publication.mode_height,
+                        publication.active_connector_name,
+                        publication.active_connector_id,
+                        publication.last_selection_attempt,
+                        publication.last_selection_result,
+                        publication.ownership,
+                        publication.atomic_enabled,
+                        publication.overlay_capable,
+                    );
+                }
+            },
+        ) else {
+            return;
+        };
+        if activated_reclaim {
+            self.host_backend.finish_reclaim_activation();
+            self.wayland_state.sync_dmabuf_protocol_formats(
+                self.host_backend.claimed_dmabuf_protocol_advertisement(),
+            );
+        }
+        if let Some(response) = self.pending_rotation_response.take() {
+            let _ = response.send(Ok(()));
+        }
+        if let Some((sequence, mutation)) = self.pending_geometry_mutation.take() {
+            eprintln!(
+                "{{\"ok\":true,\"mutation\":\"{mutation}\",\"sequence\":{sequence},\"rootGeometryGeneration\":{}}}",
+                prepared.committed.snapshot.generation
+            );
+        }
+    }
+
+    fn discard_staged_root_geometry(&mut self, error: crate::root_geometry::RootGeometryError) {
+        self.root_geometry_flip_boundary.discard();
+        if let Some(prepared) = self.wayland_state.staged_root_geometry.take() {
+            self.host_backend
+                .discard_stage(prepared.committed.snapshot.generation);
+        }
+        self.wayland_state
+            .sync_output_rotation_reconfigure_if_needed();
+        if let Some(response) = self.pending_rotation_response.take() {
+            let _ = response.send(Err(error));
+        }
+        if self
+            .pending_geometry_mutation
+            .is_some_and(|(_, mutation)| mutation == "mode")
+        {
+            self.pending_reclaim_publication = None;
+            self.host_backend.discard_unactivated_reclaim();
+        }
+        if let Some((sequence, mutation)) = self.pending_geometry_mutation.take() {
+            eprintln!(
+                "{{\"ok\":false,\"error\":\"{}\",\"mutation\":\"{mutation}\",\"sequence\":{sequence}}}",
+                error.code()
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HostPresentFailureClass {
     Reclaimable,
+    Transaction,
     Fatal,
 }
 
@@ -1001,8 +1552,19 @@ impl HostPresentFailure {
         }
     }
 
+    fn transaction(error: RuntimeError) -> Self {
+        Self {
+            class: HostPresentFailureClass::Transaction,
+            error,
+        }
+    }
+
     fn is_reclaimable(&self) -> bool {
         matches!(self.class, HostPresentFailureClass::Reclaimable)
+    }
+
+    fn is_transaction(&self) -> bool {
+        matches!(self.class, HostPresentFailureClass::Transaction)
     }
 
     fn error_ref(&self) -> &RuntimeError {
@@ -1024,18 +1586,18 @@ fn process_claimed_drm_event_source(
     data: &mut HostRuntimeLoopData,
 ) -> Result<(), HostPresentFailure> {
     let completed = data.host_backend.process_claimed_presentation_events()?;
-    if completed > 0 {
+    if !completed.is_empty() {
+        data.complete_root_geometry_presentations(&completed);
         data.wayland_state.prune_dead_surfaces();
         data.wayland_state.send_frame_callbacks();
         let _ = data.display_handle.flush_clients();
         let mut state = lock_state(&data.shared_state);
-        for _ in 0..completed {
+        for _ in &completed {
             state.mark_runtime_redraw();
         }
         state.poll_processes();
         drop(state);
-        data.host_backend
-            .queue_claimed_presentation_tick(&mut data.wayland_state)?;
+        data.queue_pinned_presentation_tick()?;
     }
     Ok(())
 }
@@ -1094,20 +1656,25 @@ fn reclaim_host_output_in_process(
     drm_events_source_token: &Rc<RefCell<Option<RegistrationToken>>>,
     reclaim_required_ownership: Option<StartupPresentOwnership>,
 ) -> Result<(), RuntimeError> {
-    let claimed_output = match data
-        .host_backend
-        .claim_output_ownership(reclaim_required_ownership)
-    {
+    let root_geometry_queue = &mut data.root_geometry_queue;
+    let mut observe_mode_before_activation = |width: u16, height: u16| {
+        root_geometry_queue.push(RuntimeGeometryMutation::Mode {
+            width: width as i32,
+            height: height as i32,
+        });
+        Ok(())
+    };
+    let claimed_output = match data.host_backend.claim_output_ownership(
+        reclaim_required_ownership,
+        Some(&mut observe_mode_before_activation),
+        true,
+    ) {
         Ok(claimed_output) => claimed_output,
         Err(err) => {
             sync_runtime_host_selection_status(&data.shared_state, &data.host_backend);
             return Err(err);
         }
     };
-    sync_runtime_host_selection_status(&data.shared_state, &data.host_backend);
-    sync_runtime_host_present_capabilities(&data.shared_state, &data.host_backend);
-    data.wayland_state
-        .sync_dmabuf_protocol_formats(data.host_backend.claimed_dmabuf_protocol_advertisement());
     if let Some(old_token) = drm_events_source_token.borrow_mut().take() {
         loop_handle.remove(old_token);
     }
@@ -1126,24 +1693,22 @@ fn reclaim_host_output_in_process(
         Rc::clone(drm_events_source_token),
     )?;
     let (mode_w, mode_h) = claimed_output.mode.size();
-    data.wayland_state
-        .reconfigure_roles(mode_w as i32, mode_h as i32);
-    data.wayland_state.sync_runtime_status_with_roles();
-    let (active_connector_name, active_connector_id) = data.host_backend.active_connector_status();
+    let active_connector_name = Some(claimed_output.identity.connector_name.clone());
+    let active_connector_id = Some(claimed_output.identity.connector_id);
     let (last_selection_attempt, last_selection_result) = data.host_backend.selection_logs();
     let rotation = { lock_state(&data.shared_state).output_rotation() };
-    let (ownership, atomic_enabled, overlay_capable) =
-        runtime_host_present_capabilities_for_status(&data.host_backend, rotation);
-    let mut state = lock_state(&data.shared_state);
-    state.set_runtime_host_backend_snapshot(
-        Some(data.host_backend.seat_name.clone()),
-        data.host_backend.detected_count(),
-        data.host_backend.opened_count(),
-        data.host_backend.primary_opened_path(),
-    );
-    state.mark_runtime_host_output_reclaimed(
-        mode_w as i32,
-        mode_h as i32,
+    let (mut ownership, atomic_enabled, overlay_capable) = data
+        .host_backend
+        .present_capabilities_for(&claimed_output)
+        .unwrap_or((RuntimeHostPresentOwnership::None, false, false));
+    if matches!(ownership, RuntimeHostPresentOwnership::DirectGbm)
+        && !direct_present_supported_for_rotation(rotation)
+    {
+        ownership = RuntimeHostPresentOwnership::Dumb;
+    }
+    data.pending_reclaim_publication = Some(PendingReclaimPublication {
+        mode_width: mode_w as i32,
+        mode_height: mode_h as i32,
         active_connector_name,
         active_connector_id,
         last_selection_attempt,
@@ -1151,7 +1716,7 @@ fn reclaim_host_output_in_process(
         ownership,
         atomic_enabled,
         overlay_capable,
-    );
+    });
     Ok(())
 }
 
@@ -1184,7 +1749,7 @@ fn bind_claimed_drm_event_source(
                             "host backend lost present/event stream after commit/present error: {}; scheduling in-process reclaim",
                             failure.error_ref()
                         );
-                        data.host_backend.claimed_output = None;
+                        data.host_backend.mark_claim_lost();
                         sync_runtime_host_present_capabilities(&data.shared_state, &data.host_backend);
                         data.wayland_state.sync_dmabuf_protocol_formats(None);
                         *token_state_for_cb.borrow_mut() = None;
@@ -1208,7 +1773,7 @@ fn bind_claimed_drm_event_source(
 }
 
 struct HostBackendState {
-    session: LibSeatSession,
+    session: Option<LibSeatSession>,
     seat_name: String,
     preferred_primary_path: Option<PathBuf>,
     forced_drm_path: Option<PathBuf>,
@@ -1217,11 +1782,14 @@ struct HostBackendState {
     detected_devices: HashMap<u64, PathBuf>,
     opened_devices: HashMap<u64, OpenedHostDevice>,
     claimed_output: Option<ClaimedHostOutput>,
+    retired_claim: Option<RetiredHostClaim>,
+    prepared_reclaim_output: Option<ClaimedHostOutput>,
     last_good_output_identity: Option<OutputIdentity>,
     device_selection_state: RuntimeHostSelectionState,
     output_selection_state: RuntimeHostSelectionState,
     last_selection_attempt: Option<String>,
     last_selection_result: Option<String>,
+    next_presentation_token: u64,
 }
 
 struct OpenedHostDevice {
@@ -1229,6 +1797,12 @@ struct OpenedHostDevice {
     node: DrmNode,
     fd: OwnedFd,
     claimed_pipeline: Option<ClaimedPresentationPipeline>,
+    prepared_pipeline: Option<ClaimedPresentationPipeline>,
+}
+
+struct RetiredHostClaim {
+    output: ClaimedHostOutput,
+    pipeline: ClaimedPresentationPipeline,
 }
 
 struct ClaimedOutputBuffer {
@@ -1242,10 +1816,15 @@ struct ClaimedPresentationPipeline {
     dumb_front_buffer: usize,
     dumb_back_buffer: usize,
     atomic_commit_state: Option<AtomicCommitState>,
+    pending_atomic_modeset: bool,
     flip_pending: bool,
     pending_flip_source: Option<QueuedFlipSource>,
+    pending_presentation_token: Option<PresentationToken>,
     gles_renderer: Option<HostGlesRendererState>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PresentationToken(u64);
 
 struct HostGlesRendererState {
     render_node: DrmNode,
@@ -1524,6 +2103,40 @@ impl drm_api::Device for HostKmsCard<'_> {}
 impl DrmControlDevice for HostKmsCard<'_> {}
 
 impl HostBackendState {
+    #[cfg(test)]
+    fn for_root_geometry_test(screen_capture: ScreenCaptureStore) -> Self {
+        Self {
+            session: None,
+            seat_name: "test-seat".to_string(),
+            preferred_primary_path: None,
+            forced_drm_path: None,
+            forced_output_name: None,
+            screen_capture,
+            detected_devices: HashMap::new(),
+            opened_devices: HashMap::new(),
+            claimed_output: None,
+            retired_claim: None,
+            prepared_reclaim_output: None,
+            last_good_output_identity: None,
+            device_selection_state: RuntimeHostSelectionState::Automatic,
+            output_selection_state: RuntimeHostSelectionState::Automatic,
+            last_selection_attempt: None,
+            last_selection_result: None,
+            next_presentation_token: 0,
+        }
+    }
+
+    fn mark_claim_lost(&mut self) {
+        let Some(output) = self.claimed_output.take() else {
+            return;
+        };
+        let pipeline = self
+            .opened_devices
+            .get_mut(&output.device_id)
+            .and_then(|opened| opened.claimed_pipeline.take());
+        self.retired_claim = pipeline.map(|pipeline| RetiredHostClaim { output, pipeline });
+    }
+
     fn new(
         session: LibSeatSession,
         seat_name: String,
@@ -1543,7 +2156,7 @@ impl HostBackendState {
             RuntimeHostSelectionState::Automatic
         };
         Self {
-            session,
+            session: Some(session),
             seat_name,
             preferred_primary_path,
             forced_drm_path,
@@ -1552,11 +2165,14 @@ impl HostBackendState {
             detected_devices: HashMap::new(),
             opened_devices: HashMap::new(),
             claimed_output: None,
+            retired_claim: None,
+            prepared_reclaim_output: None,
             last_good_output_identity: None,
             device_selection_state,
             output_selection_state,
             last_selection_attempt: None,
             last_selection_result: None,
+            next_presentation_token: 0,
         }
     }
 
@@ -1624,6 +2240,8 @@ impl HostBackendState {
         })?;
         let fd = self
             .session
+            .as_mut()
+            .expect("production host backend must own a libseat session")
             .open(path, OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY)
             .map_err(|err| RuntimeError::HostDeviceOpen {
                 path: path.display().to_string(),
@@ -1636,6 +2254,7 @@ impl HostBackendState {
                 node,
                 fd,
                 claimed_pipeline: None,
+                prepared_pipeline: None,
             },
         );
         Ok(())
@@ -1644,6 +2263,8 @@ impl HostBackendState {
     fn claim_output_ownership(
         &mut self,
         required_startup_ownership: Option<StartupPresentOwnership>,
+        mut before_activation: Option<&mut dyn FnMut(u16, u16) -> Result<(), RuntimeError>>,
+        defer_activation: bool,
     ) -> Result<ClaimedHostOutput, RuntimeError> {
         let recovering = self.last_good_output_identity.is_some();
         let forced_drm_path = self.forced_drm_path.clone();
@@ -1687,7 +2308,7 @@ impl HostBackendState {
             {
                 continue;
             }
-            match build_output_claim_plans(opened) {
+            match build_output_claim_plans(opened, forced_output_name.as_deref()) {
                 Ok(plans) => {
                     for plan in plans {
                         candidates.push(OutputClaimCandidate {
@@ -1778,9 +2399,33 @@ impl HostBackendState {
         let Some(opened) = self.opened_devices.get_mut(&chosen.device_id) else {
             return Err(RuntimeError::HostNoConnectedOutputRoute);
         };
+        if !defer_activation && let Some(before_activation) = before_activation.as_mut() {
+            let (width, height) = chosen.plan.mode.size();
+            before_activation(width, height)?;
+        }
         let previous_identity = self.last_good_output_identity.clone();
-        match claim_output_on_device(opened, chosen.plan.clone(), required_startup_ownership) {
+        match claim_output_on_device(
+            opened,
+            chosen.plan.clone(),
+            required_startup_ownership,
+            defer_activation,
+        ) {
             Ok(claimed) => {
+                if defer_activation && let Err(err) = drain_prior_pipeline_before_reclaim(opened) {
+                    if let Some(pipeline) = opened.prepared_pipeline.take() {
+                        destroy_claimed_pipeline_resources(&opened.fd, pipeline);
+                    }
+                    return Err(err);
+                }
+                if defer_activation && let Some(before_activation) = before_activation.as_mut() {
+                    let (width, height) = claimed.mode.size();
+                    if let Err(err) = before_activation(width, height) {
+                        if let Some(pipeline) = opened.prepared_pipeline.take() {
+                            destroy_claimed_pipeline_resources(&opened.fd, pipeline);
+                        }
+                        return Err(err);
+                    }
+                }
                 let claimed_output = ClaimedHostOutput {
                     device_id: chosen.device_id,
                     mode: claimed.mode,
@@ -1795,7 +2440,11 @@ impl HostBackendState {
                     forced_drm_path.as_deref(),
                     forced_output_name.as_deref(),
                 ));
-                self.claimed_output = Some(claimed_output.clone());
+                if defer_activation {
+                    self.prepared_reclaim_output = Some(claimed_output.clone());
+                } else {
+                    self.claimed_output = Some(claimed_output.clone());
+                }
                 Ok(claimed_output)
             }
             Err(err) => {
@@ -1814,9 +2463,97 @@ impl HostBackendState {
     }
 
     fn claimed_device_event_fd(&self) -> Option<OwnedFd> {
-        let claimed = self.claimed_output.as_ref()?;
+        let claimed = self
+            .claimed_output
+            .as_ref()
+            .or(self.prepared_reclaim_output.as_ref())?;
         let opened = self.opened_devices.get(&claimed.device_id)?;
         dup(opened.fd.as_fd()).ok()
+    }
+
+    fn arm_prepared_reclaim_for_presentation(&mut self) -> Result<(), RuntimeError> {
+        let prepared =
+            self.prepared_reclaim_output
+                .take()
+                .ok_or_else(|| RuntimeError::HostOutputClaim {
+                    path: self
+                        .primary_opened_path()
+                        .unwrap_or_else(|| "<selected-root4-device>".to_string()),
+                    error: "mode mutation reached the FIFO head without a prepared reclaim"
+                        .to_string(),
+                })?;
+        let opened = self
+            .opened_devices
+            .get_mut(&prepared.device_id)
+            .ok_or_else(|| RuntimeError::HostOutputClaim {
+                path: prepared.identity.device_path.display().to_string(),
+                error: "prepared reclaim device disappeared before FIFO activation".to_string(),
+            })?;
+        let pipeline =
+            opened
+                .prepared_pipeline
+                .take()
+                .ok_or_else(|| RuntimeError::HostOutputClaim {
+                    path: opened.path.display().to_string(),
+                    error: "prepared reclaim pipeline disappeared before FIFO activation"
+                        .to_string(),
+                })?;
+        opened.claimed_pipeline = Some(pipeline);
+        self.claimed_output = Some(prepared);
+        Ok(())
+    }
+
+    fn discard_unactivated_reclaim(&mut self) {
+        if let Some(prepared) = self.prepared_reclaim_output.take() {
+            if let Some(opened) = self.opened_devices.get_mut(&prepared.device_id) {
+                if let Some(pipeline) = opened.prepared_pipeline.take() {
+                    destroy_claimed_pipeline_resources(&opened.fd, pipeline);
+                }
+            }
+            return;
+        }
+        let Some(failed) = self.claimed_output.take() else {
+            return;
+        };
+        let Some(opened) = self.opened_devices.get_mut(&failed.device_id) else {
+            if let Some(retired) = self.retired_claim.take() {
+                if let Some(retired_opened) = self.opened_devices.get_mut(&retired.output.device_id)
+                {
+                    retired_opened.claimed_pipeline = Some(retired.pipeline);
+                }
+                self.claimed_output = Some(retired.output);
+            }
+            return;
+        };
+        let can_restore = opened
+            .claimed_pipeline
+            .as_ref()
+            .is_some_and(|pipeline| pipeline.pending_atomic_modeset);
+        if can_restore {
+            let failed_pipeline = opened.claimed_pipeline.take();
+            if let Some(failed_pipeline) = failed_pipeline {
+                destroy_claimed_pipeline_resources(&opened.fd, failed_pipeline);
+            }
+            if let Some(retired) = self.retired_claim.take() {
+                if let Some(retired_opened) = self.opened_devices.get_mut(&retired.output.device_id)
+                {
+                    retired_opened.claimed_pipeline = Some(retired.pipeline);
+                }
+                self.claimed_output = Some(retired.output);
+            }
+        } else {
+            self.claimed_output = Some(failed);
+        }
+    }
+
+    fn finish_reclaim_activation(&mut self) {
+        let Some(retired) = self.retired_claim.take() else {
+            return;
+        };
+        let Some(opened) = self.opened_devices.get_mut(&retired.output.device_id) else {
+            return;
+        };
+        destroy_claimed_pipeline_resources(&opened.fd, retired.pipeline);
     }
 
     fn claimed_dmabuf_protocol_advertisement(&self) -> Option<(DrmNode, Vec<Format>)> {
@@ -1832,6 +2569,13 @@ impl HostBackendState {
 
     fn claimed_present_capabilities(&self) -> Option<(RuntimeHostPresentOwnership, bool, bool)> {
         let claimed = self.claimed_output.as_ref()?;
+        self.present_capabilities_for(claimed)
+    }
+
+    fn present_capabilities_for(
+        &self,
+        claimed: &ClaimedHostOutput,
+    ) -> Option<(RuntimeHostPresentOwnership, bool, bool)> {
         let opened = self.opened_devices.get(&claimed.device_id)?;
         let pipeline = opened.claimed_pipeline.as_ref()?;
         let ownership = match claimed.startup_present_ownership {
@@ -1856,22 +2600,37 @@ impl HostBackendState {
     fn queue_claimed_presentation_tick(
         &mut self,
         wayland_state: &mut RuntimeWaylandState,
-    ) -> Result<bool, HostPresentFailure> {
+    ) -> Result<Option<PresentationToken>, HostPresentFailure> {
         wayland_state.sync_output_rotation_reconfigure_if_needed();
         sync_runtime_host_present_capabilities(&wayland_state.shared_state, self);
         let Some(claimed) = self.claimed_output.as_ref().cloned() else {
-            return Ok(false);
+            if wayland_state.staged_root_geometry.is_some() {
+                return Err(HostPresentFailure::transaction(
+                    RuntimeError::HostOutputClaim {
+                        path: self
+                            .primary_opened_path()
+                            .unwrap_or_else(|| "<selected-root4-device>".to_string()),
+                        error:
+                            "root4 geometry head cannot present before the observed mode mutation"
+                                .to_string(),
+                    },
+                ));
+            }
+            return Ok(None);
         };
         let Some(opened) = self.opened_devices.get_mut(&claimed.device_id) else {
-            return Ok(false);
+            return Ok(None);
         };
         let Some(pipeline) = opened.claimed_pipeline.as_mut() else {
-            return Ok(false);
+            return Ok(None);
         };
         if pipeline.flip_pending {
-            return Ok(false);
+            return Ok(None);
         }
-        let rotation = { lock_state(&wayland_state.shared_state).output_rotation() };
+        let rotation = wayland_state
+            .root_geometry_snapshot()
+            .map(|snapshot| snapshot.rotation)
+            .unwrap_or_else(|| lock_state(&wayland_state.shared_state).output_rotation());
         let direct_present_supported = direct_present_supported_for_rotation(rotation);
         let requires_direct_present = matches!(
             claimed.startup_present_ownership,
@@ -1896,7 +2655,10 @@ impl HostBackendState {
         let force_readback_present =
             std::env::var_os("SURF_ACE_HOST_RUNTIME_FORCE_READBACK").is_some();
         let overlay_plane_rotation_supported = matches!(
-            lock_state(&wayland_state.shared_state).output_rotation(),
+            wayland_state
+                .root_geometry_snapshot()
+                .map(|snapshot| snapshot.rotation)
+                .unwrap_or_else(|| lock_state(&wayland_state.shared_state).output_rotation()),
             OutputRotation::Deg0
         );
         let overlay_plane_alpha_format_supported = pipeline
@@ -1911,6 +2673,7 @@ impl HostBackendState {
             .map(|atomic| atomic.overlay_alpha_blending_supported)
             .unwrap_or(false);
         let prefer_overlay_plane_split = overlay_plane_rotation_supported
+            && wayland_state.root_display_scale() == 1.0
             && overlay_plane_alpha_format_supported
             && overlay_plane_alpha_blending_supported;
         if !force_readback_present && direct_present_supported {
@@ -2029,9 +2792,27 @@ impl HostBackendState {
                 }
             }
             if disable_gles_renderer {
+                if wayland_state.has_dmabuf_surface_material() {
+                    return Err(HostPresentFailure::transaction(
+                        RuntimeError::HostOutputClaim {
+                            path: opened.path.display().to_string(),
+                            error: "dmabuf scene cannot enter the wl_shm software fallback"
+                                .to_string(),
+                        },
+                    ));
+                }
                 pipeline.gles_renderer = None;
             }
             if !rendered_with_gles_readback {
+                if wayland_state.has_dmabuf_surface_material() {
+                    return Err(HostPresentFailure::transaction(
+                        RuntimeError::HostOutputClaim {
+                            path: opened.path.display().to_string(),
+                            error: "dmabuf scene cannot enter the wl_shm software fallback"
+                                .to_string(),
+                        },
+                    ));
+                }
                 let _ = wayland_state.compose_host_scene(
                     &mut mapping,
                     stride,
@@ -2041,16 +2822,33 @@ impl HostBackendState {
             }
             let quarter_turn_gles_capture_already_recorded =
                 rendered_with_gles_readback && OutputRotationModel::new(rotation).swaps_axes();
-            if !quarter_turn_gles_capture_already_recorded {
-                self.screen_capture.update_from_scanout_xrgb8888(
+            if !quarter_turn_gles_capture_already_recorded
+                && let Some(snapshot) = wayland_state.root_capture_snapshot()
+            {
+                self.screen_capture.update_root4_scanout_xrgb8888(
                     &mapping[..],
                     stride,
                     mode_w.max(1) as usize,
                     mode_h.max(1) as usize,
                     false,
-                    rotation,
+                    snapshot,
+                    &wayland_state.root_pane_capture_geometries(),
                 );
             }
+        }
+
+        if let Some(staged) = wayland_state.staged_root_geometry.as_ref()
+            && !self
+                .screen_capture
+                .root4_stage_has_frame(staged.committed.snapshot.generation)
+        {
+            return Err(HostPresentFailure::transaction(
+                RuntimeError::HostOutputClaim {
+                    path: opened.path.display().to_string(),
+                    error: "root4 capture consumer did not stage the presentation frame"
+                        .to_string(),
+                },
+            ));
         }
 
         let queued_framebuffer =
@@ -2086,16 +2884,29 @@ impl HostBackendState {
             None
         };
         if let Some(atomic) = pipeline.atomic_commit_state.as_ref() {
-            if let Err(err) = queue_atomic_frame_commit(
-                &card,
-                &opened.path,
-                atomic,
-                Some(queued_framebuffer),
-                overlay_framebuffer,
-                wayland_state,
-            ) {
+            let commit = if pipeline.pending_atomic_modeset {
+                queue_atomic_modeset_frame_commit(
+                    &card,
+                    &opened.path,
+                    atomic,
+                    queued_framebuffer,
+                    overlay_framebuffer,
+                    wayland_state,
+                )
+            } else {
+                queue_atomic_frame_commit(
+                    &card,
+                    &opened.path,
+                    atomic,
+                    Some(queued_framebuffer),
+                    overlay_framebuffer,
+                    wayland_state,
+                )
+            };
+            if let Err(err) = commit {
                 return Err(HostPresentFailure::reclaimable(err));
             }
+            pipeline.pending_atomic_modeset = false;
         } else {
             if let Err(err) = card.page_flip(
                 pipeline.crtc,
@@ -2124,20 +2935,25 @@ impl HostBackendState {
                 queued_overlay_dmabuf_format,
             );
         }
+        self.next_presentation_token = self.next_presentation_token.saturating_add(1);
+        let token = PresentationToken(self.next_presentation_token);
         pipeline.flip_pending = true;
         pipeline.pending_flip_source = Some(queued_source);
-        Ok(true)
+        pipeline.pending_presentation_token = Some(token);
+        Ok(Some(token))
     }
 
-    fn process_claimed_presentation_events(&mut self) -> Result<u64, HostPresentFailure> {
+    fn process_claimed_presentation_events(
+        &mut self,
+    ) -> Result<Vec<PresentationToken>, HostPresentFailure> {
         let Some(claimed) = self.claimed_output.as_ref().cloned() else {
-            return Ok(0);
+            return Ok(Vec::new());
         };
         let Some(opened) = self.opened_devices.get_mut(&claimed.device_id) else {
-            return Ok(0);
+            return Ok(Vec::new());
         };
         let Some(pipeline) = opened.claimed_pipeline.as_mut() else {
-            return Ok(0);
+            return Ok(Vec::new());
         };
 
         let card = HostKmsCard::new(&opened.fd);
@@ -2148,33 +2964,13 @@ impl HostBackendState {
             })
         })?;
 
-        let mut completed = 0u64;
+        let mut completed = Vec::new();
         for event in events {
             if let drm_api::control::Event::PageFlip(flip) = event {
                 if flip.crtc == pipeline.crtc && pipeline.flip_pending {
-                    match pipeline.pending_flip_source {
-                        Some(QueuedFlipSource::Dumb) => {
-                            std::mem::swap(
-                                &mut pipeline.dumb_front_buffer,
-                                &mut pipeline.dumb_back_buffer,
-                            );
-                        }
-                        Some(QueuedFlipSource::DirectGbm) => {
-                            if let Some(gles_renderer) = pipeline.gles_renderer.as_mut() {
-                                if let Some(direct_scanout) = gles_renderer.direct_scanout.as_mut()
-                                {
-                                    std::mem::swap(
-                                        &mut direct_scanout.front_buffer,
-                                        &mut direct_scanout.back_buffer,
-                                    );
-                                }
-                            }
-                        }
-                        None => {}
+                    if let Some(token) = complete_pipeline_flip(pipeline) {
+                        completed.push(token);
                     }
-                    pipeline.flip_pending = false;
-                    pipeline.pending_flip_source = None;
-                    completed = completed.saturating_add(1);
                 }
             }
         }
@@ -2191,24 +2987,43 @@ impl HostBackendState {
         {
             self.claimed_output = None;
         }
+        if self
+            .prepared_reclaim_output
+            .as_ref()
+            .is_some_and(|prepared| prepared.device_id == device_id)
+        {
+            self.prepared_reclaim_output = None;
+        }
+        let retired_pipeline = if self
+            .retired_claim
+            .as_ref()
+            .is_some_and(|retired| retired.output.device_id == device_id)
+        {
+            self.retired_claim.take().map(|retired| retired.pipeline)
+        } else {
+            None
+        };
         let Some(opened) = self.opened_devices.remove(&device_id) else {
             return Ok(());
         };
-        if let Some(pipeline) = opened.claimed_pipeline {
-            let card = HostKmsCard::new(&opened.fd);
-            if let Some(dumb_buffers) = pipeline.dumb_buffers {
-                for buffer in dumb_buffers {
-                    let _ = card.destroy_framebuffer(buffer.fb);
-                    let _ = card.destroy_dumb_buffer(buffer.dumb);
-                }
-            }
+        for pipeline in [
+            opened.claimed_pipeline,
+            opened.prepared_pipeline,
+            retired_pipeline,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            destroy_claimed_pipeline_resources(&opened.fd, pipeline);
         }
-        self.session
-            .close(opened.fd)
-            .map_err(|err| RuntimeError::HostDeviceClose {
-                path: opened.path.display().to_string(),
-                error: err.to_string(),
-            })?;
+        if let Some(session) = self.session.as_mut() {
+            session
+                .close(opened.fd)
+                .map_err(|err| RuntimeError::HostDeviceClose {
+                    path: opened.path.display().to_string(),
+                    error: err.to_string(),
+                })?;
+        }
         Ok(())
     }
 
@@ -2216,6 +3031,69 @@ impl HostBackendState {
         self.detected_devices.remove(&device_id);
         self.close_device(device_id)
     }
+}
+
+fn destroy_claimed_pipeline_resources(fd: &OwnedFd, pipeline: ClaimedPresentationPipeline) {
+    let card = HostKmsCard::new(fd);
+    if let Some(dumb_buffers) = pipeline.dumb_buffers {
+        for buffer in dumb_buffers {
+            let _ = card.destroy_framebuffer(buffer.fb);
+            let _ = card.destroy_dumb_buffer(buffer.dumb);
+        }
+    }
+}
+
+fn complete_pipeline_flip(pipeline: &mut ClaimedPresentationPipeline) -> Option<PresentationToken> {
+    match pipeline.pending_flip_source {
+        Some(QueuedFlipSource::Dumb) => {
+            std::mem::swap(
+                &mut pipeline.dumb_front_buffer,
+                &mut pipeline.dumb_back_buffer,
+            );
+        }
+        Some(QueuedFlipSource::DirectGbm) => {
+            if let Some(gles_renderer) = pipeline.gles_renderer.as_mut()
+                && let Some(direct_scanout) = gles_renderer.direct_scanout.as_mut()
+            {
+                std::mem::swap(
+                    &mut direct_scanout.front_buffer,
+                    &mut direct_scanout.back_buffer,
+                );
+            }
+        }
+        None => {}
+    }
+    pipeline.flip_pending = false;
+    pipeline.pending_flip_source = None;
+    pipeline.pending_presentation_token.take()
+}
+
+fn drain_prior_pipeline_before_reclaim(opened: &mut OpenedHostDevice) -> Result<(), RuntimeError> {
+    let Some(pipeline) = opened.claimed_pipeline.as_mut() else {
+        return Ok(());
+    };
+    if !pipeline.flip_pending {
+        return Ok(());
+    }
+    let card = HostKmsCard::new(&opened.fd);
+    let events = card
+        .receive_events()
+        .map_err(|err| RuntimeError::HostOutputClaim {
+            path: opened.path.display().to_string(),
+            error: format!("failed to drain prior presentation before reclaim: {err}"),
+        })?;
+    if events.into_iter().any(|event| {
+        matches!(event, drm_api::control::Event::PageFlip(flip) if flip.crtc == pipeline.crtc)
+    }) {
+        complete_pipeline_flip(pipeline);
+    }
+    if pipeline.flip_pending {
+        return Err(RuntimeError::HostOutputClaim {
+            path: opened.path.display().to_string(),
+            error: "prior presentation is still pending before reclaim activation".to_string(),
+        });
+    }
+    Ok(())
 }
 
 impl Drop for HostBackendState {
@@ -2243,6 +3121,7 @@ fn connector_name(connector_info: &drm_api::control::connector::Info) -> String 
 
 fn build_output_claim_plans(
     opened: &OpenedHostDevice,
+    selected_output_name: Option<&str>,
 ) -> Result<Vec<OutputClaimPlan>, RuntimeError> {
     let card = HostKmsCard::new(&opened.fd);
     let _ = card.set_client_capability(ClientCapability::UniversalPlanes, true);
@@ -2264,6 +3143,9 @@ fn build_output_claim_plans(
                 error: err.to_string(),
             }
         })?;
+        if selected_output_name.is_some_and(|selected| connector_name(&info) != selected) {
+            continue;
+        }
         if info.state() == drm_connector::State::Connected && !info.modes().is_empty() {
             connector_infos.push(info);
         }
@@ -3038,7 +3920,10 @@ fn overlay_plane_layout_for_frame(
     overlay_framebuffer: Option<drm_framebuffer::Handle>,
 ) -> Option<AtomicPlaneLayout> {
     let overlay_plane_rotation_supported = matches!(
-        lock_state(&wayland_state.shared_state).output_rotation(),
+        wayland_state
+            .root_geometry_snapshot()
+            .map(|snapshot| snapshot.rotation)
+            .unwrap_or_else(|| lock_state(&wayland_state.shared_state).output_rotation()),
         OutputRotation::Deg0
     );
     if overlay_plane_rotation_supported
@@ -3086,10 +3971,65 @@ fn queue_atomic_frame_commit(
     })
 }
 
+fn queue_atomic_modeset_frame_commit(
+    card: &HostKmsCard<'_>,
+    device_path: &Path,
+    atomic: &AtomicCommitState,
+    framebuffer: drm_framebuffer::Handle,
+    overlay_framebuffer: Option<drm_framebuffer::Handle>,
+    wayland_state: &RuntimeWaylandState,
+) -> Result<(), RuntimeError> {
+    let mode_blob =
+        card.create_property_blob(&atomic.mode)
+            .map_err(|err| RuntimeError::HostOutputClaim {
+                path: device_path.display().to_string(),
+                error: format!("failed to create atomic mode blob: {err}"),
+            })?;
+    let mode_blob_id = mode_blob
+        .as_blob()
+        .ok_or_else(|| RuntimeError::HostOutputClaim {
+            path: device_path.display().to_string(),
+            error: "invalid mode blob value while creating atomic request".to_string(),
+        })?;
+    let mut request = AtomicModeReq::new();
+    request.add_property(
+        atomic.connector,
+        atomic.connector_crtc_id,
+        drm_property::Value::CRTC(Some(atomic.crtc)),
+    );
+    request.add_property(
+        atomic.crtc,
+        atomic.crtc_active,
+        drm_property::Value::Boolean(true),
+    );
+    request.add_property(atomic.crtc, atomic.crtc_mode_id, mode_blob);
+    let fullscreen_layout = AtomicPlaneLayout::fullscreen(atomic.mode_size);
+    let overlay_layout = overlay_plane_layout_for_frame(wayland_state, overlay_framebuffer);
+    for plane in &atomic.plane_states {
+        let (fb, layout) = match plane.role {
+            AtomicPlaneRole::Primary => (Some(framebuffer), Some(&fullscreen_layout)),
+            AtomicPlaneRole::Overlay => (overlay_framebuffer, overlay_layout.as_ref()),
+        };
+        populate_atomic_plane_properties(&mut request, atomic, fb, layout, plane);
+    }
+    let commit = card.atomic_commit(
+        AtomicCommitFlags::ALLOW_MODESET
+            | AtomicCommitFlags::PAGE_FLIP_EVENT
+            | AtomicCommitFlags::NONBLOCK,
+        request,
+    );
+    let _ = card.destroy_property_blob(mode_blob_id);
+    commit.map_err(|err| RuntimeError::HostOutputClaim {
+        path: device_path.display().to_string(),
+        error: format!("failed to queue atomic modeset frame commit: {err}"),
+    })
+}
+
 fn claim_output_on_device(
     opened: &mut OpenedHostDevice,
     plan: OutputClaimPlan,
     required_startup_ownership: Option<StartupPresentOwnership>,
+    defer_activation: bool,
 ) -> Result<ClaimedOutput, RuntimeError> {
     let card = HostKmsCard::new(&opened.fd);
     let mut dumb_buffers: Option<[ClaimedOutputBuffer; 2]> = None;
@@ -3128,7 +4068,10 @@ fn claim_output_on_device(
             if !force_readback_present {
                 match prime_direct_startup_frame(&mut renderer, &opened.path, plan.mode.size()) {
                     Ok(Some(framebuffer)) => {
-                        if let Some(atomic) = atomic_candidate.as_ref() {
+                        if defer_activation && atomic_candidate.is_some() {
+                            used_direct_startup = true;
+                            atomic_commit_state = atomic_candidate.take();
+                        } else if let Some(atomic) = atomic_candidate.as_ref() {
                             match claim_output_with_atomic_modeset(
                                 &card,
                                 &opened.path,
@@ -3147,7 +4090,7 @@ fn claim_output_on_device(
                                 }
                             }
                         }
-                        if !used_direct_startup {
+                        if !used_direct_startup && !defer_activation {
                             if let Err(err) = card.set_crtc(
                                 plan.crtc,
                                 Some(framebuffer),
@@ -3209,7 +4152,9 @@ fn claim_output_on_device(
             [0x38, 0x18, 0x18, 0x00],
         )?;
         let mut claimed_with_atomic = false;
-        if let Some(atomic) = atomic_candidate.as_ref() {
+        if defer_activation {
+            atomic_commit_state = atomic_candidate.take();
+        } else if let Some(atomic) = atomic_candidate.as_ref() {
             match claim_output_with_atomic_modeset(&card, &opened.path, &atomic, first.fb) {
                 Ok(()) => {
                     claimed_with_atomic = true;
@@ -3223,7 +4168,17 @@ fn claim_output_on_device(
                 }
             }
         }
-        if !claimed_with_atomic {
+        if defer_activation && atomic_commit_state.is_none() {
+            let _ = card.destroy_framebuffer(first.fb);
+            let _ = card.destroy_dumb_buffer(first.dumb);
+            let _ = card.destroy_framebuffer(second.fb);
+            let _ = card.destroy_dumb_buffer(second.dumb);
+            return Err(RuntimeError::HostOutputClaim {
+                path: opened.path.display().to_string(),
+                error: "root4 reclaim requires an evented atomic modeset; legacy set_crtc cannot satisfy the geometry transaction".to_string(),
+            });
+        }
+        if !claimed_with_atomic && !defer_activation {
             if let Err(err) = card.set_crtc(
                 plan.crtc,
                 Some(first.fb),
@@ -3249,16 +4204,23 @@ fn claim_output_on_device(
     }
 
     // Keep direct scanout as primary when available, while retaining lazy dumb fallback buffers.
-    opened.claimed_pipeline = Some(ClaimedPresentationPipeline {
+    let pipeline = ClaimedPresentationPipeline {
         crtc: plan.crtc,
         dumb_buffers,
         dumb_front_buffer: 0,
         dumb_back_buffer: 1,
         atomic_commit_state,
+        pending_atomic_modeset: defer_activation,
         flip_pending: false,
         pending_flip_source: None,
+        pending_presentation_token: None,
         gles_renderer,
-    });
+    };
+    if defer_activation {
+        opened.prepared_pipeline = Some(pipeline);
+    } else {
+        opened.claimed_pipeline = Some(pipeline);
+    }
     Ok(ClaimedOutput {
         mode: plan.mode,
         startup_present_ownership: if used_direct_startup {
@@ -3672,7 +4634,7 @@ fn prime_direct_startup_frame(
 
 fn render_host_scene_with_gles_direct(
     gles_state: &mut HostGlesRendererState,
-    wayland_state: &RuntimeWaylandState,
+    wayland_state: &mut RuntimeWaylandState,
     device_path: &Path,
     output_w: i32,
     output_h: i32,
@@ -3723,10 +4685,23 @@ fn render_host_scene_with_gles_direct(
         )
     };
 
-    let rotation = { lock_state(&wayland_state.shared_state).output_rotation() };
+    let rotation = wayland_state
+        .root_geometry_snapshot()
+        .map(|snapshot| snapshot.rotation)
+        .unwrap_or_else(|| lock_state(&wayland_state.shared_state).output_rotation());
     let transform = transform_from_rotation(rotation);
-    let capture =
-        wayland_state.collect_render_elements(&mut gles_state.renderer, output_w, output_h);
+    let logical_size = wayland_state.runtime_output_size();
+    let capture = wayland_state.collect_render_elements(
+        &mut gles_state.renderer,
+        logical_size.w,
+        logical_size.h,
+    );
+    if let Some(failure) = capture.failure.as_ref() {
+        return Err(RuntimeError::HostOutputClaim {
+            path: device_path.display().to_string(),
+            error: failure.clone(),
+        });
+    }
     let overlay_framebuffer = if prefer_overlay_plane_split {
         render_overlay_plane_framebuffer(gles_state, wayland_state, device_path)?
     } else {
@@ -3742,6 +4717,7 @@ fn render_host_scene_with_gles_direct(
                 &mut gles_state.target_texture,
                 scene_render_size,
                 &primary_elements,
+                wayland_state.root_display_scale(),
                 "quarter-turn scene texture",
             )?;
         } else {
@@ -3751,6 +4727,7 @@ fn render_host_scene_with_gles_direct(
                 &mut gles_state.target_texture,
                 scene_render_size,
                 &capture.elements,
+                wayland_state.root_display_scale(),
                 "quarter-turn scene texture",
             )?;
         }
@@ -3768,6 +4745,7 @@ fn render_host_scene_with_gles_direct(
             &mut render_target,
             &gles_state.target_texture,
             Size::<i32, Physical>::from((scanout_size.w, scanout_size.h)),
+            wayland_state.root_display_scale(),
             rotation,
             wayland_state.cursor_render_location(),
             scene_render_size,
@@ -3790,6 +4768,7 @@ fn render_host_scene_with_gles_direct(
                 wayland_state.cursor_render_location(),
                 scene_render_size,
                 Size::<i32, Physical>::from((scanout_size.w, scanout_size.h)),
+                wayland_state.root_display_scale(),
                 rotation,
                 "direct scanout cursor",
             )?;
@@ -3801,6 +4780,8 @@ fn render_host_scene_with_gles_direct(
             scanout_size.w.max(1) as usize,
             scanout_size.h.max(1) as usize,
             rotation,
+            wayland_state.root_capture_snapshot(),
+            &wayland_state.root_pane_capture_geometries(),
         );
 
         return Ok(DirectRenderTargets {
@@ -3833,18 +4814,26 @@ fn render_host_scene_with_gles_direct(
         })?;
     if overlay_framebuffer.is_some() {
         let primary_elements = capture.primary_plane_elements();
-        draw_render_elements(&mut frame, 1.0, &primary_elements, &[damage]).map_err(|err| {
-            RuntimeError::HostOutputClaim {
-                path: device_path.display().to_string(),
-                error: format!("failed to draw scene elements into direct scanout buffer: {err}"),
-            }
+        draw_render_elements(
+            &mut frame,
+            wayland_state.root_display_scale(),
+            &primary_elements,
+            &[damage],
+        )
+        .map_err(|err| RuntimeError::HostOutputClaim {
+            path: device_path.display().to_string(),
+            error: format!("failed to draw scene elements into direct scanout buffer: {err}"),
         })?;
     } else {
-        draw_render_elements(&mut frame, 1.0, &capture.elements, &[damage]).map_err(|err| {
-            RuntimeError::HostOutputClaim {
-                path: device_path.display().to_string(),
-                error: format!("failed to draw scene elements into direct scanout buffer: {err}"),
-            }
+        draw_render_elements(
+            &mut frame,
+            wayland_state.root_display_scale(),
+            &capture.elements,
+            &[damage],
+        )
+        .map_err(|err| RuntimeError::HostOutputClaim {
+            path: device_path.display().to_string(),
+            error: format!("failed to draw scene elements into direct scanout buffer: {err}"),
         })?;
     }
     let _ = frame
@@ -3870,6 +4859,7 @@ fn render_host_scene_with_gles_direct(
         wayland_state.cursor_render_location(),
         render_size,
         render_size,
+        wayland_state.root_display_scale(),
         rotation,
         "direct scanout cursor",
     )?;
@@ -3880,6 +4870,8 @@ fn render_host_scene_with_gles_direct(
         scanout_size.w.max(1) as usize,
         scanout_size.h.max(1) as usize,
         rotation,
+        wayland_state.root_capture_snapshot(),
+        &wayland_state.root_pane_capture_geometries(),
     );
 
     Ok(DirectRenderTargets {
@@ -3941,11 +4933,15 @@ fn render_overlay_plane_framebuffer(
             path: device_path.display().to_string(),
             error: format!("failed to clear overlay render target: {err}"),
         })?;
-    draw_render_elements(&mut frame, 1.0, &overlay_elements, &[damage]).map_err(|err| {
-        RuntimeError::HostOutputClaim {
-            path: device_path.display().to_string(),
-            error: format!("failed to draw overlay elements: {err}"),
-        }
+    draw_render_elements(
+        &mut frame,
+        wayland_state.root_display_scale(),
+        &overlay_elements,
+        &[damage],
+    )
+    .map_err(|err| RuntimeError::HostOutputClaim {
+        path: device_path.display().to_string(),
+        error: format!("failed to draw overlay elements: {err}"),
     })?;
     let _ = frame
         .finish()
@@ -3958,7 +4954,7 @@ fn render_overlay_plane_framebuffer(
 
 fn render_host_scene_with_gles_readback(
     gles_state: &mut HostGlesRendererState,
-    wayland_state: &RuntimeWaylandState,
+    wayland_state: &mut RuntimeWaylandState,
     device_path: &Path,
     screen_capture: &ScreenCaptureStore,
     target: &mut [u8],
@@ -3967,9 +4963,22 @@ fn render_host_scene_with_gles_readback(
     output_h: i32,
 ) -> Result<(), RuntimeError> {
     let scanout_size = Size::<i32, BufferCoords>::from((output_w.max(1), output_h.max(1)));
-    let rotation = { lock_state(&wayland_state.shared_state).output_rotation() };
-    let capture =
-        wayland_state.collect_render_elements(&mut gles_state.renderer, output_w, output_h);
+    let rotation = wayland_state
+        .root_geometry_snapshot()
+        .map(|snapshot| snapshot.rotation)
+        .unwrap_or_else(|| lock_state(&wayland_state.shared_state).output_rotation());
+    let logical_size = wayland_state.runtime_output_size();
+    let capture = wayland_state.collect_render_elements(
+        &mut gles_state.renderer,
+        logical_size.w,
+        logical_size.h,
+    );
+    if let Some(failure) = capture.failure.as_ref() {
+        return Err(RuntimeError::HostOutputClaim {
+            path: device_path.display().to_string(),
+            error: failure.clone(),
+        });
+    }
     let render_size = render_output_size_before_transform(wayland_state);
 
     if matches!(rotation, OutputRotation::Deg90 | OutputRotation::Deg270) {
@@ -3994,6 +5003,7 @@ fn render_host_scene_with_gles_readback(
             &mut gles_state.target_texture,
             render_size,
             &capture.elements,
+            wayland_state.root_display_scale(),
             "quarter-turn scene texture",
         )?;
 
@@ -4010,6 +5020,7 @@ fn render_host_scene_with_gles_readback(
             &mut render_target,
             &gles_state.target_texture,
             Size::<i32, Physical>::from((scanout_size.w, scanout_size.h)),
+            wayland_state.root_display_scale(),
             rotation,
             wayland_state.cursor_render_location(),
             render_size,
@@ -4032,6 +5043,7 @@ fn render_host_scene_with_gles_readback(
                 wayland_state.cursor_render_location(),
                 render_size,
                 Size::<i32, Physical>::from((scanout_size.w, scanout_size.h)),
+                wayland_state.root_display_scale(),
                 rotation,
                 "readback scanout cursor",
             )?;
@@ -4050,14 +5062,17 @@ fn render_host_scene_with_gles_readback(
                 error: format!("failed to map quarter-turn scanout pixels: {err}"),
             }
         })?;
-        screen_capture.update_from_scanout_xrgb8888(
-            pixels,
-            scanout_size.w.max(1) as usize * 4,
-            scanout_size.w.max(1) as usize,
-            scanout_size.h.max(1) as usize,
-            screen_capture_src_flipped(mapping.flipped(), rotation),
-            rotation,
-        );
+        if let Some(snapshot) = wayland_state.root_capture_snapshot() {
+            screen_capture.update_root4_scanout_xrgb8888(
+                pixels,
+                scanout_size.w.max(1) as usize * 4,
+                scanout_size.w.max(1) as usize,
+                scanout_size.h.max(1) as usize,
+                screen_capture_src_flipped(mapping.flipped(), rotation),
+                snapshot,
+                &wayland_state.root_pane_capture_geometries(),
+            );
+        }
         copy_renderer_pixels_to_dumb(
             pixels,
             mapping.flipped(),
@@ -4099,11 +5114,15 @@ fn render_host_scene_with_gles_readback(
             path: device_path.display().to_string(),
             error: format!("failed to clear gles render target: {err}"),
         })?;
-    draw_render_elements(&mut frame, 1.0, &capture.elements, &[damage]).map_err(|err| {
-        RuntimeError::HostOutputClaim {
-            path: device_path.display().to_string(),
-            error: format!("failed to draw scene elements with gles: {err}"),
-        }
+    draw_render_elements(
+        &mut frame,
+        wayland_state.root_display_scale(),
+        &capture.elements,
+        &[damage],
+    )
+    .map_err(|err| RuntimeError::HostOutputClaim {
+        path: device_path.display().to_string(),
+        error: format!("failed to draw scene elements with gles: {err}"),
     })?;
     let _ = frame
         .finish()
@@ -4128,6 +5147,7 @@ fn render_host_scene_with_gles_readback(
         wayland_state.cursor_render_location(),
         render_size,
         Size::<i32, Physical>::from((scanout_size.w, scanout_size.h)),
+        wayland_state.root_display_scale(),
         rotation,
         "readback scanout cursor",
     )?;
@@ -4161,8 +5181,17 @@ fn render_host_scene_with_gles_readback(
     Ok(())
 }
 fn render_output_size_before_transform(wayland_state: &RuntimeWaylandState) -> Size<i32, Physical> {
-    let size = wayland_state.runtime_output_size();
-    Size::<i32, Physical>::from((size.w.max(1), size.h.max(1)))
+    let size = wayland_state
+        .root_geometry_snapshot()
+        .map(|snapshot| snapshot.oriented_physical_size_i32())
+        .unwrap_or_else(|| {
+            let size = wayland_state.runtime_output_size();
+            crate::root_geometry::RootSizeI32 {
+                width: size.w,
+                height: size.h,
+            }
+        });
+    Size::<i32, Physical>::from((size.width.max(1), size.height.max(1)))
 }
 
 fn draw_software_cursor_to_gles_target(
@@ -4172,6 +5201,7 @@ fn draw_software_cursor_to_gles_target(
     location: Point<f64, Logical>,
     logical_size: Size<i32, Physical>,
     scanout_size: Size<i32, Physical>,
+    scale: f64,
     rotation: OutputRotation,
     target_name: &str,
 ) -> Result<(), RuntimeError> {
@@ -4181,11 +5211,18 @@ fn draw_software_cursor_to_gles_target(
             path: device_path.display().to_string(),
             error: format!("failed to begin {target_name} render pass: {err}"),
         })?;
-    draw_software_cursor_frame(&mut frame, location, logical_size, scanout_size, rotation)
-        .map_err(|err| RuntimeError::HostOutputClaim {
-            path: device_path.display().to_string(),
-            error: format!("failed to draw {target_name}: {err}"),
-        })?;
+    draw_software_cursor_frame(
+        &mut frame,
+        location,
+        logical_size,
+        scanout_size,
+        scale,
+        rotation,
+    )
+    .map_err(|err| RuntimeError::HostOutputClaim {
+        path: device_path.display().to_string(),
+        error: format!("failed to draw {target_name}: {err}"),
+    })?;
     let _ = frame
         .finish()
         .map_err(|err| RuntimeError::HostOutputClaim {
@@ -4222,6 +5259,7 @@ fn draw_overlay_region_debug_borders_to_gles_target(
         &regions,
         logical_size,
         scanout_size,
+        wayland_state.root_display_scale(),
         rotation,
     )
     .map_err(|err| RuntimeError::HostOutputClaim {
@@ -4242,13 +5280,14 @@ fn draw_overlay_region_debug_borders_frame<F: Frame>(
     regions: &[OverlayRegionStatus],
     logical_size: Size<i32, Physical>,
     scanout_size: Size<i32, Physical>,
+    scale: f64,
     rotation: OutputRotation,
 ) -> Result<(), F::Error> {
     let logical_size = Size::<i32, Logical>::from((logical_size.w, logical_size.h));
     let output_bounds = Rectangle::from_size(scanout_size);
     let output_damage = [output_bounds];
     for rect in overlay_region_debug_border_rects(regions, logical_size.w, logical_size.h) {
-        let Some(rect) = cursor_rect_to_scanout(rect, logical_size, scanout_size, rotation)
+        let Some(rect) = cursor_rect_to_scanout(rect, scanout_size, scale, rotation)
             .and_then(|rect| rect.intersection(output_bounds))
         else {
             continue;
@@ -4263,6 +5302,7 @@ fn draw_software_cursor_frame<F: Frame>(
     location: Point<f64, Logical>,
     logical_size: Size<i32, Physical>,
     scanout_size: Size<i32, Physical>,
+    scale: f64,
     rotation: OutputRotation,
 ) -> Result<(), F::Error> {
     let logical_size = Size::<i32, Logical>::from((logical_size.w, logical_size.h));
@@ -4272,7 +5312,7 @@ fn draw_software_cursor_frame<F: Frame>(
         .into_iter()
         .rev()
     {
-        let Some(rect) = cursor_rect_to_scanout(rect, logical_size, scanout_size, rotation)
+        let Some(rect) = cursor_rect_to_scanout(rect, scanout_size, scale, rotation)
             .and_then(|rect| rect.intersection(output_bounds))
         else {
             continue;
@@ -4288,38 +5328,55 @@ fn draw_software_cursor_frame<F: Frame>(
 
 fn cursor_rect_to_scanout(
     rect: Rectangle<i32, Logical>,
-    logical_size: Size<i32, Logical>,
     scanout_size: Size<i32, Physical>,
+    scale: f64,
     rotation: OutputRotation,
 ) -> Option<Rectangle<i32, Physical>> {
-    if rect.size.w <= 0 || rect.size.h <= 0 || scanout_size.w <= 0 || scanout_size.h <= 0 {
+    if rect.size.w <= 0
+        || rect.size.h <= 0
+        || scanout_size.w <= 0
+        || scanout_size.h <= 0
+        || !scale.is_finite()
+        || scale <= 0.0
+    {
         return None;
     }
-    let logical_w = logical_size.w.max(1);
-    let logical_h = logical_size.h.max(1);
-    let mapped = match rotation {
-        OutputRotation::Deg0 => Rectangle::new(
-            (rect.loc.x, rect.loc.y).into(),
-            (rect.size.w, rect.size.h).into(),
-        ),
-        OutputRotation::Deg180 => Rectangle::new(
-            (
-                logical_w - (rect.loc.x + rect.size.w),
-                logical_h - (rect.loc.y + rect.size.h),
-            )
-                .into(),
-            (rect.size.w, rect.size.h).into(),
-        ),
-        OutputRotation::Deg90 => Rectangle::new(
-            (rect.loc.y, logical_w - (rect.loc.x + rect.size.w)).into(),
-            (rect.size.h, rect.size.w).into(),
-        ),
-        OutputRotation::Deg270 => Rectangle::new(
-            (logical_h - (rect.loc.y + rect.size.h), rect.loc.x).into(),
-            (rect.size.h, rect.size.w).into(),
-        ),
-    };
-    mapped.intersection(Rectangle::from_size(scanout_size))
+    let x0 = rect.loc.x as f64;
+    let y0 = rect.loc.y as f64;
+    let x1 = (rect.loc.x + rect.size.w) as f64;
+    let y1 = (rect.loc.y + rect.size.h) as f64;
+    let raw_w = scanout_size.w as f64;
+    let raw_h = scanout_size.h as f64;
+    let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)].map(|(x, y)| match rotation {
+        OutputRotation::Deg0 => (x * scale, y * scale),
+        OutputRotation::Deg90 => (raw_w - y * scale, x * scale),
+        OutputRotation::Deg180 => (raw_w - x * scale, raw_h - y * scale),
+        OutputRotation::Deg270 => (y * scale, raw_h - x * scale),
+    });
+    let min_x = corners
+        .iter()
+        .map(|point| point.0)
+        .fold(f64::INFINITY, f64::min);
+    let min_y = corners
+        .iter()
+        .map(|point| point.1)
+        .fold(f64::INFINITY, f64::min);
+    let max_x = corners
+        .iter()
+        .map(|point| point.0)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let max_y = corners
+        .iter()
+        .map(|point| point.1)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let left = min_x.floor().clamp(0.0, raw_w) as i32;
+    let top = min_y.floor().clamp(0.0, raw_h) as i32;
+    let right = max_x.ceil().clamp(0.0, raw_w) as i32;
+    let bottom = max_y.ceil().clamp(0.0, raw_h) as i32;
+    Some(Rectangle::new(
+        (left, top).into(),
+        (right - left, bottom - top).into(),
+    ))
 }
 
 fn ensure_gles_render_target_size(
@@ -4348,6 +5405,7 @@ fn render_elements_to_texture<E>(
     target_texture: &mut GlesTexture,
     render_size: Size<i32, Physical>,
     elements: &[E],
+    scale: f64,
     target_name: &str,
 ) -> Result<(), RuntimeError>
 where
@@ -4373,7 +5431,7 @@ where
             path: device_path.display().to_string(),
             error: format!("failed to clear {target_name}: {err}"),
         })?;
-    draw_render_elements(&mut frame, 1.0, elements, &[damage]).map_err(|err| {
+    draw_render_elements(&mut frame, scale, elements, &[damage]).map_err(|err| {
         RuntimeError::HostOutputClaim {
             path: device_path.display().to_string(),
             error: format!("failed to draw scene elements into {target_name}: {err}"),
@@ -4394,6 +5452,7 @@ fn composite_scene_texture_to_physical_scanout(
     render_target: &mut smithay::backend::renderer::gles::GlesTarget<'_>,
     scene_texture: &GlesTexture,
     scanout_size: Size<i32, Physical>,
+    scale: f64,
     rotation: OutputRotation,
     cursor_location: Point<f64, Logical>,
     logical_size: Size<i32, Physical>,
@@ -4438,6 +5497,7 @@ fn composite_scene_texture_to_physical_scanout(
         cursor_location,
         logical_size,
         scanout_size,
+        scale,
         rotation,
     )
     .map_err(|err| RuntimeError::HostOutputClaim {
@@ -4468,6 +5528,8 @@ fn capture_screen_from_render_target(
     width: usize,
     height: usize,
     rotation: OutputRotation,
+    root_geometry: Option<crate::root_geometry::RootGeometrySnapshot>,
+    pane_captures: &[(PaneId, crate::root_geometry::CaptureGeometry)],
 ) {
     let region = Rectangle::from_size(Size::<i32, BufferCoords>::from((
         width.max(1) as i32,
@@ -4488,14 +5550,17 @@ fn capture_screen_from_render_target(
             return;
         }
     };
-    screen_capture.update_from_scanout_xrgb8888(
-        pixels,
-        width.saturating_mul(4),
-        width,
-        height,
-        screen_capture_src_flipped(flipped, rotation),
-        rotation,
-    );
+    if let Some(root_geometry) = root_geometry {
+        screen_capture.update_root4_scanout_xrgb8888(
+            pixels,
+            width.saturating_mul(4),
+            width,
+            height,
+            screen_capture_src_flipped(flipped, rotation),
+            root_geometry,
+            pane_captures,
+        );
+    }
 }
 
 fn copy_renderer_pixels_to_dumb(
@@ -4607,6 +5672,8 @@ struct RuntimeWaylandState {
     compositor_state: SmithayCompositorState,
     _output_manager_state: OutputManagerState,
     _data_device_state: DataDeviceState,
+    _fractional_scale_manager_state: FractionalScaleManagerState,
+    _viewporter_state: ViewporterState,
     output: Output,
     xdg_shell_state: XdgShellState,
     _xdg_decoration_state: XdgDecorationState,
@@ -4626,9 +5693,262 @@ struct RuntimeWaylandState {
     pointer_location_initialized: bool,
     start_time: std::time::Instant,
     host_surface_buffers: HashMap<ObjectId, SurfaceBufferSnapshot>,
+    surface_material_serials: HashMap<ObjectId, u64>,
+    next_surface_material_serial: u64,
     backend_output_size: Size<i32, Physical>,
     applied_output_rotation: OutputRotation,
+    applied_root_geometry_generation: u64,
+    staged_root_geometry: Option<StagedRuntimeRootGeometry>,
+    presentation_root_geometry: Option<StagedRuntimeRootGeometry>,
+    active_root_geometry_consumers: Option<StagedRuntimeRootGeometry>,
+    native_clip_program: Option<GlesTexProgram>,
     shell_overlay_toggle_shortcut: ShellOverlayToggleShortcut,
+}
+
+#[derive(Clone)]
+struct StagedRuntimeRootGeometry {
+    committed: crate::root_geometry::CommittedRootGeometry,
+    output_global: StagedOutputGlobalState,
+    root_layout: crate::root_geometry::ViewportProjection,
+    composited_crops: Vec<crate::root_geometry::PhysicalPixelRect>,
+    native_materializations: Vec<(PaneId, crate::root_geometry::NativeBufferProjection)>,
+    viewports: Vec<(PaneId, crate::root_geometry::ViewportProjection)>,
+    captures: Vec<(PaneId, crate::root_geometry::CaptureGeometry)>,
+    input: crate::root_geometry::RootGeometrySnapshot,
+    status: crate::root_geometry::DisplayScaleStatus,
+    topology: crate::model::StatusSnapshot,
+    accepted_material_identity: Option<AcceptedMaterialIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AcceptedSurfaceMaterial {
+    id: ObjectId,
+    commit_serial: u64,
+    tree_offset: Point<i32, Logical>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AcceptedPopupMaterial {
+    id: ObjectId,
+    owner_role: RuntimeSurfaceRole,
+    geometry: Rectangle<i32, Logical>,
+    surfaces: Vec<AcceptedSurfaceMaterial>,
+}
+
+/// The exact surface material/topology accepted for one root4 presentation.
+///
+/// Geometry transactions may stage while clients continue committing, but the
+/// first presentation attempt accepts one complete tree identity. A later
+/// buffer, subsurface position/order, popup role/geometry, or tree membership
+/// change therefore rejects that attempt instead of mixing two operations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AcceptedMaterialIdentity {
+    surfaces: Vec<AcceptedSurfaceMaterial>,
+    popups: Vec<AcceptedPopupMaterial>,
+}
+
+#[derive(Clone, Copy)]
+struct StagedOutputGlobalState {
+    physical_width: i32,
+    physical_height: i32,
+    factor: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum Root4ConsumerStage {
+    RootLayoutBackgroundAndChrome,
+    CompositedContentOverlaysAndHitRegions,
+    NativeBuffers,
+    SurfaceAndPaneViewports,
+    Capture,
+    Input,
+    Status,
+}
+
+impl StagedRuntimeRootGeometry {
+    fn is_coherent(&self) -> bool {
+        let generation = self.committed.snapshot.generation;
+        self.root_layout.root_geometry_generation == generation
+            && self.output_global.physical_width == self.committed.snapshot.physical_size_px.width
+            && self.output_global.physical_height == self.committed.snapshot.physical_size_px.height
+            && self.output_global.factor == self.committed.snapshot.factor
+            && self.input.generation == generation
+            && self.status.root_geometry_generation == generation
+            && self
+                .viewports
+                .iter()
+                .all(|(_, viewport)| viewport.root_geometry_generation == generation)
+            && self
+                .captures
+                .iter()
+                .all(|(_, capture)| capture.root_geometry_generation == generation)
+            && self
+                .composited_crops
+                .iter()
+                .all(|crop| crop.width >= 0 && crop.height >= 0)
+            && self.native_materializations.iter().all(|(_, native)| {
+                native.width_px > 0
+                    && native.height_px > 0
+                    && native.logical_clip.width > 0.0
+                    && native.logical_clip.height > 0.0
+            })
+    }
+
+    fn accept_or_validate_material_identity(&mut self, current: AcceptedMaterialIdentity) -> bool {
+        match self.accepted_material_identity.as_ref() {
+            Some(accepted) => accepted == &current,
+            None => {
+                self.accepted_material_identity = Some(current);
+                true
+            }
+        }
+    }
+}
+
+fn stage_runtime_root_geometry_consumers(
+    state: &CompositorState,
+    committed: crate::root_geometry::CommittedRootGeometry,
+    #[cfg(test)] fail_at: Option<Root4ConsumerStage>,
+) -> Result<StagedRuntimeRootGeometry, crate::root_geometry::RootGeometryError> {
+    let snapshot = committed.snapshot;
+    macro_rules! stage {
+        ($consumer:expr, $expression:expr) => {{
+            #[cfg(test)]
+            if fail_at == Some($consumer) {
+                return Err(crate::root_geometry::RootGeometryError::DisplayScaleApplyFailed);
+            }
+            $expression
+        }};
+    }
+    let root_rect = crate::root_geometry::LogicalRect {
+        x: 0.0,
+        y: 0.0,
+        width: snapshot.logical_size.width,
+        height: snapshot.logical_size.height,
+    };
+    let output_global = stage!(
+        Root4ConsumerStage::RootLayoutBackgroundAndChrome,
+        StagedOutputGlobalState {
+            physical_width: snapshot.physical_size_px.width,
+            physical_height: snapshot.physical_size_px.height,
+            factor: snapshot.factor,
+        }
+    );
+    let root_layout = snapshot.viewport(root_rect);
+    let mut status_snapshot = state.status_snapshot();
+    if let Some(previous) = state.root_geometry_snapshot()
+        && previous.rotation != snapshot.rotation
+    {
+        for pane in &mut status_snapshot.panes {
+            if !matches!(
+                pane.render_mode,
+                crate::model::PaneRenderMode::ExternalNative { .. }
+            ) {
+                continue;
+            }
+            if let Some(rotated) = crate::state::rotate_pane_geometry_between_root_geometries(
+                pane.geometry,
+                previous,
+                snapshot,
+            ) {
+                pane.geometry = rotated;
+            }
+        }
+    }
+    let composited_crops = stage!(
+        Root4ConsumerStage::CompositedContentOverlaysAndHitRegions,
+        status_snapshot
+            .panes
+            .iter()
+            .map(|pane| {
+                snapshot.physical_crop(crate::root_geometry::LogicalRect {
+                    x: pane.geometry.x as f64,
+                    y: pane.geometry.y as f64,
+                    width: pane.geometry.width as f64,
+                    height: pane.geometry.height as f64,
+                })
+            })
+            .collect()
+    );
+    let native_materializations = stage!(
+        Root4ConsumerStage::NativeBuffers,
+        status_snapshot
+            .panes
+            .iter()
+            .filter(|pane| matches!(
+                pane.render_mode,
+                crate::model::PaneRenderMode::ExternalNative { .. }
+            ))
+            .map(|pane| {
+                let rect = crate::root_geometry::LogicalRect {
+                    x: pane.geometry.x as f64,
+                    y: pane.geometry.y as f64,
+                    width: pane.geometry.width as f64,
+                    height: pane.geometry.height as f64,
+                };
+                (pane.id.clone(), snapshot.native_buffer(rect))
+            })
+            .collect()
+    );
+    let viewports: Vec<(PaneId, crate::root_geometry::ViewportProjection)> = stage!(
+        Root4ConsumerStage::SurfaceAndPaneViewports,
+        status_snapshot
+            .panes
+            .iter()
+            .map(|pane| {
+                let rect = crate::root_geometry::LogicalRect {
+                    x: pane.geometry.x as f64,
+                    y: pane.geometry.y as f64,
+                    width: pane.geometry.width as f64,
+                    height: pane.geometry.height as f64,
+                };
+                (pane.id.clone(), snapshot.viewport(rect))
+            })
+            .collect()
+    );
+    for pane in &mut status_snapshot.panes {
+        pane.viewport = viewports
+            .iter()
+            .find(|(pane_id, _)| pane_id == &pane.id)
+            .map(|(_, viewport)| viewport.clone());
+    }
+    let captures = stage!(
+        Root4ConsumerStage::Capture,
+        status_snapshot
+            .panes
+            .iter()
+            .map(|pane| {
+                let rect = crate::root_geometry::LogicalRect {
+                    x: pane.geometry.x as f64,
+                    y: pane.geometry.y as f64,
+                    width: pane.geometry.width as f64,
+                    height: pane.geometry.height as f64,
+                };
+                (pane.id.clone(), snapshot.capture_geometry(rect))
+            })
+            .collect()
+    );
+    let input = stage!(Root4ConsumerStage::Input, committed.input.0);
+    let status = stage!(Root4ConsumerStage::Status, committed.status.0.status());
+    let staged = StagedRuntimeRootGeometry {
+        committed,
+        output_global,
+        root_layout,
+        composited_crops,
+        native_materializations,
+        viewports,
+        captures,
+        input,
+        status,
+        topology: status_snapshot,
+        accepted_material_identity: None,
+    };
+    if staged.is_coherent() {
+        Ok(staged)
+    } else {
+        Err(crate::root_geometry::RootGeometryError::DisplayScaleApplyFailed)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4647,7 +5967,307 @@ render_elements! {
     SurfAceRenderElement<=GlesRenderer>;
     Wayland=WaylandSurfaceRenderElement<GlesRenderer>,
     CroppedWayland=CropRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
+    NativeMaterialized=NativeMaterializedRenderElement,
     Solid=SolidColorRenderElement,
+}
+
+struct NativeMaterializedRenderElement {
+    element: WaylandSurfaceRenderElement<GlesRenderer>,
+    projection: crate::root_geometry::NativeBufferProjection,
+    clip_program: GlesTexProgram,
+    materialize_root: bool,
+    target_height_px: f32,
+}
+
+fn materialize_native_surface_elements(
+    elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
+    root_element_id: Option<&Id>,
+    projection: crate::root_geometry::NativeBufferProjection,
+    clip_program: &GlesTexProgram,
+    target_height_px: f32,
+) -> Vec<NativeMaterializedRenderElement> {
+    elements
+        .into_iter()
+        .map(|element| NativeMaterializedRenderElement {
+            materialize_root: root_element_id.is_some_and(|root| element.id() == root),
+            element,
+            projection,
+            clip_program: clip_program.clone(),
+            target_height_px,
+        })
+        .collect()
+}
+
+const NATIVE_CLIP_FRAGMENT_SHADER: &str = r#"#version 100
+
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+#endif
+
+precision mediump float;
+#if defined(EXTERNAL)
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+uniform float alpha;
+uniform vec2 clip_min;
+uniform vec2 clip_max;
+uniform float target_height;
+varying vec2 v_coords;
+#if defined(DEBUG_FLAGS)
+uniform float tint;
+#endif
+
+void main() {
+    vec2 root_position = vec2(gl_FragCoord.x, target_height - gl_FragCoord.y);
+    if (root_position.x < clip_min.x || root_position.y < clip_min.y ||
+        root_position.x >= clip_max.x || root_position.y >= clip_max.y) {
+        discard;
+    }
+    vec4 color = texture2D(tex, v_coords);
+#if defined(NO_ALPHA)
+    color = vec4(color.rgb, 1.0) * alpha;
+#else
+    color = color * alpha;
+#endif
+#if defined(DEBUG_FLAGS)
+    if (tint == 1.0)
+        color = vec4(0.0, 0.2, 0.0, 0.2) + color * 0.8;
+#endif
+    gl_FragColor = color;
+}
+"#;
+
+fn compile_native_clip_program(
+    renderer: &mut GlesRenderer,
+) -> Result<GlesTexProgram, smithay::backend::renderer::gles::GlesError> {
+    renderer.compile_custom_texture_shader(
+        NATIVE_CLIP_FRAGMENT_SHADER,
+        &[
+            UniformName::new("clip_min", UniformType::_2f),
+            UniformName::new("clip_max", UniformType::_2f),
+            UniformName::new("target_height", UniformType::_1f),
+        ],
+    )
+}
+
+fn remap_damage_to_materialized_destination(
+    damage: DamageSet<i32, Physical>,
+    source_size: Size<i32, Physical>,
+    destination_size: Size<i32, Physical>,
+) -> DamageSet<i32, Physical> {
+    if source_size.w <= 0
+        || source_size.h <= 0
+        || destination_size.w <= 0
+        || destination_size.h <= 0
+    {
+        return DamageSet::default();
+    }
+    damage
+        .iter()
+        .filter_map(|rect| {
+            remap_rect_to_materialized_destination(*rect, source_size, destination_size)
+        })
+        .collect()
+}
+
+fn remap_rect_to_materialized_destination(
+    rect: Rectangle<i32, Physical>,
+    source_size: Size<i32, Physical>,
+    destination_size: Size<i32, Physical>,
+) -> Option<Rectangle<i32, Physical>> {
+    let x0 = (i64::from(rect.loc.x) * i64::from(destination_size.w))
+        .div_euclid(i64::from(source_size.w));
+    let y0 = (i64::from(rect.loc.y) * i64::from(destination_size.h))
+        .div_euclid(i64::from(source_size.h));
+    let x1_numerator = i64::from(rect.loc.x + rect.size.w) * i64::from(destination_size.w);
+    let y1_numerator = i64::from(rect.loc.y + rect.size.h) * i64::from(destination_size.h);
+    let x1 = x1_numerator.div_euclid(i64::from(source_size.w))
+        + i64::from(x1_numerator.rem_euclid(i64::from(source_size.w)) != 0);
+    let y1 = y1_numerator.div_euclid(i64::from(source_size.h))
+        + i64::from(y1_numerator.rem_euclid(i64::from(source_size.h)) != 0);
+    Rectangle::new(
+        (i32::try_from(x0).ok()?, i32::try_from(y0).ok()?).into(),
+        (i32::try_from(x1 - x0).ok()?, i32::try_from(y1 - y0).ok()?).into(),
+    )
+    .intersection(Rectangle::from_size(destination_size))
+}
+
+fn native_materialized_source_rect(
+    projection: crate::root_geometry::NativeBufferProjection,
+) -> Rectangle<f64, BufferCoords> {
+    Rectangle::new(
+        (0.0, 0.0).into(),
+        (projection.width_px as f64, projection.height_px as f64).into(),
+    )
+}
+
+fn native_materialized_destination_rect(
+    projection: crate::root_geometry::NativeBufferProjection,
+) -> Rectangle<i32, Physical> {
+    Rectangle::new(
+        (projection.origin_x, projection.origin_y).into(),
+        (projection.width_px, projection.height_px).into(),
+    )
+}
+
+fn native_materialized_local_clip(
+    projection: crate::root_geometry::NativeBufferProjection,
+    destination: Rectangle<i32, Physical>,
+) -> Rectangle<i32, Physical> {
+    let clip_min_x = projection.logical_clip.x * projection.scale_factor;
+    let clip_min_y = projection.logical_clip.y * projection.scale_factor;
+    let clip_max_x =
+        (projection.logical_clip.x + projection.logical_clip.width) * projection.scale_factor;
+    let clip_max_y =
+        (projection.logical_clip.y + projection.logical_clip.height) * projection.scale_factor;
+    let x0 = (clip_min_x - destination.loc.x as f64 - 0.5).ceil() as i32;
+    let y0 = (clip_min_y - destination.loc.y as f64 - 0.5).ceil() as i32;
+    let x1 = (clip_max_x - destination.loc.x as f64 - 0.5).ceil() as i32;
+    let y1 = (clip_max_y - destination.loc.y as f64 - 0.5).ceil() as i32;
+    Rectangle::new((x0, y0).into(), (x1 - x0, y1 - y0).into())
+}
+
+impl Element for NativeMaterializedRenderElement {
+    fn id(&self) -> &Id {
+        self.element.id()
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        self.element.current_commit()
+    }
+
+    fn src(&self) -> Rectangle<f64, BufferCoords> {
+        if self.materialize_root {
+            native_materialized_source_rect(self.projection)
+        } else {
+            self.element.src()
+        }
+    }
+
+    fn transform(&self) -> Transform {
+        self.element.transform()
+    }
+
+    fn geometry(&self, scale: SurfaceScale<f64>) -> Rectangle<i32, Physical> {
+        if self.materialize_root {
+            native_materialized_destination_rect(self.projection)
+        } else {
+            self.element.geometry(scale)
+        }
+    }
+
+    fn damage_since(
+        &self,
+        scale: SurfaceScale<f64>,
+        commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        let damage = self.element.damage_since(scale, commit);
+        let damage = if self.materialize_root {
+            remap_damage_to_materialized_destination(
+                damage,
+                self.element.geometry(scale).size,
+                native_materialized_destination_rect(self.projection).size,
+            )
+        } else {
+            damage
+        };
+        let geometry = self.geometry(scale);
+        let clip = native_materialized_local_clip(self.projection, geometry);
+        damage
+            .iter()
+            .filter_map(|rect| rect.intersection(clip))
+            .collect()
+    }
+
+    fn opaque_regions(&self, scale: SurfaceScale<f64>) -> OpaqueRegions<i32, Physical> {
+        let geometry = self.geometry(scale);
+        let clip = native_materialized_local_clip(self.projection, geometry);
+        self.element
+            .opaque_regions(scale)
+            .iter()
+            .filter_map(|rect| {
+                if self.materialize_root {
+                    remap_rect_to_materialized_destination(
+                        *rect,
+                        self.element.geometry(scale).size,
+                        geometry.size,
+                    )
+                } else {
+                    Some(*rect)
+                }
+            })
+            .filter_map(|rect| rect.intersection(clip))
+            .collect()
+    }
+
+    fn alpha(&self) -> f32 {
+        self.element.alpha()
+    }
+
+    fn kind(&self) -> Kind {
+        self.element.kind()
+    }
+}
+
+impl RenderElement<GlesRenderer> for NativeMaterializedRenderElement {
+    fn draw(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        src: Rectangle<f64, BufferCoords>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+    ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
+        let local_clip = native_materialized_local_clip(self.projection, dst);
+        let clipped_damage: Vec<_> = damage
+            .iter()
+            .filter_map(|rect| rect.intersection(local_clip))
+            .collect();
+        if clipped_damage.is_empty() {
+            return Ok(());
+        }
+        match self.element.texture() {
+            WaylandSurfaceTexture::Texture(texture) => {
+                let clip_min = (
+                    (self.projection.logical_clip.x * self.projection.scale_factor) as f32,
+                    (self.projection.logical_clip.y * self.projection.scale_factor) as f32,
+                );
+                let clip_max = (
+                    ((self.projection.logical_clip.x + self.projection.logical_clip.width)
+                        * self.projection.scale_factor) as f32,
+                    ((self.projection.logical_clip.y + self.projection.logical_clip.height)
+                        * self.projection.scale_factor) as f32,
+                );
+                frame.render_texture_from_to(
+                    texture,
+                    src,
+                    dst,
+                    &clipped_damage,
+                    opaque_regions,
+                    self.transform(),
+                    self.alpha(),
+                    Some(&self.clip_program),
+                    &[
+                        Uniform::new("clip_min", clip_min),
+                        Uniform::new("clip_max", clip_max),
+                        Uniform::new("target_height", self.target_height_px),
+                    ],
+                )
+            }
+            WaylandSurfaceTexture::SolidColor(_) => {
+                self.element
+                    .draw(frame, src, dst, &clipped_damage, opaque_regions)
+            }
+        }
+    }
+
+    fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
+        self.element.underlying_storage(renderer)
+    }
 }
 
 #[derive(Default)]
@@ -4655,6 +6275,7 @@ struct RenderElementCapture {
     elements: Vec<SurfAceRenderElement>,
     counts: RenderElementCounts,
     sources: Vec<RenderElementSource>,
+    failure: Option<String>,
 }
 
 impl RenderElementCapture {
@@ -4747,6 +6368,9 @@ struct SurfaceBufferSnapshot {
     kind: SurfaceBufferKind,
     size: Option<Size<i32, Logical>>,
     dmabuf: Option<SurfaceDmabufInfo>,
+    native_materialization: Option<crate::root_geometry::NativeBufferProjection>,
+    damage: Option<crate::root_geometry::PhysicalPixelRect>,
+    root_geometry_generation: Option<u64>,
 }
 
 struct HostSceneSurface {
@@ -4754,6 +6378,8 @@ struct HostSceneSurface {
     kind: SurfaceBufferKind,
     target: Rectangle<i32, Logical>,
     dmabuf: Option<SurfaceDmabufInfo>,
+    native_materialization: Option<crate::root_geometry::NativeBufferProjection>,
+    damage: Option<crate::root_geometry::PhysicalPixelRect>,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -4896,10 +6522,10 @@ fn launch_token_evidence_for_pid(
 
 fn rectangle_from_pane_geometry(geometry: PaneGeometry) -> Rectangle<i32, Logical> {
     Rectangle::new(
-        (geometry.x, geometry.y).into(),
+        (geometry.x.floor() as i32, geometry.y.floor() as i32).into(),
         (
-            i32::try_from(geometry.width).unwrap_or(i32::MAX).max(1),
-            i32::try_from(geometry.height).unwrap_or(i32::MAX).max(1),
+            geometry.width.ceil().max(1.0) as i32,
+            geometry.height.ceil().max(1.0) as i32,
         )
             .into(),
     )
@@ -4907,26 +6533,60 @@ fn rectangle_from_pane_geometry(geometry: PaneGeometry) -> Rectangle<i32, Logica
 
 impl RoleSurfaceMapping {
     fn new(source_bbox: Rectangle<i32, Logical>, target_rect: Rectangle<i32, Logical>) -> Self {
+        Self::new_logical(
+            source_bbox,
+            crate::root_geometry::LogicalRect {
+                x: target_rect.loc.x as f64,
+                y: target_rect.loc.y as f64,
+                width: target_rect.size.w as f64,
+                height: target_rect.size.h as f64,
+            },
+        )
+    }
+
+    fn new_logical(
+        source_bbox: Rectangle<i32, Logical>,
+        target_rect: crate::root_geometry::LogicalRect,
+    ) -> Self {
         if source_bbox.size.w <= 0
             || source_bbox.size.h <= 0
-            || target_rect.size.w <= 0
-            || target_rect.size.h <= 0
+            || target_rect.width <= 0.0
+            || target_rect.height <= 0.0
         {
             return Self {
-                origin: target_rect.loc.to_f64(),
+                origin: (target_rect.x, target_rect.y).into(),
                 scale: 1.0.into(),
             };
         }
 
-        let scale_x = target_rect.size.w as f64 / source_bbox.size.w as f64;
-        let scale_y = target_rect.size.h as f64 / source_bbox.size.h as f64;
+        let scale_x = target_rect.width / source_bbox.size.w as f64;
+        let scale_y = target_rect.height / source_bbox.size.h as f64;
         Self {
             origin: (
-                target_rect.loc.x as f64 - source_bbox.loc.x as f64 * scale_x,
-                target_rect.loc.y as f64 - source_bbox.loc.y as f64 * scale_y,
+                target_rect.x - source_bbox.loc.x as f64 * scale_x,
+                target_rect.y - source_bbox.loc.y as f64 * scale_y,
             )
                 .into(),
             scale: (scale_x, scale_y).into(),
+        }
+    }
+
+    fn new_native_materialization(
+        source_bbox: Rectangle<i32, Logical>,
+        projection: crate::root_geometry::NativeBufferProjection,
+    ) -> Self {
+        let scale = 1.0 / projection.scale_factor;
+        Self {
+            origin: (
+                projection.logical_clip.x
+                    - projection.fractional_phase_x * scale
+                    - source_bbox.loc.x as f64 * scale,
+                projection.logical_clip.y
+                    - projection.fractional_phase_y * scale
+                    - source_bbox.loc.y as f64 * scale,
+            )
+                .into(),
+            scale: (scale, scale).into(),
         }
     }
 
@@ -4967,8 +6627,137 @@ impl RoleSurfaceMapping {
 }
 
 impl RuntimeWaylandState {
+    fn has_dmabuf_surface_material(&self) -> bool {
+        self.host_surface_buffers
+            .values()
+            .any(|snapshot| snapshot.dmabuf.is_some())
+    }
+
+    fn accepted_material_identity(&self) -> AcceptedMaterialIdentity {
+        let mut surfaces = Vec::new();
+        if let Some(main) = self.main_toplevel.as_ref() {
+            self.collect_accepted_surface_tree(main.wl_surface(), &mut surfaces);
+        }
+        if let Some(overlay) = self.overlay_toplevel.as_ref() {
+            self.collect_accepted_surface_tree(overlay.wl_surface(), &mut surfaces);
+        }
+        let mut native_roots = self.native_pane_toplevels.iter().collect::<Vec<_>>();
+        native_roots.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (_, native) in native_roots {
+            self.collect_accepted_surface_tree(native.wl_surface(), &mut surfaces);
+        }
+
+        let popups = self
+            .popups
+            .iter()
+            .map(|popup| {
+                let mut popup_surfaces = Vec::new();
+                self.collect_accepted_surface_tree(popup.surface.wl_surface(), &mut popup_surfaces);
+                AcceptedPopupMaterial {
+                    id: surface_key(popup.surface.wl_surface()),
+                    owner_role: popup.owner_role.clone(),
+                    geometry: self.popup_geometry_local(&popup.surface),
+                    surfaces: popup_surfaces,
+                }
+            })
+            .collect();
+        AcceptedMaterialIdentity { surfaces, popups }
+    }
+
+    fn collect_accepted_surface_tree(
+        &self,
+        root: &WlSurface,
+        surfaces: &mut Vec<AcceptedSurfaceMaterial>,
+    ) {
+        with_surface_tree_downward(
+            root,
+            Point::<i32, Logical>::from((0, 0)),
+            |_surface, data, &parent_offset| {
+                let location = data
+                    .cached_state
+                    .get::<SubsurfaceCachedState>()
+                    .current()
+                    .location;
+                TraversalAction::DoChildren(parent_offset + location)
+            },
+            |surface, _, &tree_offset| {
+                let id = surface_key(surface);
+                surfaces.push(AcceptedSurfaceMaterial {
+                    commit_serial: self.surface_material_serials.get(&id).copied().unwrap_or(0),
+                    id,
+                    tree_offset,
+                });
+            },
+            |_, _, _| true,
+        );
+    }
+
+    fn staged_native_materializations_ready(&self) -> bool {
+        let Some(staged) = self.staged_root_geometry.as_ref() else {
+            return true;
+        };
+        let generation = staged.committed.snapshot.generation;
+        staged.native_materializations.iter().all(|(pane_id, _)| {
+            let Some(toplevel) = self.native_pane_toplevels.get(pane_id) else {
+                return true;
+            };
+            self.host_surface_buffers
+                .get(&surface_key(toplevel.wl_surface()))
+                .is_some_and(|buffer| buffer.root_geometry_generation == Some(generation))
+        })
+    }
+
+    fn root_geometry_projections(&self) -> Option<crate::root_geometry::CommittedRootGeometry> {
+        if let Some(presentation) = self.presentation_root_geometry.as_ref() {
+            return Some(presentation.committed);
+        }
+        if let Some(active) = self.active_root_geometry_consumers.as_ref() {
+            return Some(active.committed);
+        }
+        lock_state(&self.shared_state).root_geometry_projections()
+    }
+
+    fn root_geometry_snapshot(&self) -> Option<crate::root_geometry::RootGeometrySnapshot> {
+        self.root_geometry_projections()
+            .map(|projections| projections.root_layout.0)
+    }
+
+    fn root_capture_snapshot(&self) -> Option<crate::root_geometry::RootGeometrySnapshot> {
+        self.root_geometry_projections()
+            .map(|projections| projections.captures.0)
+    }
+
+    fn root_pane_capture_geometries(&self) -> Vec<(PaneId, crate::root_geometry::CaptureGeometry)> {
+        self.presentation_root_geometry
+            .as_ref()
+            .or(self.active_root_geometry_consumers.as_ref())
+            .map(|geometry| geometry.captures.clone())
+            .unwrap_or_default()
+    }
+
+    fn root_display_scale(&self) -> f64 {
+        match self.root_geometry_projections() {
+            Some(projections) => projections.composited_content.0.factor,
+            None if lock_state(&self.shared_state)
+                .status_snapshot()
+                .host_mode_active =>
+            {
+                panic!("root4 host operation requires an activated geometry generation")
+            }
+            None => crate::root_geometry::DEFAULT_DISPLAY_SCALE_FACTOR,
+        }
+    }
+
     fn runtime_output_size(&self) -> Size<i32, Logical> {
+        if let Some(snapshot) = self.root_geometry_snapshot() {
+            let size = snapshot.logical_size_i32();
+            return (size.width, size.height).into();
+        }
         let state = lock_state(&self.shared_state);
+        assert!(
+            !state.status_snapshot().host_mode_active,
+            "root4 host output size requires an activated geometry generation"
+        );
         let width = state
             .status_snapshot()
             .runtime
@@ -4983,6 +6772,9 @@ impl RuntimeWaylandState {
             .max(1);
         let (width, height) =
             OutputRotationModel::new(state.output_rotation()).logical_size_i32(width, height);
+        let factor = crate::root_geometry::DEFAULT_DISPLAY_SCALE_FACTOR;
+        let width = (width as f64 / factor).floor().max(1.0) as i32;
+        let height = (height as f64 / factor).floor().max(1.0) as i32;
         (width, height).into()
     }
 
@@ -5003,11 +6795,23 @@ impl RuntimeWaylandState {
         (width, height).into()
     }
 
-    fn new(display_handle: DisplayHandle, shared_state: Arc<Mutex<CompositorState>>) -> Self {
+    fn new(
+        display_handle: DisplayHandle,
+        shared_state: Arc<Mutex<CompositorState>>,
+    ) -> Result<Self, crate::root_geometry::RootGeometryError> {
+        Self::new_with_initial_root_geometry(display_handle, shared_state, None)
+    }
+
+    fn new_with_initial_root_geometry(
+        display_handle: DisplayHandle,
+        shared_state: Arc<Mutex<CompositorState>>,
+        initial_root_geometry: Option<crate::root_geometry::CommittedRootGeometry>,
+    ) -> Result<Self, crate::root_geometry::RootGeometryError> {
         let (
             backend_output_size,
             initial_pointer_output_size,
             applied_output_rotation,
+            applied_root_geometry_generation,
             shell_overlay_toggle_shortcut,
         ) = {
             let state = lock_state(&shared_state);
@@ -5034,18 +6838,71 @@ impl RuntimeWaylandState {
                     .expect("default shell overlay shortcut must remain valid")
             });
             let applied_output_rotation = state.output_rotation();
-            let (logical_width, logical_height) =
-                OutputRotationModel::new(applied_output_rotation).logical_size_i32(width, height);
+            let initial_snapshot = initial_root_geometry
+                .map(|committed| committed.snapshot)
+                .or_else(|| state.root_geometry_snapshot());
+            if state.status_snapshot().host_mode_active && initial_snapshot.is_none() {
+                return Err(crate::root_geometry::RootGeometryError::DisplayScaleApplyFailed);
+            }
+            let (logical_width, logical_height) = initial_snapshot
+                .map(|snapshot| {
+                    let size = snapshot.logical_size_i32();
+                    (size.width, size.height)
+                })
+                .unwrap_or_else(|| {
+                    let (width, height) = OutputRotationModel::new(applied_output_rotation)
+                        .logical_size_i32(width, height);
+                    (
+                        (width as f64 / crate::root_geometry::DEFAULT_DISPLAY_SCALE_FACTOR)
+                            .floor()
+                            .max(1.0) as i32,
+                        (height as f64 / crate::root_geometry::DEFAULT_DISPLAY_SCALE_FACTOR)
+                            .floor()
+                            .max(1.0) as i32,
+                    )
+                });
             (
                 Size::<i32, Physical>::from((width, height)),
                 Size::<i32, Logical>::from((logical_width, logical_height)),
                 applied_output_rotation,
+                initial_snapshot
+                    .map(|snapshot| snapshot.generation)
+                    .unwrap_or(0),
                 shell_overlay_toggle_shortcut,
             )
         };
+        let active_root_geometry_consumers = {
+            let state = lock_state(&shared_state);
+            initial_root_geometry
+                .or_else(|| state.root_geometry_projections())
+                .map(|committed| {
+                    #[cfg(test)]
+                    {
+                        stage_runtime_root_geometry_consumers(&state, committed, None)
+                    }
+                    #[cfg(not(test))]
+                    {
+                        stage_runtime_root_geometry_consumers(&state, committed)
+                    }
+                })
+                .transpose()?
+        };
+        if let Some(prepared) = initial_root_geometry {
+            let consumers = active_root_geometry_consumers
+                .as_ref()
+                .expect("prepared root4 geometry must stage consumers");
+            lock_state(&shared_state).commit_root4_geometry_consumers(
+                prepared,
+                consumers.root_layout.clone(),
+                &consumers.viewports,
+            );
+        }
         let compositor_state = SmithayCompositorState::new::<Self>(&display_handle);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
+        let fractional_scale_manager_state =
+            FractionalScaleManagerState::new::<Self>(&display_handle);
+        let viewporter_state = ViewporterState::new::<Self>(&display_handle);
         let output = Output::new(
             "surf-ace-output-0".to_string(),
             PhysicalProperties {
@@ -5071,6 +6928,8 @@ impl RuntimeWaylandState {
             compositor_state,
             _output_manager_state: output_manager_state,
             _data_device_state: data_device_state,
+            _fractional_scale_manager_state: fractional_scale_manager_state,
+            _viewporter_state: viewporter_state,
             output,
             xdg_shell_state,
             _xdg_decoration_state: xdg_decoration_state,
@@ -5090,17 +6949,28 @@ impl RuntimeWaylandState {
             pointer_location_initialized: false,
             start_time: std::time::Instant::now(),
             host_surface_buffers: HashMap::new(),
+            surface_material_serials: HashMap::new(),
+            next_surface_material_serial: 0,
             backend_output_size,
             applied_output_rotation,
+            applied_root_geometry_generation,
+            staged_root_geometry: None,
+            presentation_root_geometry: None,
+            active_root_geometry_consumers,
+            native_clip_program: None,
             shell_overlay_toggle_shortcut,
         };
         state.sync_output_state();
         state.sync_runtime_dmabuf_protocol_status();
-        state
+        Ok(state)
     }
 
     fn sync_output_state(&self) {
-        let size = self.runtime_output_size();
+        let size = self
+            .root_geometry_snapshot()
+            .map(|snapshot| snapshot.physical_size_px)
+            .map(|size| Size::<i32, Physical>::from((size.width, size.height)))
+            .unwrap_or(self.backend_output_size);
         let mode = OutputMode {
             size: (size.w, size.h).into(),
             refresh: 60_000,
@@ -5108,7 +6978,21 @@ impl RuntimeWaylandState {
         self.output.change_current_state(
             Some(mode),
             Some(Transform::Normal),
-            Some(OutputScale::Integer(1)),
+            Some(OutputScale::Fractional(self.root_display_scale())),
+            Some((0, 0).into()),
+        );
+        self.output.set_preferred(mode);
+    }
+
+    fn activate_output_global(&self, staged: StagedOutputGlobalState) {
+        let mode = OutputMode {
+            size: (staged.physical_width, staged.physical_height).into(),
+            refresh: 60_000,
+        };
+        self.output.change_current_state(
+            Some(mode),
+            Some(Transform::Normal),
+            Some(OutputScale::Fractional(staged.factor)),
             Some((0, 0).into()),
         );
         self.output.set_preferred(mode);
@@ -5272,16 +7156,24 @@ impl RuntimeWaylandState {
             }
             InputEvent::PointerMotion { event, .. } => {
                 let delta = event.delta();
-                let rotation = { lock_state(&self.shared_state).output_rotation() };
-                let (dx, dy) =
-                    OutputRotationModel::new(rotation).physical_delta_to_logical(delta.x, delta.y);
+                let (snapshot, status) = self.input_operation_snapshot();
+                let (dx, dy) = snapshot
+                    .map(|snapshot| {
+                        let (dx, dy) = OutputRotationModel::new(snapshot.rotation)
+                            .physical_delta_to_logical(delta.x, delta.y);
+                        (dx / snapshot.factor, dy / snapshot.factor)
+                    })
+                    .unwrap_or((delta.x, delta.y));
                 let pos = self.update_pointer_location(
                     (self.pointer_location.x + dx, self.pointer_location.y + dy).into(),
                 );
                 let serial = SERIAL_COUNTER.next_serial();
 
-                let under = self
-                    .surface_under_point_for_capture(pos, OverlayCaptureCapability::PointerHover);
+                let under = self.surface_under_point_for_capture(
+                    pos,
+                    OverlayCaptureCapability::PointerHover,
+                    &status,
+                );
                 if let Some(pointer) = self.seat.get_pointer() {
                     pointer.motion(
                         self,
@@ -5296,16 +7188,25 @@ impl RuntimeWaylandState {
                 }
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
-                let physical_size = self.runtime_physical_output_size();
+                let (snapshot, status) = self.input_operation_snapshot();
+                let physical_size = snapshot
+                    .map(|snapshot| snapshot.physical_size_px)
+                    .map(|size| Size::<i32, Physical>::from((size.width, size.height)))
+                    .unwrap_or_else(|| self.runtime_physical_output_size());
                 let physical_pos =
                     event.position_transformed((physical_size.w, physical_size.h).into());
-                let pos = self.update_pointer_location(
-                    self.map_physical_pointer_point_to_logical(physical_pos),
-                );
+                let logical_pos = snapshot
+                    .map(|snapshot| snapshot.physical_to_logical(physical_pos.x, physical_pos.y))
+                    .map(Point::from)
+                    .unwrap_or_else(|| self.map_physical_pointer_point_to_logical(physical_pos));
+                let pos = self.update_pointer_location(logical_pos);
                 let serial = SERIAL_COUNTER.next_serial();
 
-                let under = self
-                    .surface_under_point_for_capture(pos, OverlayCaptureCapability::PointerHover);
+                let under = self.surface_under_point_for_capture(
+                    pos,
+                    OverlayCaptureCapability::PointerHover,
+                    &status,
+                );
                 if let Some(pointer) = self.seat.get_pointer() {
                     pointer.motion(
                         self,
@@ -5323,9 +7224,11 @@ impl RuntimeWaylandState {
                 if let Some(pointer) = self.seat.get_pointer() {
                     let serial = SERIAL_COUNTER.next_serial();
                     if event.state() == ButtonState::Pressed && !pointer.is_grabbed() {
+                        let (_, status) = self.input_operation_snapshot();
                         let surface_under = self.surface_under_point_for_capture(
                             self.pointer_location,
                             OverlayCaptureCapability::PointerButton,
+                            &status,
                         );
                         pointer.motion(
                             self,
@@ -5357,9 +7260,11 @@ impl RuntimeWaylandState {
             InputEvent::PointerAxis { event, .. } => {
                 if let Some(pointer) = self.seat.get_pointer() {
                     let serial = SERIAL_COUNTER.next_serial();
+                    let (_, status) = self.input_operation_snapshot();
                     let under = self.surface_under_point_for_capture(
                         self.pointer_location,
                         OverlayCaptureCapability::PointerAxis,
+                        &status,
                     );
                     pointer.motion(
                         self,
@@ -5777,14 +7682,10 @@ impl RuntimeWaylandState {
         &self,
         point: Point<f64, Logical>,
     ) -> Point<f64, Logical> {
-        let physical_size = self.runtime_physical_output_size();
-        let rotation = { lock_state(&self.shared_state).output_rotation() };
-        let (x, y) = OutputRotationModel::new(rotation).physical_point_to_logical(
-            point.x,
-            point.y,
-            physical_size.w,
-            physical_size.h,
-        );
+        let Some(snapshot) = self.root_geometry_snapshot() else {
+            return point;
+        };
+        let (x, y) = snapshot.physical_to_logical(point.x, point.y);
         (x, y).into()
     }
 
@@ -5827,13 +7728,48 @@ impl RuntimeWaylandState {
         Some(rectangle_from_pane_geometry(geometry))
     }
 
+    fn input_operation_snapshot(
+        &self,
+    ) -> (
+        Option<crate::root_geometry::RootGeometrySnapshot>,
+        crate::model::StatusSnapshot,
+    ) {
+        let state = lock_state(&self.shared_state);
+        (
+            state
+                .root_geometry_projections()
+                .map(|projections| projections.input.0),
+            state.status_snapshot(),
+        )
+    }
+
     fn surface_under_point_for_capture(
         &self,
         pos: Point<f64, Logical>,
         capture: OverlayCaptureCapability,
+        status: &crate::model::StatusSnapshot,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        let pane_rect = |pane_id: &PaneId| {
+            status
+                .panes
+                .iter()
+                .find(|pane| &pane.id == pane_id)
+                .map(|pane| rectangle_from_pane_geometry(pane.geometry))
+        };
+        let output_size = self.runtime_output_size();
         for popup in self.popups.iter().rev() {
-            let popup_geometry = self.popup_absolute_geometry(popup);
+            let local = self.popup_geometry_local(&popup.surface);
+            let base = match popup.owner_role {
+                RuntimeSurfaceRole::MainApp => Point::from((0, 0)),
+                RuntimeSurfaceRole::OverlayNative => self.overlay_rect().loc,
+                RuntimeSurfaceRole::NativePane(ref pane_id) => pane_rect(pane_id)
+                    .map(|rect| rect.loc)
+                    .unwrap_or_else(|| Point::from((0, 0))),
+            };
+            let popup_geometry = Rectangle::new(
+                (base.x + local.loc.x, base.y + local.loc.y).into(),
+                local.size,
+            );
             let hit = pos.x >= popup_geometry.loc.x as f64
                 && pos.x < (popup_geometry.loc.x + popup_geometry.size.w) as f64
                 && pos.y >= popup_geometry.loc.y as f64
@@ -5861,15 +7797,10 @@ impl RuntimeWaylandState {
             }
         }
 
-        let overlay_regions = lock_state(&self.shared_state)
-            .status_snapshot()
-            .overlay_regions;
-        if overlay_region_capture_contains(&overlay_regions.regions, pos, capture) {
+        if overlay_region_capture_contains(&status.overlay_regions.regions, pos, capture) {
             if let Some(main) = &self.main_toplevel {
-                let output_rect = Rectangle::new(
-                    (0, 0).into(),
-                    (self.runtime_output_width(), self.runtime_output_height()).into(),
-                );
+                let output_rect =
+                    Rectangle::new((0, 0).into(), (output_size.w, output_size.h).into());
                 let focus_origin = self
                     .role_surface_mapping(RuntimeSurfaceRole::MainApp, output_rect)
                     .map(RoleSurfaceMapping::focus_origin)
@@ -5879,7 +7810,7 @@ impl RuntimeWaylandState {
         }
 
         for (pane_id, native) in &self.native_pane_toplevels {
-            let Some(rect) = self.native_pane_rect(pane_id) else {
+            let Some(rect) = pane_rect(pane_id) else {
                 continue;
             };
             let hit = pos.x >= rect.loc.x as f64
@@ -5895,10 +7826,7 @@ impl RuntimeWaylandState {
             }
         }
         self.main_toplevel.as_ref().map(|main| {
-            let output_rect = Rectangle::new(
-                (0, 0).into(),
-                (self.runtime_output_width(), self.runtime_output_height()).into(),
-            );
+            let output_rect = Rectangle::new((0, 0).into(), (output_size.w, output_size.h).into());
             let focus_origin = self
                 .role_surface_mapping(RuntimeSurfaceRole::MainApp, output_rect)
                 .map(RoleSurfaceMapping::focus_origin)
@@ -5970,22 +7898,6 @@ impl RuntimeWaylandState {
         })
     }
 
-    fn popup_absolute_geometry(&self, popup: &ManagedPopup) -> Rectangle<i32, Logical> {
-        let local = self.popup_geometry_local(&popup.surface);
-        let base = match popup.owner_role {
-            RuntimeSurfaceRole::MainApp => Point::from((0, 0)),
-            RuntimeSurfaceRole::OverlayNative => self.overlay_rect().loc,
-            RuntimeSurfaceRole::NativePane(ref pane_id) => self
-                .native_pane_rect(pane_id)
-                .map(|rect| rect.loc)
-                .unwrap_or_else(|| Point::from((0, 0))),
-        };
-        Rectangle::new(
-            (base.x + local.loc.x, base.y + local.loc.y).into(),
-            local.size,
-        )
-    }
-
     fn role_surface_mapping(
         &self,
         role: RuntimeSurfaceRole,
@@ -6006,6 +7918,42 @@ impl RuntimeWaylandState {
                 .map(toplevel_surface_source_rect),
         }?;
         Some(RoleSurfaceMapping::new(source_rect, target_rect))
+    }
+
+    fn native_pane_surface_mapping(
+        &self,
+        pane_id: &PaneId,
+        geometry: PaneGeometry,
+    ) -> Option<RoleSurfaceMapping> {
+        let source_rect = self
+            .native_pane_toplevels
+            .get(pane_id)
+            .map(toplevel_surface_source_rect)?;
+        let projection = self
+            .presentation_root_geometry
+            .as_ref()
+            .or(self.staged_root_geometry.as_ref())
+            .or(self.active_root_geometry_consumers.as_ref())
+            .and_then(|root| {
+                root.native_materializations
+                    .iter()
+                    .find(|(candidate, _)| candidate == pane_id)
+                    .map(|(_, projection)| *projection)
+            })
+            .unwrap_or_else(|| {
+                self.root_geometry_snapshot()
+                    .expect("native pane mapping requires root4 geometry")
+                    .native_buffer(crate::root_geometry::LogicalRect {
+                        x: geometry.x,
+                        y: geometry.y,
+                        width: geometry.width,
+                        height: geometry.height,
+                    })
+            });
+        Some(RoleSurfaceMapping::new_native_materialization(
+            source_rect,
+            projection,
+        ))
     }
 
     fn handle_surface_identity_update(&mut self, surface: &ToplevelSurface) {
@@ -6077,7 +8025,6 @@ impl RuntimeWaylandState {
     }
 
     fn configure_toplevel_for_role(&self, surface: &ToplevelSurface, role: RuntimeSurfaceRole) {
-        self.sync_output_state();
         let output_w = self.runtime_output_width();
         let output_h = self.runtime_output_height();
 
@@ -6094,7 +8041,14 @@ impl RuntimeWaylandState {
                     pending.size = Some((overlay_rect.size.w, overlay_rect.size.h).into());
                 }
                 RuntimeSurfaceRole::NativePane(ref pane_id) => {
-                    if let Some(rect) = self.native_pane_rect(pane_id) {
+                    let staged_rect = self.presentation_root_geometry.as_ref().and_then(|root| {
+                        root.topology
+                            .panes
+                            .iter()
+                            .find(|pane| &pane.id == pane_id)
+                            .map(|pane| rectangle_from_pane_geometry(pane.geometry))
+                    });
+                    if let Some(rect) = staged_rect.or_else(|| self.native_pane_rect(pane_id)) {
                         pending.size = Some((rect.size.w, rect.size.h).into());
                     }
                 }
@@ -6121,6 +8075,10 @@ impl RuntimeWaylandState {
             state.mark_runtime_resize(width, height);
         }
         self.sync_output_state();
+        self.stage_role_configures();
+    }
+
+    fn stage_role_configures(&self) {
         if let Some(main) = &self.main_toplevel {
             self.configure_toplevel_for_role(main, RuntimeSurfaceRole::MainApp);
         }
@@ -6136,11 +8094,33 @@ impl RuntimeWaylandState {
     }
 
     fn sync_output_rotation_reconfigure_if_needed(&mut self) {
-        let rotation = { lock_state(&self.shared_state).output_rotation() };
-        if rotation == self.applied_output_rotation {
+        let (rotation, generation, active) = {
+            let state = lock_state(&self.shared_state);
+            let committed = state.root_geometry_projections();
+            (
+                state.output_rotation(),
+                state
+                    .root_geometry_snapshot()
+                    .map(|snapshot| snapshot.generation)
+                    .unwrap_or(0),
+                committed.and_then(|committed| {
+                    #[cfg(test)]
+                    {
+                        stage_runtime_root_geometry_consumers(&state, committed, None).ok()
+                    }
+                    #[cfg(not(test))]
+                    {
+                        stage_runtime_root_geometry_consumers(&state, committed).ok()
+                    }
+                }),
+            )
+        };
+        if generation == self.applied_root_geometry_generation {
             return;
         }
         self.applied_output_rotation = rotation;
+        self.applied_root_geometry_generation = generation;
+        self.active_root_geometry_consumers = active;
         self.reconfigure_roles(self.backend_output_size.w, self.backend_output_size.h);
     }
 
@@ -6206,17 +8186,28 @@ impl RuntimeWaylandState {
     }
 
     fn collect_render_elements(
-        &self,
+        &mut self,
         renderer: &mut GlesRenderer,
         _output_width: i32,
         _output_height: i32,
     ) -> RenderElementCapture {
+        if self.native_clip_program.is_none() {
+            match compile_native_clip_program(renderer) {
+                Ok(program) => self.native_clip_program = Some(program),
+                Err(err) => eprintln!("root4 native clip shader unavailable: {err:?}"),
+            }
+        }
         let mut capture = RenderElementCapture::default();
+        if self.native_clip_program.is_none() && !self.native_pane_toplevels.is_empty() {
+            capture.failure = Some("root4 native fractional clip shader unavailable".to_string());
+        }
         let mut main_elements = Vec::new();
         let mut main_overlay_region_elements = Vec::new();
         let mut main_popup_elements = Vec::new();
         let mut native_pane_elements = Vec::new();
+        let mut cropped_native_pane_elements = Vec::new();
         let mut native_pane_popup_elements = Vec::new();
+        let mut cropped_native_pane_popup_elements = Vec::new();
         let mut overlay_elements = Vec::new();
         let mut overlay_popup_elements = Vec::new();
         let output_rect = Rectangle::new(
@@ -6226,13 +8217,16 @@ impl RuntimeWaylandState {
         let main_mapping = self.role_surface_mapping(RuntimeSurfaceRole::MainApp, output_rect);
         let overlay_mapping =
             self.role_surface_mapping(RuntimeSurfaceRole::OverlayNative, self.overlay_rect());
-        let overlay_region_status = {
-            let status = lock_state(&self.shared_state).status_snapshot();
-            (
-                status.runtime.overlay_region_debug_borders,
-                status.overlay_regions.regions,
-            )
-        };
+        let pinned_status = self
+            .presentation_root_geometry
+            .as_ref()
+            .or(self.active_root_geometry_consumers.as_ref())
+            .map(|geometry| geometry.topology.clone())
+            .unwrap_or_else(|| lock_state(&self.shared_state).status_snapshot());
+        let overlay_region_status = (
+            pinned_status.runtime.overlay_region_debug_borders,
+            pinned_status.overlay_regions.regions.clone(),
+        );
 
         if let Some(main) = &self.main_toplevel {
             if let Some(mapping) = main_mapping {
@@ -6312,19 +8306,34 @@ impl RuntimeWaylandState {
             let Some(native) = self.native_pane_toplevels.get(&pane_id) else {
                 continue;
             };
-            let Some(rect) = self.native_pane_rect(&pane_id) else {
-                continue;
-            };
-            let Some(mapping) =
-                self.role_surface_mapping(RuntimeSurfaceRole::NativePane(pane_id.clone()), rect)
+            let Some(geometry) = pinned_status
+                .panes
+                .iter()
+                .find(|pane| pane.id == pane_id)
+                .map(|pane| pane.geometry)
             else {
                 continue;
             };
+            let Some(mapping) = self.native_pane_surface_mapping(&pane_id, geometry) else {
+                continue;
+            };
+            let pinned_generation = self
+                .presentation_root_geometry
+                .as_ref()
+                .or(self.active_root_geometry_consumers.as_ref())
+                .map(|root| root.committed.snapshot.generation);
+            if self
+                .host_surface_buffers
+                .get(&surface_key(native.wl_surface()))
+                .is_none_or(|buffer| buffer.root_geometry_generation != pinned_generation)
+            {
+                continue;
+            }
             if let Err(err) = import_surface_tree(renderer, native.wl_surface()) {
-                eprintln!(
-                    "host renderer could not import native pane surface tree: {err:#?}",
-                    err = err
-                );
+                capture.failure = Some(format!(
+                    "host renderer could not import native pane surface tree: {err:#?}"
+                ));
+                continue;
             }
             let elements = render_elements_from_surface_tree(
                 renderer,
@@ -6334,7 +8343,49 @@ impl RuntimeWaylandState {
                 1.0,
                 Kind::Unspecified,
             );
-            native_pane_elements.extend(elements);
+            let native_projection = self
+                .presentation_root_geometry
+                .as_ref()
+                .or(self.active_root_geometry_consumers.as_ref())
+                .and_then(|geometry| {
+                    geometry
+                        .native_materializations
+                        .iter()
+                        .find(|(candidate, _)| candidate == &pane_id)
+                        .map(|(_, projection)| *projection)
+                });
+            if let (Some(projection), Some(clip_program)) =
+                (native_projection, self.native_clip_program.as_ref())
+            {
+                let target_height_px = render_output_size_before_transform(self).h as f32;
+                let root_element_id = Id::from_wayland_resource(native.wl_surface());
+                let root_element_present =
+                    elements
+                        .iter()
+                        .any(|element: &WaylandSurfaceRenderElement<GlesRenderer>| {
+                            element.id() == &root_element_id
+                        });
+                if !root_element_present {
+                    capture.failure = Some(format!(
+                        "root4 native pane {} has no imported root material",
+                        pane_id.0
+                    ));
+                    continue;
+                }
+                cropped_native_pane_elements.extend(
+                    materialize_native_surface_elements(
+                        elements,
+                        Some(&root_element_id),
+                        projection,
+                        clip_program,
+                        target_height_px,
+                    )
+                    .into_iter()
+                    .map(SurfAceRenderElement::from),
+                );
+            } else if native_projection.is_none() {
+                native_pane_elements.extend(elements);
+            }
         }
 
         for popup in &self.popups {
@@ -6365,17 +8416,20 @@ impl RuntimeWaylandState {
             let RuntimeSurfaceRole::NativePane(ref pane_id) = popup.owner_role else {
                 continue;
             };
-            let Some(rect) = self.native_pane_rect(pane_id) else {
+            let Some(geometry) = pinned_status
+                .panes
+                .iter()
+                .find(|pane| &pane.id == pane_id)
+                .map(|pane| pane.geometry)
+            else {
                 continue;
             };
-            if let Some(mapping) =
-                self.role_surface_mapping(RuntimeSurfaceRole::NativePane(pane_id.clone()), rect)
-            {
+            if let Some(mapping) = self.native_pane_surface_mapping(pane_id, geometry) {
                 if let Err(err) = import_surface_tree(renderer, popup.surface.wl_surface()) {
-                    eprintln!(
-                        "host renderer could not import native pane popup surface tree: {err:#?}",
-                        err = err
-                    );
+                    capture.failure = Some(format!(
+                        "host renderer could not import native pane popup surface tree: {err:#?}"
+                    ));
+                    continue;
                 }
                 let popup_geo = self.popup_geometry_local(&popup.surface);
                 let elements = render_elements_from_surface_tree(
@@ -6386,7 +8440,50 @@ impl RuntimeWaylandState {
                     1.0,
                     Kind::Unspecified,
                 );
-                native_pane_popup_elements.extend(elements);
+                let native_clip = self
+                    .presentation_root_geometry
+                    .as_ref()
+                    .or(self.active_root_geometry_consumers.as_ref())
+                    .and_then(|root| {
+                        root.native_materializations
+                            .iter()
+                            .find(|(candidate, _)| candidate == pane_id)
+                            .map(|(_, projection)| crate::root_geometry::PhysicalPixelRect {
+                                x: projection.origin_x,
+                                y: projection.origin_y,
+                                width: projection.width_px,
+                                height: projection.height_px,
+                            })
+                    });
+                if native_clip.is_some()
+                    && let (Some(projection), Some(clip_program)) = (
+                        self.presentation_root_geometry
+                            .as_ref()
+                            .or(self.active_root_geometry_consumers.as_ref())
+                            .and_then(|root| {
+                                root.native_materializations
+                                    .iter()
+                                    .find(|(candidate, _)| candidate == pane_id)
+                                    .map(|(_, projection)| *projection)
+                            }),
+                        self.native_clip_program.as_ref(),
+                    )
+                {
+                    let target_height_px = render_output_size_before_transform(self).h as f32;
+                    cropped_native_pane_popup_elements.extend(
+                        materialize_native_surface_elements(
+                            elements,
+                            None,
+                            projection,
+                            clip_program,
+                            target_height_px,
+                        )
+                        .into_iter()
+                        .map(SurfAceRenderElement::from),
+                    );
+                } else {
+                    native_pane_popup_elements.extend(elements);
+                }
             }
         }
 
@@ -6413,6 +8510,14 @@ impl RuntimeWaylandState {
         capture.push(
             RenderElementSource::NativePanePopup,
             native_pane_popup_elements,
+        );
+        capture.push_elements(
+            RenderElementSource::NativePanePopup,
+            cropped_native_pane_popup_elements,
+        );
+        capture.push_elements(
+            RenderElementSource::NativePane,
+            cropped_native_pane_elements,
         );
         capture.push(RenderElementSource::NativePane, native_pane_elements);
         capture.push(RenderElementSource::MainPopup, main_popup_elements);
@@ -6617,6 +8722,73 @@ impl RuntimeWaylandState {
         });
 
         let id = surface_key(surface);
+        // Every wl_surface commit is material to the accepted operation: in
+        // addition to buffers it can publish subsurface topology/position or
+        // xdg popup/toplevel state consumed by the same render tree.
+        self.next_surface_material_serial = self.next_surface_material_serial.saturating_add(1);
+        self.surface_material_serials
+            .insert(id.clone(), self.next_surface_material_serial);
+        let native_materialization = self
+            .native_pane_toplevels
+            .iter()
+            .find(|(_, toplevel)| same_surface(toplevel.wl_surface(), surface))
+            .and_then(|(pane_id, _)| {
+                let geometry = self
+                    .presentation_root_geometry
+                    .as_ref()
+                    .or(self.staged_root_geometry.as_ref())
+                    .or(self.active_root_geometry_consumers.as_ref())?;
+                geometry
+                    .native_materializations
+                    .iter()
+                    .find(|(candidate, _)| candidate == pane_id)
+                    .map(|(_, projection)| (*projection, geometry.committed.snapshot))
+            });
+        let damage = native_materialization.and_then(|(projection, root)| {
+            let damaged = smithay::wayland::compositor::with_states(surface, |states| {
+                let mut guard = states.cached_state.get::<SurfaceAttributes>();
+                guard
+                    .current()
+                    .damage
+                    .iter()
+                    .map(|damage| match damage {
+                        smithay::wayland::compositor::Damage::Surface(rect) => {
+                            crate::root_geometry::LogicalRect {
+                                x: projection.logical_clip.x + rect.loc.x as f64,
+                                y: projection.logical_clip.y + rect.loc.y as f64,
+                                width: rect.size.w as f64,
+                                height: rect.size.h as f64,
+                            }
+                        }
+                        smithay::wayland::compositor::Damage::Buffer(rect) => {
+                            crate::root_geometry::LogicalRect {
+                                x: projection.logical_clip.x
+                                    + (rect.loc.x as f64 - projection.fractional_phase_x)
+                                        / projection.scale_factor,
+                                y: projection.logical_clip.y
+                                    + (rect.loc.y as f64 - projection.fractional_phase_y)
+                                        / projection.scale_factor,
+                                width: rect.size.w as f64 / projection.scale_factor,
+                                height: rect.size.h as f64 / projection.scale_factor,
+                            }
+                        }
+                    })
+                    .map(|rect| root.physical_crop(rect))
+                    .reduce(|left, right| {
+                        let x0 = left.x.min(right.x);
+                        let y0 = left.y.min(right.y);
+                        let x1 = (left.x + left.width).max(right.x + right.width);
+                        let y1 = (left.y + left.height).max(right.y + right.height);
+                        crate::root_geometry::PhysicalPixelRect {
+                            x: x0,
+                            y: y0,
+                            width: x1 - x0,
+                            height: y1 - y0,
+                        }
+                    })
+            });
+            damaged
+        });
         match assignment {
             Some(Some(buffer)) => {
                 let mut kind = SurfaceBufferKind::Other;
@@ -6656,6 +8828,17 @@ impl RuntimeWaylandState {
                         );
                     }
                 }
+                if let (Some((projection, _)), Some(buffer_size)) = (native_materialization, size)
+                    && (buffer_size.w != projection.width_px
+                        || buffer_size.h != projection.height_px)
+                {
+                    self.host_surface_buffers.remove(&id);
+                    eprintln!(
+                        "root4 native buffer rejected: expected {}x{}, received {}x{}",
+                        projection.width_px, projection.height_px, buffer_size.w, buffer_size.h
+                    );
+                    return;
+                }
                 self.host_surface_buffers.insert(
                     id,
                     SurfaceBufferSnapshot {
@@ -6663,6 +8846,10 @@ impl RuntimeWaylandState {
                         kind,
                         size,
                         dmabuf,
+                        native_materialization: native_materialization.map(|value| value.0),
+                        damage,
+                        root_geometry_generation: native_materialization
+                            .map(|value| value.1.generation),
                     },
                 );
             }
@@ -6674,10 +8861,17 @@ impl RuntimeWaylandState {
     }
 
     fn drop_surface_buffer(&mut self, surface: &WlSurface) {
-        self.host_surface_buffers.remove(&surface_key(surface));
+        let id = surface_key(surface);
+        self.host_surface_buffers.remove(&id);
+        self.surface_material_serials.remove(&id);
     }
 
-    fn host_scene_surfaces(&self, output_w: i32, output_h: i32) -> Vec<HostSceneSurface> {
+    fn host_scene_surfaces(
+        &self,
+        output_w: i32,
+        output_h: i32,
+        status: &crate::model::StatusSnapshot,
+    ) -> Vec<HostSceneSurface> {
         let mut surfaces = Vec::new();
         let output_rect = Rectangle::new((0, 0).into(), (output_w, output_h).into());
         let main_mapping = self.role_surface_mapping(RuntimeSurfaceRole::MainApp, output_rect);
@@ -6711,12 +8905,15 @@ impl RuntimeWaylandState {
             let Some(native) = self.native_pane_toplevels.get(&pane_id) else {
                 continue;
             };
-            let Some(rect) = self.native_pane_rect(&pane_id) else {
+            let Some(geometry) = status
+                .panes
+                .iter()
+                .find(|pane| pane.id == pane_id)
+                .map(|pane| pane.geometry)
+            else {
                 continue;
             };
-            if let Some(mapping) =
-                self.role_surface_mapping(RuntimeSurfaceRole::NativePane(pane_id), rect)
-            {
+            if let Some(mapping) = self.native_pane_surface_mapping(&pane_id, geometry) {
                 self.collect_surface_tree_surfaces(
                     native.wl_surface(),
                     (0, 0).into(),
@@ -6734,9 +8931,11 @@ impl RuntimeWaylandState {
                 let mapping = match &popup.owner_role {
                     RuntimeSurfaceRole::MainApp => main_mapping,
                     RuntimeSurfaceRole::OverlayNative => overlay_mapping,
-                    RuntimeSurfaceRole::NativePane(pane_id) => self
-                        .native_pane_rect(pane_id)
-                        .and_then(|rect| self.role_surface_mapping(popup.owner_role.clone(), rect)),
+                    RuntimeSurfaceRole::NativePane(pane_id) => status
+                        .panes
+                        .iter()
+                        .find(|pane| &pane.id == pane_id)
+                        .and_then(|pane| self.native_pane_surface_mapping(pane_id, pane.geometry)),
                 };
                 let Some(mapping) = mapping else {
                     continue;
@@ -6757,6 +8956,8 @@ impl RuntimeWaylandState {
                     kind: snapshot.kind,
                     target: mapping.map_rect(Rectangle::new(popup_geo.loc, target_size)),
                     dmabuf: snapshot.dmabuf,
+                    native_materialization: snapshot.native_materialization,
+                    damage: snapshot.damage,
                 });
             }
         }
@@ -6798,6 +8999,8 @@ impl RuntimeWaylandState {
                             kind: snapshot.kind,
                             target: mapping.map_rect(Rectangle::new(offset, size)),
                             dmabuf: snapshot.dmabuf,
+                            native_materialization: snapshot.native_materialization,
+                            damage: snapshot.damage,
                         });
                     }
                 }
@@ -6815,13 +9018,39 @@ impl RuntimeWaylandState {
     ) -> HostSceneComposeStats {
         let mut stats = HostSceneComposeStats::default();
         clear_host_scene_background(target, target_stride, output_w, output_h);
-        for surface in self.host_scene_surfaces(output_w, output_h) {
+        let Some(root_geometry) = self.root_geometry_snapshot() else {
+            return stats;
+        };
+        let status = self
+            .presentation_root_geometry
+            .as_ref()
+            .or(self.active_root_geometry_consumers.as_ref())
+            .map(|geometry| geometry.topology.clone())
+            .unwrap_or_else(|| lock_state(&self.shared_state).status_snapshot());
+        for surface in self.host_scene_surfaces(output_w, output_h, &status) {
             stats.attempted_surfaces = stats.attempted_surfaces.saturating_add(1);
+            let crop = root_geometry.physical_crop(crate::root_geometry::LogicalRect {
+                x: surface.target.loc.x as f64,
+                y: surface.target.loc.y as f64,
+                width: surface.target.size.w as f64,
+                height: surface.target.size.h as f64,
+            });
+            let target_rect =
+                Rectangle::new((crop.x, crop.y).into(), (crop.width, crop.height).into());
+            let damage_rect = surface.damage.map(|damage| {
+                Rectangle::new(
+                    (damage.x, damage.y).into(),
+                    (damage.width, damage.height).into(),
+                )
+            });
             match surface.kind {
                 SurfaceBufferKind::Shm => {
                     if blit_shm_surface(
                         &surface.buffer,
-                        surface.target,
+                        target_rect,
+                        damage_rect,
+                        surface.native_materialization,
+                        root_geometry.rotation,
                         target,
                         target_stride,
                         output_w,
@@ -6855,10 +9084,10 @@ impl RuntimeWaylandState {
                 }
             }
         }
-        let status = lock_state(&self.shared_state).status_snapshot();
         if status.runtime.overlay_region_debug_borders {
             draw_overlay_region_debug_borders(
                 &status.overlay_regions.regions,
+                root_geometry,
                 target,
                 target_stride,
                 output_w,
@@ -6867,6 +9096,7 @@ impl RuntimeWaylandState {
         }
         draw_software_cursor(
             self.cursor_render_location(),
+            root_geometry,
             target,
             target_stride,
             output_w,
@@ -6893,8 +9123,25 @@ impl CompositorHandler for RuntimeWaylandState {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
+        let scale = self.root_display_scale();
+        smithay::wayland::compositor::with_states(surface, |states| {
+            fractional_scale::with_fractional_scale(states, |fractional_scale| {
+                fractional_scale.set_preferred_scale(scale);
+            });
+        });
         self.capture_surface_buffer_commit(surface);
         on_commit_buffer_handler::<Self>(surface);
+    }
+}
+
+impl FractionalScaleHandler for RuntimeWaylandState {
+    fn new_fractional_scale(&mut self, surface: WlSurface) {
+        let scale = self.root_display_scale();
+        smithay::wayland::compositor::with_states(&surface, |states| {
+            fractional_scale::with_fractional_scale(states, |fractional_scale| {
+                fractional_scale.set_preferred_scale(scale);
+            });
+        });
     }
 }
 
@@ -7168,6 +9415,9 @@ fn clear_host_scene_background(
 fn blit_shm_surface(
     buffer: &wl_buffer::WlBuffer,
     target_rect: Rectangle<i32, Logical>,
+    damage_rect: Option<Rectangle<i32, Logical>>,
+    native_materialization: Option<crate::root_geometry::NativeBufferProjection>,
+    rotation: OutputRotation,
     target: &mut [u8],
     target_stride: usize,
     output_w: i32,
@@ -7177,8 +9427,9 @@ fn blit_shm_surface(
         return false;
     }
 
-    let clipped =
-        target_rect.intersection(Rectangle::new((0, 0).into(), (output_w, output_h).into()));
+    let clipped = target_rect
+        .intersection(Rectangle::new((0, 0).into(), (output_w, output_h).into()))
+        .and_then(|rect| damage_rect.map_or(Some(rect), |damage| rect.intersection(damage)));
     let Some(clipped) = clipped else {
         return false;
     };
@@ -7216,14 +9467,24 @@ fn blit_shm_surface(
         let clipped_right = clipped_left + clipped.size.w as usize;
 
         for rel_y in clipped_top..clipped_bottom {
-            let src_y = rel_y.saturating_mul(src_h) / dst_h;
             let dst_y_i32 = target_rect.loc.y + rel_y as i32;
             if !(0..output_h).contains(&dst_y_i32) {
                 continue;
             }
             let dst_row = (dst_y_i32 as usize).saturating_mul(target_stride);
             for rel_x in clipped_left..clipped_right {
-                let src_x = rel_x.saturating_mul(src_w) / dst_w;
+                let (sample_x, sample_y) = native_source_sample(
+                    native_materialization,
+                    rotation,
+                    rel_x,
+                    rel_y,
+                    dst_w,
+                    dst_h,
+                    src_w,
+                    src_h,
+                );
+                let src_x = sample_x.floor().clamp(0.0, src_w.saturating_sub(1) as f64) as usize;
+                let src_y = sample_y.floor().clamp(0.0, src_h.saturating_sub(1) as f64) as usize;
                 let dst_x_i32 = target_rect.loc.x + rel_x as i32;
                 if !(0..output_w).contains(&dst_x_i32) {
                     continue;
@@ -7277,6 +9538,39 @@ fn blit_shm_surface(
         Err(BufferAccessError::BadMap) => false,
         Err(BufferAccessError::NotWritable) => false,
     }
+}
+
+fn native_source_sample(
+    native_materialization: Option<crate::root_geometry::NativeBufferProjection>,
+    rotation: OutputRotation,
+    rel_x: usize,
+    rel_y: usize,
+    dst_w: usize,
+    dst_h: usize,
+    src_w: usize,
+    src_h: usize,
+) -> (f64, f64) {
+    let raw_u = (rel_x as f64 + 0.5) / dst_w as f64;
+    let raw_v = (rel_y as f64 + 0.5) / dst_h as f64;
+    let (oriented_u, oriented_v) = match rotation {
+        OutputRotation::Deg0 => (raw_u, raw_v),
+        OutputRotation::Deg90 => (raw_v, 1.0 - raw_u),
+        OutputRotation::Deg180 => (1.0 - raw_u, 1.0 - raw_v),
+        OutputRotation::Deg270 => (1.0 - raw_v, raw_u),
+    };
+    let (source_x, source_y, source_width, source_height) =
+        native_materialization.map_or((0.0, 0.0, src_w as f64, src_h as f64), |projection| {
+            (
+                projection.fractional_phase_x,
+                projection.fractional_phase_y,
+                projection.logical_clip.width * projection.scale_factor,
+                projection.logical_clip.height * projection.scale_factor,
+            )
+        });
+    (
+        source_x + oriented_u * source_width,
+        source_y + oriented_v * source_height,
+    )
 }
 
 fn overlay_region_capture_contains(
@@ -7396,12 +9690,26 @@ fn overlay_region_debug_border_rects(
 
 fn draw_overlay_region_debug_borders(
     regions: &[OverlayRegionStatus],
+    root_geometry: crate::root_geometry::RootGeometrySnapshot,
     target: &mut [u8],
     target_stride: usize,
     output_w: i32,
     output_h: i32,
 ) {
-    for rect in overlay_region_debug_border_rects(regions, output_w, output_h) {
+    let logical_size = root_geometry.logical_size_i32();
+    for logical_rect in
+        overlay_region_debug_border_rects(regions, logical_size.width, logical_size.height)
+    {
+        let crop = root_geometry.physical_crop(crate::root_geometry::LogicalRect {
+            x: logical_rect.loc.x as f64,
+            y: logical_rect.loc.y as f64,
+            width: logical_rect.size.w as f64,
+            height: logical_rect.size.h as f64,
+        });
+        let rect = Rectangle::<i32, Physical>::new(
+            (crop.x, crop.y).into(),
+            (crop.width, crop.height).into(),
+        );
         for y in rect.loc.y.max(0)..(rect.loc.y + rect.size.h).min(output_h) {
             let row_start = (y as usize).saturating_mul(target_stride);
             for x in rect.loc.x.max(0)..(rect.loc.x + rect.size.w).min(output_w) {
@@ -7610,15 +9918,28 @@ fn software_cursor_outline_pixel(mask_x: i32, mask_y: i32) -> bool {
 
 fn draw_software_cursor(
     location: Point<f64, Logical>,
+    root_geometry: crate::root_geometry::RootGeometrySnapshot,
     target: &mut [u8],
     target_stride: usize,
     output_w: i32,
     output_h: i32,
 ) {
-    for (rect, color) in software_cursor_rects(location, output_w, output_h)
-        .into_iter()
-        .rev()
+    let logical_size = root_geometry.logical_size_i32();
+    for (logical_rect, color) in
+        software_cursor_rects(location, logical_size.width, logical_size.height)
+            .into_iter()
+            .rev()
     {
+        let crop = root_geometry.physical_crop(crate::root_geometry::LogicalRect {
+            x: logical_rect.loc.x as f64,
+            y: logical_rect.loc.y as f64,
+            width: logical_rect.size.w as f64,
+            height: logical_rect.size.h as f64,
+        });
+        let rect = Rectangle::<i32, Physical>::new(
+            (crop.x, crop.y).into(),
+            (crop.width, crop.height).into(),
+        );
         let (b, g, r) = match color {
             SoftwareCursorColor::White => (0xFF, 0xFF, 0xFF),
             SoftwareCursorColor::Black => (0x00, 0x00, 0x00),
@@ -7701,33 +10022,265 @@ delegate_data_device!(RuntimeWaylandState);
 delegate_output!(RuntimeWaylandState);
 delegate_shm!(RuntimeWaylandState);
 delegate_dmabuf!(RuntimeWaylandState);
+delegate_fractional_scale!(RuntimeWaylandState);
+delegate_viewporter!(RuntimeWaylandState);
 delegate_seat!(RuntimeWaylandState);
 
 #[cfg(test)]
 mod tests {
     use super::{
+        AcceptedMaterialIdentity, AcceptedPopupMaterial, AcceptedSurfaceMaterial,
         AtomicPlaneLayout, DrmFourcc, GBM_BUFFER_FROM_BO_PRESERVE_EXPLICIT_MODIFIER,
-        GLES_INTERMEDIATE_RENDER_FORMAT, PlaneSelection, RoleSurfaceMapping, RuntimeWaylandState,
-        ShellOverlayToggleShortcut, copy_renderer_pixels_to_dumb,
-        direct_present_supported_for_rotation, overlay_scanout_format_supports_alpha,
+        ClaimedHostOutput, ClaimedPresentationPipeline, GLES_INTERMEDIATE_RENDER_FORMAT,
+        HostBackendState, HostRuntimeLoopData, OpenedHostDevice, OutputIdentity, PlaneSelection,
+        RoleSurfaceMapping, Root4ConsumerStage,
+        PresentationToken, RootGeometryFlipBoundary, RuntimeGeometryMutation,
+        RootGeometryStageStore, RuntimeGeometryMutationQueue, RuntimeSurfaceRole, RuntimeWaylandState,
+        ShellOverlayToggleShortcut, StartupPresentOwnership, build_host_gles_renderer_state,
+        compile_native_clip_program, materialize_native_surface_elements,
+        copy_renderer_pixels_to_dumb,
+        direct_present_supported_for_rotation, native_materialized_destination_rect,
+        native_materialized_local_clip, native_materialized_source_rect, native_source_sample,
+        overlay_scanout_format_supports_alpha,
         parse_shell_overlay_toggle_shortcut, pid_matches_or_descends_from,
         render_output_size_before_transform, scene_texture_transform, screen_capture_src_flipped,
+        render_elements_to_texture,
+        composite_scene_texture_to_physical_scanout,
         select_atomic_plane_zpos_values, select_preferred_scanout_format, select_primary_path,
-        source_rect_from_bbox_and_geometry, transform_from_rotation, embedded_toplevel_decoration_mode,
+        remap_damage_to_materialized_destination, source_rect_from_bbox_and_geometry,
+        stage_runtime_root_geometry_consumers,
+        transform_from_rotation, embedded_toplevel_decoration_mode,
+        activate_root_geometry_stage, install_root_geometry_stage, lock_state,
     };
     use crate::output_rotation_model::OutputRotationModel;
     use crate::model::{
-        CompositorOverlayKind, OutputRotation, OverlayCaptureCapability, OverlayRect,
-        OverlayRegionStatus, PaneId, ProcessSpec, RuntimeFocusTarget,
+        CompositorOverlayKind, NativePaneHostRequest, NativeTargetClass, OutputRotation,
+        OverlayCaptureCapability, OverlayRect, OverlayRegionStatus, PaneGeometry,
+        PaneGeometryCoordinateSpace, PaneId, ProcessSpec, RuntimeFocusTarget,
     };
     use crate::process_manager::{ProcessController, ProcessExit};
+    use crate::screen_capture::ScreenCaptureStore;
     use crate::state::CompositorState;
     use smithay::input::keyboard::{Keysym, ModifiersState, keysyms};
+    use smithay::backend::drm::DrmNode;
+    use smithay::backend::renderer::utils::DamageSet;
+    use smithay::backend::renderer::{
+        Bind, Color32F, ExportMem, Frame, ImportDma, ImportMem, Offscreen, Renderer,
+    };
+    use smithay::backend::renderer::element::Element;
     use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as XdgDecorationMode;
     use smithay::reexports::wayland_server::Display;
-    use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
+    use smithay::reexports::calloop::EventLoop;
+    use smithay::reexports::drm as drm_api;
+    use smithay::reexports::drm::control::Mode as DrmMode;
+    use smithay::utils::{Buffer as BufferCoords, Logical, Physical, Point, Rectangle, Size, Transform};
+    use std::fs::OpenOptions;
+    use std::os::fd::{AsFd, OwnedFd};
+    use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
+    use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, delegate_noop};
+    use wayland_client::globals::registry_queue_init;
+    use wayland_client::protocol::{
+        wl_buffer, wl_callback, wl_compositor, wl_registry, wl_region, wl_shm, wl_shm_pool,
+        wl_subcompositor, wl_subsurface, wl_surface,
+    };
+    use wayland_protocols::xdg::shell::client::{
+        xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
+    };
+
+    #[derive(Default)]
+    struct SurfaceTreeClient {
+        configured: bool,
+    }
+
+    impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListContents>
+        for SurfaceTreeClient
+    {
+        fn event(
+            _state: &mut Self,
+            _proxy: &wl_registry::WlRegistry,
+            _event: wl_registry::Event,
+            _data: &wayland_client::globals::GlobalListContents,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+        }
+    }
+    delegate_noop!(SurfaceTreeClient: ignore wl_compositor::WlCompositor);
+    delegate_noop!(SurfaceTreeClient: ignore wl_subcompositor::WlSubcompositor);
+    delegate_noop!(SurfaceTreeClient: ignore wl_shm::WlShm);
+    delegate_noop!(SurfaceTreeClient: ignore wl_shm_pool::WlShmPool);
+    delegate_noop!(SurfaceTreeClient: ignore wl_surface::WlSurface);
+    delegate_noop!(SurfaceTreeClient: ignore wl_subsurface::WlSubsurface);
+    delegate_noop!(SurfaceTreeClient: ignore wl_buffer::WlBuffer);
+    delegate_noop!(SurfaceTreeClient: ignore wl_callback::WlCallback);
+    delegate_noop!(SurfaceTreeClient: ignore wl_region::WlRegion);
+    delegate_noop!(SurfaceTreeClient: ignore xdg_positioner::XdgPositioner);
+    delegate_noop!(SurfaceTreeClient: ignore xdg_toplevel::XdgToplevel);
+    delegate_noop!(SurfaceTreeClient: ignore xdg_popup::XdgPopup);
+
+    impl Dispatch<xdg_wm_base::XdgWmBase, ()> for SurfaceTreeClient {
+        fn event(
+            _state: &mut Self,
+            proxy: &xdg_wm_base::XdgWmBase,
+            event: xdg_wm_base::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            if let xdg_wm_base::Event::Ping { serial } = event {
+                proxy.pong(serial);
+            }
+        }
+    }
+
+    impl Dispatch<xdg_surface::XdgSurface, ()> for SurfaceTreeClient {
+        fn event(
+            state: &mut Self,
+            proxy: &xdg_surface::XdgSurface,
+            event: xdg_surface::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            if let xdg_surface::Event::Configure { serial } = event {
+                proxy.ack_configure(serial);
+                state.configured = true;
+            }
+        }
+    }
+
+    fn spawn_real_shm_surface_tree(
+        socket: UnixStream,
+    ) -> (mpsc::Receiver<(u32, u32, u32)>, mpsc::Sender<()>) {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let connection = Connection::from_socket(socket).expect("client socket must connect");
+            let (globals, mut queue) = registry_queue_init::<SurfaceTreeClient>(&connection)
+                .expect("fixture globals must roundtrip");
+            let qh = queue.handle();
+            let compositor = globals
+                .bind::<wl_compositor::WlCompositor, _, _>(&qh, 1..=6, ())
+                .expect("wl_compositor must exist");
+            let subcompositor = globals
+                .bind::<wl_subcompositor::WlSubcompositor, _, _>(&qh, 1..=1, ())
+                .expect("wl_subcompositor must exist");
+            let shm = globals
+                .bind::<wl_shm::WlShm, _, _>(&qh, 1..=1, ())
+                .expect("wl_shm must exist");
+            let wm_base = globals
+                .bind::<xdg_wm_base::XdgWmBase, _, _>(&qh, 1..=6, ())
+                .expect("xdg_wm_base must exist");
+
+            let width = 100_i32;
+            let height = 50_i32;
+            let child_width = 16_i32;
+            let child_height = 12_i32;
+            let popup_width = 18_i32;
+            let popup_height = 10_i32;
+            let root_bytes = (width * height * 4) as usize;
+            let child_bytes = (child_width * child_height * 4) as usize;
+            let popup_bytes = (popup_width * popup_height * 4) as usize;
+            let fd =
+                rustix::fs::memfd_create("t316-real-surface-tree", rustix::fs::MemfdFlags::CLOEXEC)
+                    .expect("fixture memfd must allocate");
+            rustix::fs::ftruncate(&fd, (root_bytes + child_bytes + popup_bytes) as u64)
+                .expect("fixture memfd must size");
+            let mut pixels = vec![0_u8; root_bytes + child_bytes + popup_bytes];
+            for pixel in pixels[..root_bytes].chunks_exact_mut(4) {
+                pixel.copy_from_slice(&[0x00, 0x00, 0xff, 0xff]);
+            }
+            for pixel in pixels[root_bytes..root_bytes + child_bytes].chunks_exact_mut(4) {
+                pixel.copy_from_slice(&[0x00, 0xff, 0x00, 0xff]);
+            }
+            for pixel in pixels[root_bytes + child_bytes..].chunks_exact_mut(4) {
+                pixel.copy_from_slice(&[0xff, 0x00, 0x00, 0xff]);
+            }
+            assert_eq!(
+                rustix::io::pwrite(&fd, &pixels, 0).expect("fixture pixels must write"),
+                pixels.len()
+            );
+            let pool = shm.create_pool(fd.as_fd(), pixels.len() as i32, &qh, ());
+            let root_buffer = pool.create_buffer(
+                0,
+                width,
+                height,
+                width * 4,
+                wl_shm::Format::Argb8888,
+                &qh,
+                (),
+            );
+            let child_buffer = pool.create_buffer(
+                root_bytes as i32,
+                child_width,
+                child_height,
+                child_width * 4,
+                wl_shm::Format::Argb8888,
+                &qh,
+                (),
+            );
+            let popup_buffer = pool.create_buffer(
+                (root_bytes + child_bytes) as i32,
+                popup_width,
+                popup_height,
+                popup_width * 4,
+                wl_shm::Format::Argb8888,
+                &qh,
+                (),
+            );
+            let root = compositor.create_surface(&qh, ());
+            let child = compositor.create_surface(&qh, ());
+            let subsurface = subcompositor.get_subsurface(&child, &root, &qh, ());
+            subsurface.set_position(7, 9);
+            child.attach(Some(&child_buffer), 0, 0);
+            child.damage_buffer(0, 0, child_width, child_height);
+            child.commit();
+            root.attach(Some(&root_buffer), 0, 0);
+            root.damage_buffer(0, 0, width, height);
+            root.commit();
+            let popup_parent = compositor.create_surface(&qh, ());
+            let popup_parent_xdg = wm_base.get_xdg_surface(&popup_parent, &qh, ());
+            let _popup_parent_role = popup_parent_xdg.get_toplevel(&qh, ());
+            popup_parent.commit();
+            connection.flush().expect("popup parent role must flush");
+            let mut client_state = SurfaceTreeClient::default();
+            while !client_state.configured {
+                queue
+                    .blocking_dispatch(&mut client_state)
+                    .expect("popup parent configure must dispatch");
+            }
+            let popup_surface = compositor.create_surface(&qh, ());
+            let popup_xdg_surface = wm_base.get_xdg_surface(&popup_surface, &qh, ());
+            let positioner = wm_base.create_positioner(&qh, ());
+            positioner.set_size(popup_width, popup_height);
+            positioner.set_anchor_rect(20, 15, 1, 1);
+            let _popup_role =
+                popup_xdg_surface.get_popup(Some(&popup_parent_xdg), &positioner, &qh, ());
+            popup_surface.commit();
+            connection.flush().expect("popup initial commit must flush");
+            client_state.configured = false;
+            while !client_state.configured {
+                queue
+                    .blocking_dispatch(&mut client_state)
+                    .expect("popup configure must dispatch");
+            }
+            popup_surface.attach(Some(&popup_buffer), 0, 0);
+            popup_surface.damage_buffer(0, 0, popup_width, popup_height);
+            popup_surface.commit();
+            connection.flush().expect("fixture commits must flush");
+            ready_tx
+                .send((
+                    root.id().protocol_id(),
+                    child.id().protocol_id(),
+                    popup_surface.id().protocol_id(),
+                ))
+                .expect("fixture ids must publish");
+            release_rx.recv().expect("server must finish tree proof");
+        });
+        (ready_rx, release_tx)
+    }
 
     #[derive(Default)]
     struct NoopProcessController;
@@ -7748,6 +10301,1056 @@ mod tests {
         fn reap_exited(&mut self) -> Vec<ProcessExit> {
             Vec::new()
         }
+    }
+
+    fn test_host_runtime_loop() -> (
+        HostRuntimeLoopData,
+        EventLoop<'static, HostRuntimeLoopData>,
+        ScreenCaptureStore,
+    ) {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.mark_runtime_resize(3840, 2160);
+        let shared_state = Arc::new(Mutex::new(state));
+        let display: Display<RuntimeWaylandState> = Display::new().unwrap();
+        let display_handle = display.handle();
+        let wayland_state =
+            RuntimeWaylandState::new(display_handle.clone(), Arc::clone(&shared_state)).unwrap();
+        let capture = ScreenCaptureStore::default();
+        let host_backend = HostBackendState::for_root_geometry_test(capture.clone());
+        let event_loop = EventLoop::<HostRuntimeLoopData>::try_new().unwrap();
+        let loop_signal = event_loop.get_signal();
+        (
+            HostRuntimeLoopData {
+                shared_state,
+                display_handle,
+                loop_signal,
+                wayland_state,
+                host_backend,
+                runtime_control: None,
+                pending_rotation_response: None,
+                root_geometry_queue: RuntimeGeometryMutationQueue::default(),
+                pending_geometry_mutation: None,
+                root_geometry_flip_boundary: RootGeometryFlipBoundary::default(),
+                pending_reclaim_publication: None,
+                root_geometry_stage_failure: None,
+            },
+            event_loop,
+            capture,
+        )
+    }
+
+    fn stage_capture_for_pending_geometry(runtime: &HostRuntimeLoopData) {
+        let staged = runtime
+            .wayland_state
+            .staged_root_geometry
+            .as_ref()
+            .expect("root4 transaction must be staged");
+        runtime
+            .host_backend
+            .screen_capture
+            .update_root4_scanout_xrgb8888(
+                &[0, 0, 0, 0],
+                4,
+                1,
+                1,
+                false,
+                staged.committed.snapshot,
+                &staged.captures,
+            );
+    }
+
+    fn test_pipeline(pending_atomic_modeset: bool) -> ClaimedPresentationPipeline {
+        ClaimedPresentationPipeline {
+            crtc: drm_api::control::from_u32(1).unwrap(),
+            dumb_buffers: None,
+            dumb_front_buffer: 0,
+            dumb_back_buffer: 1,
+            atomic_commit_state: None,
+            pending_atomic_modeset,
+            flip_pending: false,
+            pending_flip_source: None,
+            pending_presentation_token: None,
+            gles_renderer: None,
+        }
+    }
+
+    fn test_claimed_output(device_id: u64, path: &str) -> ClaimedHostOutput {
+        // drm::Mode is transparent over the all-integer kernel modeinfo record;
+        // a zeroed value is sufficient because lifecycle tests never inspect it.
+        let mode: DrmMode = unsafe { std::mem::zeroed() };
+        ClaimedHostOutput {
+            device_id,
+            mode,
+            startup_present_ownership: StartupPresentOwnership::Dumb,
+            identity: OutputIdentity {
+                device_path: PathBuf::from(path),
+                connector_name: format!("TEST-{device_id}"),
+                connector_id: device_id as u32,
+            },
+        }
+    }
+
+    fn test_opened_device(
+        path: &str,
+        claimed_pipeline: Option<ClaimedPresentationPipeline>,
+        prepared_pipeline: Option<ClaimedPresentationPipeline>,
+    ) -> OpenedHostDevice {
+        let fd: OwnedFd = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap()
+            .into();
+        OpenedHostDevice {
+            path: PathBuf::from(path),
+            // The lifecycle under test does not inspect the node. DrmNode is an
+            // integer device id plus NodeType, whose zero discriminant is Primary.
+            node: unsafe { std::mem::zeroed() },
+            fd,
+            claimed_pipeline,
+            prepared_pipeline,
+        }
+    }
+
+    #[derive(Default)]
+    struct DeterministicStageStore {
+        events: Vec<(&'static str, u64)>,
+    }
+
+    impl RootGeometryStageStore for DeterministicStageStore {
+        fn begin_stage(&mut self, generation: u64) {
+            self.events.push(("begin", generation));
+        }
+
+        fn commit_stage(&mut self, generation: u64) {
+            self.events.push(("commit", generation));
+        }
+
+        fn discard_stage(&mut self, generation: u64) {
+            self.events.push(("discard", generation));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an isolated Linux DRM render device; run with T316_GPU_PROOF_DEVICE"]
+    fn gpu_native_clip_shader_import_and_readback_proof() {
+        let path = PathBuf::from(
+            std::env::var_os("T316_GPU_PROOF_DEVICE")
+                .expect("T316_GPU_PROOF_DEVICE must name the non-live DRM primary node"),
+        );
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("GPU proof device must be accessible");
+        let node = DrmNode::from_path(&path).expect("GPU proof path must be a DRM node");
+        let mut state = build_host_gles_renderer_state(
+            &file.into(),
+            node,
+            &path,
+            (8, 8),
+            DrmFourcc::Xrgb8888,
+            None,
+        )
+        .expect("production GBM/EGL/GLES renderer initialization must succeed");
+        let program = compile_native_clip_program(&mut state.renderer)
+            .expect("production native clip shader must compile on the target GPU");
+
+        let (server_socket, client_socket) = UnixStream::pair().expect("fixture socket pair");
+        let mut display: Display<RuntimeWaylandState> = Display::new().unwrap();
+        let mut display_handle = display.handle();
+        let shared_state = Arc::new(Mutex::new(CompositorState::new(
+            false,
+            Box::new(NoopProcessController),
+        )));
+        let mut wayland_state = RuntimeWaylandState::new(display_handle.clone(), shared_state)
+            .expect("fixture Wayland state must initialize");
+        let server_client = display_handle
+            .insert_client(
+                server_socket,
+                Arc::new(super::RuntimeClientState::default()),
+            )
+            .expect("fixture client must insert");
+        let (surface_ids, release_client) = spawn_real_shm_surface_tree(client_socket);
+        let (root_id, child_id, popup_id) = loop {
+            display
+                .dispatch_clients(&mut wayland_state)
+                .expect("fixture requests must dispatch");
+            if wayland_state.main_toplevel.is_none() && !wayland_state.pending_toplevels.is_empty()
+            {
+                let parent = wayland_state.pending_toplevels.remove(0);
+                wayland_state
+                    .configure_toplevel_for_role(&parent, super::RuntimeSurfaceRole::MainApp);
+                wayland_state.main_toplevel = Some(parent);
+            }
+            display.flush_clients().expect("fixture replies must flush");
+            if let Ok(ids) = surface_ids.try_recv() {
+                break ids;
+            }
+            std::thread::yield_now();
+        };
+        display
+            .dispatch_clients(&mut wayland_state)
+            .expect("fixture commits must dispatch");
+        let root: smithay::reexports::wayland_server::protocol::wl_surface::WlSurface =
+            server_client
+                .object_from_protocol_id(&display_handle, root_id)
+                .expect("server must recover real root surface");
+        let child: smithay::reexports::wayland_server::protocol::wl_surface::WlSurface =
+            server_client
+                .object_from_protocol_id(&display_handle, child_id)
+                .expect("server must recover real child surface");
+        let popup: smithay::reexports::wayland_server::protocol::wl_surface::WlSurface =
+            server_client
+                .object_from_protocol_id(&display_handle, popup_id)
+                .expect("server must recover real xdg popup surface");
+        smithay::backend::renderer::utils::import_surface_tree(&mut state.renderer, &root)
+            .expect("production surface-tree import must accept real SHM buffers");
+        let raw_elements: Vec<
+            smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement<
+                smithay::backend::renderer::gles::GlesRenderer,
+            >,
+        > = smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
+            &mut state.renderer,
+            &root,
+            (0, 0),
+            1.0,
+            1.0,
+            smithay::backend::renderer::element::Kind::Unspecified,
+        );
+        assert_eq!(
+            raw_elements.len(),
+            2,
+            "real root and subsurface must materialize"
+        );
+        let child_element_id = smithay::backend::renderer::element::Id::from(&child);
+        let expected_root_element_id = smithay::backend::renderer::element::Id::from(&root);
+        assert!(
+            raw_elements
+                .iter()
+                .any(|element| element.id() == &child_element_id)
+        );
+        let root_element_id = raw_elements
+            .iter()
+            .find(|element| element.id() == &expected_root_element_id)
+            .expect("real root render element must retain surface identity")
+            .id()
+            .clone();
+        let projection = crate::root_geometry::NativeBufferProjection {
+            origin_x: 13,
+            origin_y: 26,
+            width_px: 131,
+            height_px: 67,
+            fractional_phase_x: 0.325,
+            fractional_phase_y: 0.65,
+            logical_clip: crate::root_geometry::LogicalRect {
+                x: 10.25,
+                y: 20.5,
+                width: 100.25,
+                height: 50.75,
+            },
+            scale_factor: 1.3,
+        };
+        let mut materialized = materialize_native_surface_elements(
+            raw_elements,
+            Some(&root_element_id),
+            projection,
+            &program,
+            100.0,
+        );
+        smithay::backend::renderer::utils::import_surface_tree(&mut state.renderer, &popup)
+            .expect("production popup surface-tree import must accept real SHM buffer");
+        let popup_raw: Vec<
+            smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement<
+                smithay::backend::renderer::gles::GlesRenderer,
+            >,
+        > = smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
+            &mut state.renderer,
+            &popup,
+            (30, 20),
+            1.0,
+            1.0,
+            smithay::backend::renderer::element::Kind::Unspecified,
+        );
+        assert_eq!(
+            popup_raw.len(),
+            1,
+            "real xdg popup must produce one render element"
+        );
+        let popup_element_id = smithay::backend::renderer::element::Id::from(&popup);
+        let popup_materialized =
+            materialize_native_surface_elements(popup_raw, None, projection, &program, 100.0);
+        assert_eq!(
+            popup_materialized[0].id(),
+            &popup_element_id,
+            "real popup identity must survive production materialization"
+        );
+        assert_eq!(
+            popup_materialized[0].geometry(1.0.into()),
+            Rectangle::new((30, 20).into(), (18, 10).into()),
+            "popup geometry must remain native while sharing the root clip authority"
+        );
+        materialized.extend(popup_materialized);
+        let root_element = materialized
+            .iter()
+            .find(|element| element.id() == &root_element_id)
+            .expect("materialized root must exist");
+        assert_eq!(
+            root_element.geometry(1.0.into()),
+            Rectangle::new((13, 26).into(), (131, 67).into())
+        );
+        assert_eq!(
+            root_element
+                .damage_since(1.0.into(), None)
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![Rectangle::new((0, 1).into(), (131, 66).into())],
+            "real committed SHM damage must be remapped and fractional-clipped"
+        );
+        let mut tree_target = state
+            .renderer
+            .create_buffer(GLES_INTERMEDIATE_RENDER_FORMAT, (160, 100).into())
+            .expect("tree target must allocate");
+        render_elements_to_texture(
+            &mut state.renderer,
+            &path,
+            &mut tree_target,
+            (160, 100).into(),
+            &materialized,
+            1.0,
+            "real Wayland surface-tree proof target",
+        )
+        .expect("actual NativeMaterializedRenderElement draw must succeed");
+        let mut rotation_red_counts = Vec::new();
+        for rotation in [
+            OutputRotation::Deg0,
+            OutputRotation::Deg90,
+            OutputRotation::Deg180,
+            OutputRotation::Deg270,
+        ] {
+            let scanout_size: Size<i32, Physical> = match rotation {
+                OutputRotation::Deg0 | OutputRotation::Deg180 => (160, 100).into(),
+                OutputRotation::Deg90 | OutputRotation::Deg270 => (100, 160).into(),
+            };
+            let mut scanout_texture: smithay::backend::renderer::gles::GlesTexture = state
+                .renderer
+                .create_buffer(
+                    GLES_INTERMEDIATE_RENDER_FORMAT,
+                    Size::<i32, BufferCoords>::from((scanout_size.w, scanout_size.h)),
+                )
+                .expect("rotated scanout target must allocate");
+            let mut scanout_target = state
+                .renderer
+                .bind(&mut scanout_texture)
+                .expect("rotated scanout target must bind");
+            composite_scene_texture_to_physical_scanout(
+                &mut state.renderer,
+                &path,
+                &mut scanout_target,
+                &tree_target,
+                scanout_size,
+                1.3,
+                rotation,
+                (-1000.0, -1000.0).into(),
+                (160, 100).into(),
+            )
+            .expect("production rotated scene composite must succeed");
+            let mapping = state
+                .renderer
+                .copy_framebuffer(
+                    &scanout_target,
+                    Rectangle::from_size(Size::<i32, BufferCoords>::from((
+                        scanout_size.w,
+                        scanout_size.h,
+                    ))),
+                    DrmFourcc::Xrgb8888,
+                )
+                .expect("rotated production scanout must read back");
+            let pixels = state
+                .renderer
+                .map_texture(&mapping)
+                .expect("rotated scanout mapping must succeed");
+            rotation_red_counts.push(
+                pixels
+                    .chunks_exact(4)
+                    .filter(|pixel| pixel[2] > 200 && pixel[1] < 50 && pixel[0] < 50)
+                    .count(),
+            );
+        }
+        assert!(
+            rotation_red_counts.iter().all(|count| *count > 5_000),
+            "all four production rotations must retain the real surface-tree root pixels: {rotation_red_counts:?}"
+        );
+        assert!(
+            rotation_red_counts[0] == rotation_red_counts[2]
+                && rotation_red_counts[1] == rotation_red_counts[3],
+            "opposite production rotations must preserve identical sampled coverage: {rotation_red_counts:?}"
+        );
+        release_client
+            .send(())
+            .expect("fixture client must release");
+
+        let red_xrgb = [0_u8, 0, 255, 0].repeat(64);
+        let shm_texture = state
+            .renderer
+            .import_memory(
+                &red_xrgb,
+                DrmFourcc::Xrgb8888,
+                Size::<i32, BufferCoords>::from((8, 8)),
+                false,
+            )
+            .expect("Smithay SHM/memory texture import must succeed");
+
+        let render_and_count = |renderer: &mut smithay::backend::renderer::gles::GlesRenderer,
+                                target: &mut smithay::backend::renderer::gles::GlesTexture,
+                                texture: &smithay::backend::renderer::gles::GlesTexture,
+                                channel: usize| {
+            let size = Size::<i32, Physical>::from((8, 8));
+            let damage = Rectangle::from_size(size);
+            let mut target = renderer
+                .bind(target)
+                .expect("offscreen target bind must succeed");
+            let mut frame = renderer
+                .render(&mut target, size, Transform::Normal)
+                .expect("offscreen render pass must begin");
+            frame
+                .clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &[damage])
+                .expect("offscreen clear must succeed");
+            frame
+                .render_texture_from_to(
+                    texture,
+                    Rectangle::new((0.0, 0.0).into(), (8.0, 8.0).into()),
+                    damage,
+                    &[damage],
+                    &[],
+                    Transform::Normal,
+                    1.0,
+                    Some(&program),
+                    &[
+                        smithay::backend::renderer::gles::Uniform::new(
+                            "clip_min",
+                            (2.0_f32, 2.0_f32),
+                        ),
+                        smithay::backend::renderer::gles::Uniform::new(
+                            "clip_max",
+                            (6.0_f32, 6.0_f32),
+                        ),
+                        smithay::backend::renderer::gles::Uniform::new("target_height", 8.0_f32),
+                    ],
+                )
+                .expect("production native clip shader draw must succeed");
+            let _ = frame.finish().expect("offscreen render pass must finish");
+            let mapping = renderer
+                .copy_framebuffer(
+                    &target,
+                    Rectangle::from_size(Size::<i32, BufferCoords>::from((8, 8))),
+                    DrmFourcc::Xrgb8888,
+                )
+                .expect("shader output readback must succeed");
+            renderer
+                .map_texture(&mapping)
+                .expect("shader output mapping must succeed")
+                .chunks_exact(4)
+                .filter(|pixel| pixel[channel] > 200)
+                .count()
+        };
+
+        assert_eq!(
+            render_and_count(
+                &mut state.renderer,
+                &mut state.target_texture,
+                &shm_texture,
+                2,
+            ),
+            16,
+            "SHM material must be clipped to the exact 4x4 destination"
+        );
+
+        let mut dmabuf = state
+            .direct_scanout
+            .as_ref()
+            .expect("production GBM scanout dmabuf allocation must succeed")
+            .buffers[0]
+            .dmabuf
+            .clone();
+        {
+            let size = Size::<i32, Physical>::from((8, 8));
+            let damage = Rectangle::from_size(size);
+            let mut target = state
+                .renderer
+                .bind(&mut dmabuf)
+                .expect("production dmabuf render target bind must succeed");
+            let mut frame = state
+                .renderer
+                .render(&mut target, size, Transform::Normal)
+                .expect("dmabuf render pass must begin");
+            frame
+                .clear(Color32F::new(0.0, 1.0, 0.0, 1.0), &[damage])
+                .expect("dmabuf clear must succeed");
+            let _ = frame.finish().expect("dmabuf render pass must finish");
+        }
+        let dmabuf_texture = state
+            .renderer
+            .import_dmabuf(&dmabuf, None)
+            .expect("production EGL dmabuf texture import must succeed");
+        assert_eq!(
+            render_and_count(
+                &mut state.renderer,
+                &mut state.target_texture,
+                &dmabuf_texture,
+                1,
+            ),
+            16,
+            "dmabuf material must survive shader import and exact clipped readback"
+        );
+    }
+
+    #[test]
+    fn production_consumer_staging_rolls_back_every_ordered_position() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.mark_runtime_resize(3840, 2160);
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: PaneId::new("native"),
+                content_id: Some("content".to_string()),
+                binding_id: Some("binding".to_string()),
+                launch_token: None,
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 10.25,
+                    y: 20.5,
+                    width: 100.25,
+                    height: 50.75,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+                target: NativeTargetClass::Terminal,
+                process: ProcessSpec {
+                    command: "foot".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: Default::default(),
+                },
+            }])
+            .unwrap();
+        let before = state.root_geometry_snapshot().unwrap();
+        let prepared = state
+            .prepare_root4_display_scale_from_config(
+                1.3,
+                crate::root_geometry::DisplayScaleSource::Config,
+            )
+            .unwrap();
+        for consumer in [
+            Root4ConsumerStage::RootLayoutBackgroundAndChrome,
+            Root4ConsumerStage::CompositedContentOverlaysAndHitRegions,
+            Root4ConsumerStage::NativeBuffers,
+            Root4ConsumerStage::SurfaceAndPaneViewports,
+            Root4ConsumerStage::Capture,
+            Root4ConsumerStage::Input,
+            Root4ConsumerStage::Status,
+        ] {
+            assert!(
+                stage_runtime_root_geometry_consumers(&state, prepared, Some(consumer)).is_err()
+            );
+            assert_eq!(state.root_geometry_snapshot(), Some(before));
+        }
+        let staged = stage_runtime_root_geometry_consumers(&state, prepared, None).unwrap();
+        assert!(staged.is_coherent());
+        assert_eq!(staged.native_materializations.len(), 1);
+        assert_eq!(staged.native_materializations[0].1.width_px, 131);
+        assert_eq!(staged.native_materializations[0].1.height_px, 67);
+    }
+
+    #[test]
+    fn host_runtime_rolls_back_each_consumer_and_continues_from_the_committed_base() {
+        for consumer in [
+            Root4ConsumerStage::RootLayoutBackgroundAndChrome,
+            Root4ConsumerStage::CompositedContentOverlaysAndHitRegions,
+            Root4ConsumerStage::NativeBuffers,
+            Root4ConsumerStage::SurfaceAndPaneViewports,
+            Root4ConsumerStage::Capture,
+            Root4ConsumerStage::Input,
+            Root4ConsumerStage::Status,
+        ] {
+            let (mut runtime, _event_loop, capture) = test_host_runtime_loop();
+            let active = lock_state(&runtime.shared_state)
+                .root_geometry_snapshot()
+                .unwrap();
+            runtime.root_geometry_stage_failure = Some(consumer);
+            runtime
+                .root_geometry_queue
+                .push(RuntimeGeometryMutation::Scale {
+                    factor: 1.5,
+                    source: crate::root_geometry::DisplayScaleSource::Config,
+                });
+            runtime.stage_next_root_geometry_mutation();
+
+            assert!(runtime.wayland_state.staged_root_geometry.is_none());
+            assert!(runtime.pending_geometry_mutation.is_none());
+            assert_eq!(capture.root4_generations_for_test(), (None, None));
+            assert_eq!(
+                lock_state(&runtime.shared_state).root_geometry_snapshot(),
+                Some(active)
+            );
+
+            runtime.root_geometry_stage_failure = None;
+            runtime
+                .root_geometry_queue
+                .push(RuntimeGeometryMutation::Scale {
+                    factor: 1.25,
+                    source: crate::root_geometry::DisplayScaleSource::Config,
+                });
+            runtime.stage_next_root_geometry_mutation();
+            assert_eq!(
+                runtime
+                    .wayland_state
+                    .staged_root_geometry
+                    .as_ref()
+                    .unwrap()
+                    .committed
+                    .snapshot
+                    .generation,
+                active.generation + 1
+            );
+        }
+    }
+
+    #[test]
+    fn host_runtime_fifo_activates_only_exact_completions_and_responds_after_activation() {
+        let (mut runtime, _event_loop, capture) = test_host_runtime_loop();
+        let active = lock_state(&runtime.shared_state)
+            .root_geometry_snapshot()
+            .unwrap();
+        let (rotation_tx, rotation_rx) = std::sync::mpsc::sync_channel(1);
+        runtime
+            .root_geometry_queue
+            .push(RuntimeGeometryMutation::Scale {
+                factor: 1.5,
+                source: crate::root_geometry::DisplayScaleSource::Config,
+            });
+        runtime
+            .root_geometry_queue
+            .push(RuntimeGeometryMutation::Rotation {
+                rotation: OutputRotation::Deg90,
+                response: rotation_tx,
+            });
+        runtime
+            .root_geometry_queue
+            .push(RuntimeGeometryMutation::Scale {
+                factor: 1.5,
+                source: crate::root_geometry::DisplayScaleSource::Config,
+            });
+
+        runtime.stage_next_root_geometry_mutation();
+        stage_capture_for_pending_geometry(&runtime);
+        runtime
+            .root_geometry_flip_boundary
+            .mark_queued(PresentationToken(10));
+        assert!(!runtime.complete_root_geometry_presentations(&[PresentationToken(9)]));
+        assert_eq!(
+            lock_state(&runtime.shared_state).root_geometry_snapshot(),
+            Some(active)
+        );
+        assert!(runtime.complete_root_geometry_presentations(&[PresentationToken(10)]));
+        assert_eq!(
+            capture.root4_generations_for_test(),
+            (Some(active.generation + 1), None)
+        );
+
+        runtime.stage_next_root_geometry_mutation();
+        assert!(matches!(
+            rotation_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        stage_capture_for_pending_geometry(&runtime);
+        runtime
+            .root_geometry_flip_boundary
+            .mark_queued(PresentationToken(11));
+        assert!(runtime.complete_root_geometry_presentations(&[PresentationToken(11)]));
+        assert_eq!(rotation_rx.recv().unwrap(), Ok(()));
+
+        runtime.stage_next_root_geometry_mutation();
+        let third = runtime
+            .wayland_state
+            .staged_root_geometry
+            .as_ref()
+            .unwrap()
+            .committed
+            .snapshot;
+        assert_eq!(third.generation, active.generation + 3);
+        assert_eq!(third.factor, 1.5);
+        assert_eq!(third.rotation, OutputRotation::Deg90);
+    }
+
+    fn seed_reclaim_lifecycle(backend: &mut HostBackendState, replacement_device_id: u64) {
+        backend.opened_devices.insert(
+            1,
+            test_opened_device("/dev/dri/card-test-old", Some(test_pipeline(false)), None),
+        );
+        backend.claimed_output = Some(test_claimed_output(1, "/dev/dri/card-test-old"));
+        backend.mark_claim_lost();
+
+        if replacement_device_id == 1 {
+            backend
+                .opened_devices
+                .get_mut(&1)
+                .unwrap()
+                .prepared_pipeline = Some(test_pipeline(true));
+        } else {
+            backend.opened_devices.insert(
+                replacement_device_id,
+                test_opened_device("/dev/dri/card-test-new", None, Some(test_pipeline(true))),
+            );
+        }
+        backend.prepared_reclaim_output = Some(test_claimed_output(
+            replacement_device_id,
+            "/dev/dri/card-test-new",
+        ));
+    }
+
+    #[test]
+    fn host_backend_same_and_cross_device_reclaim_failure_restore_the_retired_claim() {
+        for replacement_device_id in [1, 2] {
+            let mut backend =
+                HostBackendState::for_root_geometry_test(ScreenCaptureStore::default());
+            seed_reclaim_lifecycle(&mut backend, replacement_device_id);
+            backend.arm_prepared_reclaim_for_presentation().unwrap();
+            assert_eq!(
+                backend.claimed_output.as_ref().unwrap().device_id,
+                replacement_device_id
+            );
+
+            backend.discard_unactivated_reclaim();
+
+            assert_eq!(backend.claimed_output.as_ref().unwrap().device_id, 1);
+            assert!(backend.retired_claim.is_none());
+            assert!(
+                backend
+                    .opened_devices
+                    .get(&1)
+                    .unwrap()
+                    .claimed_pipeline
+                    .is_some()
+            );
+            if replacement_device_id != 1 {
+                assert!(
+                    backend
+                        .opened_devices
+                        .get(&replacement_device_id)
+                        .unwrap()
+                        .claimed_pipeline
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn host_backend_same_and_cross_device_reclaim_success_retires_old_resources() {
+        for replacement_device_id in [1, 2] {
+            let mut backend =
+                HostBackendState::for_root_geometry_test(ScreenCaptureStore::default());
+            seed_reclaim_lifecycle(&mut backend, replacement_device_id);
+            backend.arm_prepared_reclaim_for_presentation().unwrap();
+
+            backend.finish_reclaim_activation();
+
+            assert_eq!(
+                backend.claimed_output.as_ref().unwrap().device_id,
+                replacement_device_id
+            );
+            assert!(backend.retired_claim.is_none());
+            assert!(
+                backend
+                    .opened_devices
+                    .get(&replacement_device_id)
+                    .unwrap()
+                    .claimed_pipeline
+                    .is_some()
+            );
+            if replacement_device_id != 1 {
+                assert!(
+                    backend
+                        .opened_devices
+                        .get(&1)
+                        .unwrap()
+                        .claimed_pipeline
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn host_runtime_mode_reclaim_activates_at_the_same_exact_completion_boundary() {
+        let (mut runtime, _event_loop, capture) = test_host_runtime_loop();
+        seed_reclaim_lifecycle(&mut runtime.host_backend, 2);
+        let active = lock_state(&runtime.shared_state)
+            .root_geometry_snapshot()
+            .unwrap();
+        runtime
+            .root_geometry_queue
+            .push(RuntimeGeometryMutation::Mode {
+                width: 1920,
+                height: 1080,
+            });
+
+        runtime.stage_next_root_geometry_mutation();
+        assert_eq!(
+            runtime
+                .host_backend
+                .claimed_output
+                .as_ref()
+                .unwrap()
+                .device_id,
+            2
+        );
+        assert!(runtime.host_backend.retired_claim.is_some());
+        assert_eq!(
+            lock_state(&runtime.shared_state).root_geometry_snapshot(),
+            Some(active)
+        );
+        stage_capture_for_pending_geometry(&runtime);
+        runtime
+            .root_geometry_flip_boundary
+            .mark_queued(PresentationToken(25));
+        assert!(!runtime.complete_root_geometry_presentations(&[PresentationToken(24)]));
+        assert!(runtime.host_backend.retired_claim.is_some());
+        assert!(runtime.complete_root_geometry_presentations(&[PresentationToken(25)]));
+
+        let committed = lock_state(&runtime.shared_state)
+            .root_geometry_snapshot()
+            .unwrap();
+        assert_eq!(committed.generation, active.generation + 1);
+        assert_eq!(
+            (
+                committed.physical_size_px.width,
+                committed.physical_size_px.height
+            ),
+            (1920, 1080)
+        );
+        assert_eq!(
+            capture.root4_generations_for_test(),
+            (Some(committed.generation), None)
+        );
+        assert!(runtime.host_backend.retired_claim.is_none());
+    }
+
+    #[test]
+    fn production_geometry_queue_preserves_interleaved_fifo_and_repeated_modes() {
+        let mut queue = RuntimeGeometryMutationQueue::default();
+        queue.push(RuntimeGeometryMutation::Scale {
+            factor: 1.5,
+            source: crate::root_geometry::DisplayScaleSource::Config,
+        });
+        queue.push(RuntimeGeometryMutation::Mode {
+            width: 3840,
+            height: 2160,
+        });
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        queue.push(RuntimeGeometryMutation::Rotation {
+            rotation: OutputRotation::Deg90,
+            response: tx,
+        });
+        queue.push(RuntimeGeometryMutation::Mode {
+            width: 3840,
+            height: 2160,
+        });
+
+        for expected in 1..=4 {
+            assert_eq!(queue.pop().unwrap().sequence, expected);
+        }
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn production_geometry_activation_waits_for_a_queued_flip_completion() {
+        let mut boundary = RootGeometryFlipBoundary::default();
+        let geometry_frame = PresentationToken(7);
+        assert!(!boundary.take_completed(&[geometry_frame]));
+        boundary.mark_queued(geometry_frame);
+        assert!(!boundary.take_completed(&[]));
+        assert!(!boundary.take_completed(&[PresentationToken(6)]));
+        assert!(boundary.take_completed(&[geometry_frame]));
+        assert!(!boundary.take_completed(&[geometry_frame]));
+        boundary.mark_queued(PresentationToken(8));
+        boundary.discard();
+        assert!(!boundary.take_completed(&[PresentationToken(8)]));
+    }
+
+    #[test]
+    fn production_transaction_stage_survives_stale_completion_and_activates_exact_token() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.mark_runtime_resize(3840, 2160);
+        let active = state.root_geometry_snapshot().unwrap();
+        let prepared = state
+            .prepare_root4_display_scale_from_config(
+                1.5,
+                crate::root_geometry::DisplayScaleSource::Config,
+            )
+            .unwrap();
+        let staged = stage_runtime_root_geometry_consumers(&state, prepared, None).unwrap();
+        let shared_state = Arc::new(Mutex::new(state));
+        let display: Display<RuntimeWaylandState> = Display::new().unwrap();
+        let mut wayland =
+            RuntimeWaylandState::new(display.handle(), Arc::clone(&shared_state)).unwrap();
+        let mut store = DeterministicStageStore::default();
+        let mut boundary = RootGeometryFlipBoundary::default();
+        let matching = PresentationToken(42);
+
+        install_root_geometry_stage(&mut wayland, &mut store, staged);
+        boundary.mark_queued(matching);
+        assert_eq!(store.events, [("begin", prepared.snapshot.generation)]);
+        assert_eq!(
+            lock_state(&shared_state).root_geometry_snapshot(),
+            Some(active)
+        );
+
+        // A retired operation on the same physical CRTC cannot publish this stage.
+        assert!(!boundary.take_completed(&[PresentationToken(41)]));
+        assert!(wayland.staged_root_geometry.is_some());
+        assert_eq!(
+            lock_state(&shared_state).root_geometry_snapshot(),
+            Some(active)
+        );
+
+        assert!(boundary.take_completed(&[matching]));
+        let activated =
+            activate_root_geometry_stage(&shared_state, &mut wayland, &mut store, |_| {}).unwrap();
+        assert_eq!(activated.committed.snapshot, prepared.snapshot);
+        assert_eq!(
+            lock_state(&shared_state).root_geometry_snapshot(),
+            Some(prepared.snapshot)
+        );
+        assert_eq!(
+            store.events,
+            [
+                ("begin", prepared.snapshot.generation),
+                ("commit", prepared.snapshot.generation),
+            ]
+        );
+        assert!(wayland.staged_root_geometry.is_none());
+        assert_eq!(
+            wayland.applied_root_geometry_generation,
+            prepared.snapshot.generation
+        );
+    }
+
+    #[test]
+    fn staged_rotation_topology_matches_the_committed_fractional_native_geometry() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.mark_runtime_resize(3840, 2160);
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: PaneId::new("native"),
+                content_id: Some("content".to_string()),
+                binding_id: Some("binding".to_string()),
+                launch_token: None,
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 10.25,
+                    y: 20.5,
+                    width: 100.25,
+                    height: 50.75,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+                target: NativeTargetClass::Terminal,
+                process: ProcessSpec {
+                    command: "foot".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: Default::default(),
+                },
+            }])
+            .unwrap();
+        let prepared = state.prepare_root4_rotation(OutputRotation::Deg90).unwrap();
+        let staged = stage_runtime_root_geometry_consumers(&state, prepared, None).unwrap();
+        state.commit_root4_geometry_consumers(
+            staged.committed,
+            staged.root_layout.clone(),
+            &staged.viewports,
+        );
+
+        assert_eq!(staged.topology.panes, state.status_snapshot().panes);
+    }
+
+    #[test]
+    fn staged_generation_is_private_until_the_presentation_operation() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.mark_runtime_resize(3840, 2160);
+        let active = state.root_geometry_snapshot().unwrap();
+        let prepared = state
+            .prepare_root4_display_scale_from_config(
+                1.5,
+                crate::root_geometry::DisplayScaleSource::Config,
+            )
+            .unwrap();
+        let staged = stage_runtime_root_geometry_consumers(&state, prepared, None).unwrap();
+        let shared_state = Arc::new(Mutex::new(state));
+        let display: Display<RuntimeWaylandState> = Display::new().unwrap();
+        let mut runtime = RuntimeWaylandState::new(display.handle(), shared_state).unwrap();
+
+        runtime.staged_root_geometry = Some(staged.clone());
+        assert_eq!(runtime.root_geometry_snapshot(), Some(active));
+
+        runtime.presentation_root_geometry = Some(staged);
+        assert_eq!(runtime.root_geometry_snapshot(), Some(prepared.snapshot));
+        runtime.presentation_root_geometry = None;
+        assert_eq!(runtime.root_geometry_snapshot(), Some(active));
+    }
+
+    #[test]
+    fn production_staged_operation_rejects_surface_tree_material_interleaving() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.mark_runtime_resize(3840, 2160);
+        let committed = state
+            .prepare_root4_display_scale_from_config(
+                1.5,
+                crate::root_geometry::DisplayScaleSource::Config,
+            )
+            .unwrap();
+        let mut staged = stage_runtime_root_geometry_consumers(&state, committed, None).unwrap();
+        let surface_id = smithay::reexports::wayland_server::backend::ObjectId::null();
+        let accepted = AcceptedMaterialIdentity {
+            surfaces: vec![AcceptedSurfaceMaterial {
+                id: surface_id.clone(),
+                commit_serial: 7,
+                tree_offset: (12, 8).into(),
+            }],
+            popups: vec![AcceptedPopupMaterial {
+                id: surface_id,
+                owner_role: RuntimeSurfaceRole::NativePane(PaneId::new("native")),
+                geometry: Rectangle::new((3, 4).into(), (20, 10).into()),
+                surfaces: vec![AcceptedSurfaceMaterial {
+                    id: smithay::reexports::wayland_server::backend::ObjectId::null(),
+                    commit_serial: 11,
+                    tree_offset: (1, 2).into(),
+                }],
+            }],
+        };
+
+        assert!(staged.accept_or_validate_material_identity(accepted.clone()));
+        assert!(staged.accept_or_validate_material_identity(accepted.clone()));
+
+        let mut buffer_commit = accepted.clone();
+        buffer_commit.surfaces[0].commit_serial += 1;
+        assert!(!staged.accept_or_validate_material_identity(buffer_commit));
+
+        let mut subsurface_move = accepted.clone();
+        subsurface_move.surfaces[0].tree_offset = (13, 8).into();
+        assert!(!staged.accept_or_validate_material_identity(subsurface_move));
+
+        let mut popup_buffer_commit = accepted.clone();
+        popup_buffer_commit.popups[0].surfaces[0].commit_serial += 1;
+        assert!(!staged.accept_or_validate_material_identity(popup_buffer_commit));
+
+        let mut popup_subsurface_move = accepted.clone();
+        popup_subsurface_move.popups[0].surfaces[0].tree_offset = (2, 2).into();
+        assert!(!staged.accept_or_validate_material_identity(popup_subsurface_move));
+
+        let mut popup_move = accepted;
+        popup_move.popups[0].geometry.loc = (4, 4).into();
+        assert!(!staged.accept_or_validate_material_identity(popup_move));
     }
 
     #[test]
@@ -8017,51 +11620,45 @@ mod tests {
     #[test]
     fn cursor_rects_map_to_output_scanout_after_rotation() {
         let rect = Rectangle::<i32, Logical>::new((10, 20).into(), (30, 40).into());
-        let logical_size = Size::<i32, Logical>::from((3840, 2160));
-        let scanout_size = Size::<i32, Physical>::from((2160, 3840));
+        let scanout_size = Size::<i32, Physical>::from((3840, 2160));
 
         assert_eq!(
             super::cursor_rect_to_scanout(
                 rect,
-                logical_size,
                 Size::<i32, Physical>::from((3840, 2160)),
+                2.0,
                 OutputRotation::Deg0
             ),
             Some(Rectangle::<i32, Physical>::new(
-                (10, 20).into(),
-                (30, 40).into()
+                (20, 40).into(),
+                (60, 80).into()
             ))
         );
         assert_eq!(
-            super::cursor_rect_to_scanout(rect, logical_size, scanout_size, OutputRotation::Deg90),
+            super::cursor_rect_to_scanout(rect, scanout_size, 2.0, OutputRotation::Deg90),
             Some(Rectangle::<i32, Physical>::new(
-                (20, 3800).into(),
-                (40, 30).into()
+                (3720, 20).into(),
+                (80, 60).into()
             ))
         );
         assert_eq!(
-            super::cursor_rect_to_scanout(rect, logical_size, scanout_size, OutputRotation::Deg270),
+            super::cursor_rect_to_scanout(rect, scanout_size, 2.0, OutputRotation::Deg270),
             Some(Rectangle::<i32, Physical>::new(
-                (2100, 10).into(),
-                (40, 30).into()
+                (40, 2080).into(),
+                (80, 60).into()
             ))
         );
     }
 
     #[test]
     fn deg90_cursor_mapping_is_inverse_of_capture_rotation() {
-        let logical_size = Size::<i32, Logical>::from((3840, 2160));
-        let scanout_size = Size::<i32, Physical>::from((2160, 3840));
+        let scanout_size = Size::<i32, Physical>::from((3840, 2160));
         let rect = Rectangle::<i32, Logical>::new((10, 20).into(), (30, 40).into());
-        let mapped =
-            super::cursor_rect_to_scanout(rect, logical_size, scanout_size, OutputRotation::Deg90)
-                .expect("deg90 cursor rect should map into scanout bounds");
+        let mapped = super::cursor_rect_to_scanout(rect, scanout_size, 2.0, OutputRotation::Deg90)
+            .expect("deg90 cursor rect should map into scanout bounds");
 
-        let view_x = scanout_size.h - (mapped.loc.y + mapped.size.h);
-        let view_y = mapped.loc.x;
-
-        assert_eq!((view_x, view_y), (rect.loc.x, rect.loc.y));
-        assert_eq!((mapped.size.h, mapped.size.w), (rect.size.w, rect.size.h));
+        assert_eq!(mapped.loc, (3720, 20).into());
+        assert_eq!(mapped.size, (80, 60).into());
     }
 
     #[test]
@@ -8316,22 +11913,22 @@ mod tests {
 
         let display: Display<RuntimeWaylandState> =
             Display::new().expect("test wayland display should initialize");
-        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state);
+        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state).unwrap();
 
         let overlay_rect = wayland_state.overlay_rect();
-        assert_eq!(overlay_rect.loc.x, 944);
+        assert_eq!(overlay_rect.loc.x, 464);
         assert_eq!(overlay_rect.loc.y, 16);
-        assert_eq!(overlay_rect.size.w, 960);
-        assert_eq!(overlay_rect.size.h, 540);
+        assert_eq!(overlay_rect.size.w, 480);
+        assert_eq!(overlay_rect.size.h, 320);
 
         let layout = AtomicPlaneLayout::from_overlay_rect(overlay_rect)
             .expect("positive overlay rect should map to atomic plane layout");
-        assert_eq!(layout.crtc_x, 944);
+        assert_eq!(layout.crtc_x, 464);
         assert_eq!(layout.crtc_y, 16);
-        assert_eq!(layout.crtc_w, 960);
-        assert_eq!(layout.crtc_h, 540);
-        assert_eq!(layout.src_w, 960);
-        assert_eq!(layout.src_h, 540);
+        assert_eq!(layout.crtc_w, 480);
+        assert_eq!(layout.crtc_h, 320);
+        assert_eq!(layout.src_w, 480);
+        assert_eq!(layout.src_h, 320);
     }
 
     #[test]
@@ -8350,20 +11947,20 @@ mod tests {
 
         let display: Display<RuntimeWaylandState> =
             Display::new().expect("test wayland display should initialize");
-        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state);
+        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state).unwrap();
 
         let overlay_rect = wayland_state.overlay_rect();
         assert_eq!(overlay_rect.loc.x, 0);
         assert_eq!(overlay_rect.loc.y, 16);
-        assert_eq!(overlay_rect.size.w, 320);
-        assert_eq!(overlay_rect.size.h, 184);
+        assert_eq!(overlay_rect.size.w, 160);
+        assert_eq!(overlay_rect.size.h, 84);
 
         let layout = AtomicPlaneLayout::from_overlay_rect(overlay_rect)
             .expect("overlay rect should still map to atomic plane layout");
         assert_eq!(layout.crtc_x, 0);
         assert_eq!(layout.crtc_y, 16);
-        assert_eq!(layout.crtc_w, 320);
-        assert_eq!(layout.crtc_h, 184);
+        assert_eq!(layout.crtc_w, 160);
+        assert_eq!(layout.crtc_h, 84);
     }
 
     #[test]
@@ -8382,7 +11979,7 @@ mod tests {
 
         let display: Display<RuntimeWaylandState> =
             Display::new().expect("test wayland display should initialize");
-        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state);
+        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state).unwrap();
 
         let overlay_rect = wayland_state.overlay_rect();
         assert_eq!(overlay_rect.loc.x, 0);
@@ -8419,10 +12016,10 @@ mod tests {
 
         let display: Display<RuntimeWaylandState> =
             Display::new().expect("test wayland display should initialize");
-        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state);
+        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state).unwrap();
 
-        assert_eq!(wayland_state.runtime_output_width(), 2160);
-        assert_eq!(wayland_state.runtime_output_height(), 3840);
+        assert_eq!(wayland_state.runtime_output_width(), 1080);
+        assert_eq!(wayland_state.runtime_output_height(), 1920);
     }
 
     #[test]
@@ -8442,7 +12039,7 @@ mod tests {
 
         let display: Display<RuntimeWaylandState> =
             Display::new().expect("test wayland display should initialize");
-        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state);
+        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state).unwrap();
 
         assert_eq!(
             wayland_state.runtime_physical_output_size(),
@@ -8450,11 +12047,11 @@ mod tests {
         );
         assert_eq!(
             wayland_state.pointer_location,
-            Point::<f64, Logical>::from((1080.0, 1920.0))
+            Point::<f64, Logical>::from((540.0, 960.0))
         );
         assert_eq!(
             wayland_state.map_physical_pointer_point_to_logical((3839.0, 2159.0).into()),
-            Point::<f64, Logical>::from((0.0, 3839.0))
+            Point::<f64, Logical>::from((1079.5, 0.5))
         );
     }
 
@@ -8475,10 +12072,10 @@ mod tests {
 
         let display: Display<RuntimeWaylandState> =
             Display::new().expect("test wayland display should initialize");
-        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state);
+        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state).unwrap();
 
-        assert_eq!(wayland_state.runtime_output_width(), 3840);
-        assert_eq!(wayland_state.runtime_output_height(), 2160);
+        assert_eq!(wayland_state.runtime_output_width(), 1920);
+        assert_eq!(wayland_state.runtime_output_height(), 1080);
     }
 
     #[test]
@@ -8506,7 +12103,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_output_global_advertises_rotated_logical_size_without_client_transform() {
+    fn runtime_output_global_preserves_raw_physical_mode_across_root_rotation() {
         let shared_state = Arc::new(Mutex::new(CompositorState::new(
             true,
             Box::new(NoopProcessController),
@@ -8522,11 +12119,11 @@ mod tests {
 
         let display: Display<RuntimeWaylandState> =
             Display::new().expect("test wayland display should initialize");
-        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state);
+        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state).unwrap();
 
         assert_eq!(
             wayland_state.output.current_mode().map(|mode| mode.size),
-            Some((2160, 3840).into())
+            Some((3840, 2160).into())
         );
         assert_eq!(wayland_state.output.current_transform(), Transform::Normal);
     }
@@ -8548,7 +12145,8 @@ mod tests {
 
         let display: Display<RuntimeWaylandState> =
             Display::new().expect("test wayland display should initialize");
-        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state.clone());
+        let wayland_state =
+            RuntimeWaylandState::new(display.handle(), shared_state.clone()).unwrap();
         assert_eq!(
             wayland_state.output.current_mode().map(|mode| mode.size),
             Some((3840, 2160).into())
@@ -8565,7 +12163,7 @@ mod tests {
 
         assert_eq!(
             wayland_state.output.current_mode().map(|mode| mode.size),
-            Some((2160, 3840).into())
+            Some((3840, 2160).into())
         );
         assert_eq!(wayland_state.output.current_transform(), Transform::Normal);
     }
@@ -8587,10 +12185,11 @@ mod tests {
 
         let display: Display<RuntimeWaylandState> =
             Display::new().expect("test wayland display should initialize");
-        let mut wayland_state = RuntimeWaylandState::new(display.handle(), shared_state.clone());
+        let mut wayland_state =
+            RuntimeWaylandState::new(display.handle(), shared_state.clone()).unwrap();
         assert_eq!(
             wayland_state.output.current_mode().map(|mode| mode.size),
-            Some((2160, 3840).into())
+            Some((3840, 2160).into())
         );
 
         {
@@ -8610,8 +12209,8 @@ mod tests {
             wayland_state.backend_output_size,
             Size::<i32, Physical>::from((3840, 2160))
         );
-        assert_eq!(wayland_state.runtime_output_width(), 3840);
-        assert_eq!(wayland_state.runtime_output_height(), 2160);
+        assert_eq!(wayland_state.runtime_output_width(), 1920);
+        assert_eq!(wayland_state.runtime_output_height(), 1080);
     }
 
     #[test]
@@ -8631,7 +12230,7 @@ mod tests {
 
         let display: Display<RuntimeWaylandState> =
             Display::new().expect("test wayland display should initialize");
-        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state);
+        let wayland_state = RuntimeWaylandState::new(display.handle(), shared_state).unwrap();
         let render_size = render_output_size_before_transform(&wayland_state);
 
         assert_eq!(render_size, Size::<i32, Physical>::from((2160, 3840)));
@@ -8705,6 +12304,144 @@ mod tests {
         );
 
         assert_eq!(mapping.origin, Point::<f64, Logical>::from((0.0, 1920.0)));
+    }
+
+    #[test]
+    fn role_surface_mapping_preserves_fractional_native_pane_interval() {
+        let mapping = RoleSurfaceMapping::new_native_materialization(
+            Rectangle::<i32, Logical>::new((0, 0).into(), (131, 67).into()),
+            crate::root_geometry::NativeBufferProjection {
+                origin_x: 13,
+                origin_y: 26,
+                width_px: 131,
+                height_px: 67,
+                fractional_phase_x: 0.325,
+                fractional_phase_y: 0.65,
+                logical_clip: crate::root_geometry::LogicalRect {
+                    x: 10.25,
+                    y: 20.5,
+                    width: 100.25,
+                    height: 50.75,
+                },
+                scale_factor: 1.3,
+            },
+        );
+
+        assert!((mapping.origin.x - 10.0).abs() < 1e-12);
+        assert!((mapping.origin.y - 20.0).abs() < 1e-12);
+        assert!((mapping.scale.x - 1.0 / 1.3).abs() < 1e-12);
+        assert!((mapping.scale.y - 1.0 / 1.3).abs() < 1e-12);
+    }
+
+    #[test]
+    fn production_software_sampler_uses_fractional_source_interval_for_all_rotations() {
+        let projection = crate::root_geometry::NativeBufferProjection {
+            origin_x: 13,
+            origin_y: 26,
+            width_px: 131,
+            height_px: 67,
+            fractional_phase_x: 0.325,
+            fractional_phase_y: 0.65,
+            logical_clip: crate::root_geometry::LogicalRect {
+                x: 10.25,
+                y: 20.5,
+                width: 100.25,
+                height: 50.75,
+            },
+            scale_factor: 1.3,
+        };
+        for (rotation, width, height) in [
+            (OutputRotation::Deg0, 131, 67),
+            (OutputRotation::Deg90, 67, 131),
+            (OutputRotation::Deg180, 131, 67),
+            (OutputRotation::Deg270, 67, 131),
+        ] {
+            for (rel_x, rel_y) in [(0, 0), (width - 1, height - 1)] {
+                let (x, y) = native_source_sample(
+                    Some(projection),
+                    rotation,
+                    rel_x,
+                    rel_y,
+                    width,
+                    height,
+                    131,
+                    67,
+                );
+                assert!(x > projection.fractional_phase_x);
+                assert!(x < projection.fractional_phase_x + 100.25 * 1.3);
+                assert!(y > projection.fractional_phase_y);
+                assert!(y < projection.fractional_phase_y + 50.75 * 1.3);
+            }
+        }
+    }
+
+    #[test]
+    fn production_gles_native_materialization_keeps_one_source_texel_per_physical_pixel() {
+        let projection = crate::root_geometry::NativeBufferProjection {
+            origin_x: 13,
+            origin_y: 26,
+            width_px: 131,
+            height_px: 67,
+            fractional_phase_x: 0.325,
+            fractional_phase_y: 0.65,
+            logical_clip: crate::root_geometry::LogicalRect {
+                x: 10.25,
+                y: 20.5,
+                width: 100.25,
+                height: 50.75,
+            },
+            scale_factor: 1.3,
+        };
+
+        assert_eq!(
+            native_materialized_source_rect(projection),
+            Rectangle::<f64, BufferCoords>::new((0.0, 0.0).into(), (131.0, 67.0).into())
+        );
+        assert_eq!(
+            native_materialized_destination_rect(projection),
+            Rectangle::<i32, Physical>::new((13, 26).into(), (131, 67).into())
+        );
+    }
+
+    #[test]
+    fn native_materialization_remaps_real_damage_and_clips_fractional_coverage() {
+        let projection = crate::root_geometry::NativeBufferProjection {
+            origin_x: 13,
+            origin_y: 26,
+            width_px: 131,
+            height_px: 67,
+            fractional_phase_x: 0.325,
+            fractional_phase_y: 0.65,
+            logical_clip: crate::root_geometry::LogicalRect {
+                x: 10.25,
+                y: 20.5,
+                width: 100.25,
+                height: 50.75,
+            },
+            scale_factor: 1.3,
+        };
+        let remapped = remap_damage_to_materialized_destination(
+            DamageSet::from_slice(&[Rectangle::new((10, 5).into(), (20, 10).into())]),
+            (100, 50).into(),
+            (131, 67).into(),
+        );
+        assert_eq!(
+            remapped.iter().copied().collect::<Vec<_>>(),
+            vec![Rectangle::new((13, 6).into(), (27, 15).into())]
+        );
+
+        assert_eq!(
+            native_materialized_local_clip(
+                projection,
+                native_materialized_destination_rect(projection)
+            ),
+            Rectangle::new((0, 1).into(), (131, 66).into())
+        );
+        let child_destination = Rectangle::new((0, 0).into(), (3840, 2160).into());
+        assert_eq!(
+            native_materialized_local_clip(projection, child_destination),
+            Rectangle::new((13, 27).into(), (131, 66).into())
+        );
     }
 
     fn smithay_client_point(

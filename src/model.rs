@@ -1,3 +1,4 @@
+use crate::root_geometry::{DisplayScaleStatus, ViewportProjection};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -237,7 +238,7 @@ impl ExternalNativeEventContract {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderPaneSnapshot {
     pub id: PaneId,
     pub geometry: PaneGeometry,
@@ -299,13 +300,13 @@ pub enum PaneGeometryCoordinateSpace {
     CompositorLogical,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaneGeometry {
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
     #[serde(default)]
     pub coordinate_space: PaneGeometryCoordinateSpace,
 }
@@ -372,7 +373,7 @@ impl Default for OverlayRegionsStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativePaneHostRequest {
     pub id: PaneId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -409,7 +410,7 @@ pub struct NativePaneHostStatus {
     pub binding_evidence: Option<SurfaceBindingEvidence>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativePaneWindowGroupMemberStatus {
     pub id: String,
@@ -422,7 +423,7 @@ pub struct NativePaneWindowGroupMemberStatus {
     pub clipped_to_pane: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativePaneWindowGroupStatus {
     pub pane_id: PaneId,
@@ -443,10 +444,12 @@ pub struct NativePaneWindowGroupStatus {
     pub members: Vec<NativePaneWindowGroupMemberStatus>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PaneStatus {
     pub id: PaneId,
     pub geometry: PaneGeometry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewport: Option<ViewportProjection>,
     pub render_mode: PaneRenderMode,
     pub external_native_state: ExternalNativeLifecycleState,
     #[serde(
@@ -770,6 +773,18 @@ impl Default for RuntimeStatus {
 pub struct StatusSnapshot {
     pub host_mode_active: bool,
     pub output_rotation: OutputRotation,
+    #[serde(
+        rename = "displayScale",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub display_scale: Option<DisplayScaleStatus>,
+    #[serde(
+        rename = "surfaceViewport",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub surface_viewport: Option<ViewportProjection>,
     pub panes: Vec<PaneStatus>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub native_pane_window_groups: Vec<NativePaneWindowGroupStatus>,

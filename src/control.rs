@@ -5,6 +5,7 @@ use crate::model::{
     RuntimeBackend, RuntimeFocusTarget, RuntimePhase, StatusSnapshot, SurfaceBindingEvidence,
     SurfaceBindingEvidenceOutcome,
 };
+use crate::root_geometry::CaptureGeometry;
 use crate::screen_capture::ScreenCaptureStore;
 use crate::state::CompositorState;
 use crate::sun_schedule::{evaluate_sun_schedule, missing_profile_status};
@@ -13,7 +14,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,12 +175,35 @@ pub enum ControlRequest {
     CaptureScreen {
         output_path: String,
     },
+    CapturePane {
+        pane_id: PaneId,
+        output_path: String,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum RuntimeControlCommand {
     StartHostRuntime,
+    Root4ConfigScaleSet {
+        factor: f64,
+        source: crate::root_geometry::DisplayScaleSource,
+    },
+    SetOutputRotation {
+        rotation: OutputRotation,
+        response: SyncSender<Result<(), crate::root_geometry::RootGeometryError>>,
+    },
 }
+
+impl PartialEq for RuntimeControlCommand {
+    fn eq(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::StartHostRuntime, Self::StartHostRuntime)
+        )
+    }
+}
+
+impl Eq for RuntimeControlCommand {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ControlResponse {
@@ -190,6 +214,8 @@ pub struct ControlResponse {
     pub status: Option<StatusSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry: Option<CaptureGeometry>,
     #[serde(
         rename = "runtimeAppBinding",
         default,
@@ -205,6 +231,7 @@ impl ControlResponse {
             error: None,
             status,
             capture_path: None,
+            geometry: None,
             runtime_app_binding: None,
         }
     }
@@ -215,16 +242,18 @@ impl ControlResponse {
             error: Some(message.into()),
             status: None,
             capture_path: None,
+            geometry: None,
             runtime_app_binding: None,
         }
     }
 
-    fn capture(path: String) -> Self {
+    fn capture(path: String, geometry: Option<CaptureGeometry>) -> Self {
         Self {
             ok: true,
             error: None,
             status: None,
             capture_path: Some(path),
+            geometry,
             runtime_app_binding: None,
         }
     }
@@ -238,6 +267,7 @@ impl ControlResponse {
             error: None,
             status,
             capture_path: None,
+            geometry: None,
             runtime_app_binding: Some(diagnostics),
         }
     }
@@ -365,8 +395,14 @@ fn handle_connection(
 
     let response = match serde_json::from_str::<ControlRequest>(&request_line) {
         Ok(request) => {
-            let mut state = lock_state(shared_state);
-            handle_request_with_capture(&mut state, request, runtime_control, screen_capture)
+            if let Some(response) =
+                handle_runtime_geometry_request(&request, shared_state, runtime_control)
+            {
+                response
+            } else {
+                let mut state = lock_state(shared_state);
+                handle_request_with_capture(&mut state, request, runtime_control, screen_capture)
+            }
         }
         Err(err) => ControlResponse::err(format!("failed to parse request: {err}")),
     };
@@ -383,6 +419,34 @@ fn handle_connection(
     stream.write_all(b"\n")?;
     stream.flush()?;
     Ok(())
+}
+
+fn handle_runtime_geometry_request(
+    request: &ControlRequest,
+    shared_state: &Arc<Mutex<CompositorState>>,
+    runtime_control: Option<&Sender<RuntimeControlCommand>>,
+) -> Option<ControlResponse> {
+    let runtime_control = runtime_control?;
+    match request {
+        ControlRequest::SetOutputRotation { rotation } => {
+            let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+            if runtime_control
+                .send(RuntimeControlCommand::SetOutputRotation {
+                    rotation: *rotation,
+                    response: response_tx,
+                })
+                .is_err()
+            {
+                return Some(ControlResponse::err("display_scale_apply_failed"));
+            }
+            Some(match response_rx.recv() {
+                Ok(Ok(())) => ControlResponse::ok(Some(lock_state(shared_state).status_snapshot())),
+                Ok(Err(err)) => ControlResponse::err(err.code()),
+                Err(_) => ControlResponse::err("display_scale_apply_failed"),
+            })
+        }
+        _ => None,
+    }
 }
 
 fn lock_state(
@@ -437,10 +501,10 @@ fn handle_request_with_capture(
             state.set_runtime_sun_schedule_appearance(status);
             Ok(Some(state.status_snapshot()))
         }
-        ControlRequest::SetOutputRotation { rotation } => {
-            state.set_output_rotation(rotation);
-            Ok(Some(state.status_snapshot()))
-        }
+        ControlRequest::SetOutputRotation { rotation } => state
+            .try_set_output_rotation(rotation)
+            .map(|_| Some(state.status_snapshot()))
+            .map_err(|err| err.code().to_string()),
         ControlRequest::ApplyProviderSnapshot { panes } => state
             .apply_provider_snapshot(panes)
             .map(|_| Some(state.status_snapshot()))
@@ -590,9 +654,21 @@ fn handle_request_with_capture(
                 return ControlResponse::err("capture output path must not be empty");
             }
             let path = Path::new(&output_path);
-            return match screen_capture.write_png(path) {
-                Ok(()) => ControlResponse::capture(output_path),
+            return match screen_capture.write_root4_full_png(path) {
+                Ok(geometry) => ControlResponse::capture(output_path, Some(geometry)),
                 Err(err) => ControlResponse::err(format!("failed to capture screen: {err}")),
+            };
+        }
+        ControlRequest::CapturePane {
+            pane_id,
+            output_path,
+        } => {
+            if output_path.trim().is_empty() {
+                return ControlResponse::err("capture output path must not be empty");
+            }
+            return match screen_capture.write_root4_pane_png(Path::new(&output_path), &pane_id) {
+                Ok(geometry) => ControlResponse::capture(output_path, Some(geometry)),
+                Err(err) => ControlResponse::err(format!("failed to capture pane: {err}")),
             };
         }
     };
@@ -1032,10 +1108,10 @@ mod tests {
                         launch_token: None,
                         revision: 0,
                         geometry: PaneGeometry {
-                            x: 10,
-                            y: 20,
-                            width: 300,
-                            height: 200,
+                            x: 10.0,
+                            y: 20.0,
+                            width: 300.0,
+                            height: 200.0,
                             coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                         },
                         target: NativeTargetClass::Terminal,
@@ -1053,10 +1129,10 @@ mod tests {
                         launch_token: None,
                         revision: 0,
                         geometry: PaneGeometry {
-                            x: 320,
-                            y: 20,
-                            width: 300,
-                            height: 200,
+                            x: 320.0,
+                            y: 20.0,
+                            width: 300.0,
+                            height: 200.0,
                             coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                         },
                         target: NativeTargetClass::Terminal,
@@ -1076,13 +1152,13 @@ mod tests {
         let status = response.status.expect("status should be returned");
         assert_eq!(status.panes.len(), 2);
         assert_eq!(status.panes[0].id, PaneId::new("pane-a"));
-        assert_eq!(status.panes[0].geometry.x, 10);
+        assert_eq!(status.panes[0].geometry.x, 10.0);
         assert!(matches!(
             status.panes[0].render_mode,
             PaneRenderMode::ExternalNative { .. }
         ));
         assert_eq!(status.panes[1].id, PaneId::new("pane-b"));
-        assert_eq!(status.panes[1].geometry.x, 320);
+        assert_eq!(status.panes[1].geometry.x, 320.0);
         assert!(matches!(
             status.panes[1].render_mode,
             PaneRenderMode::ExternalNative { .. }
@@ -1188,10 +1264,10 @@ mod tests {
             .apply_provider_snapshot(vec![ProviderPaneSnapshot {
                 id: PaneId::new("pane-a"),
                 geometry: PaneGeometry {
-                    x: 0,
-                    y: 0,
-                    width: 640,
-                    height: 480,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 640.0,
+                    height: 480.0,
                     coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
             }])
@@ -1331,10 +1407,10 @@ mod tests {
             .apply_provider_snapshot(vec![ProviderPaneSnapshot {
                 id: PaneId::new("pane-a"),
                 geometry: PaneGeometry {
-                    x: 0,
-                    y: 0,
-                    width: 320,
-                    height: 240,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 320.0,
+                    height: 240.0,
                     coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
             }])
@@ -1347,10 +1423,10 @@ mod tests {
                 launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
-                    x: 0,
-                    y: 0,
-                    width: 320,
-                    height: 240,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 320.0,
+                    height: 240.0,
                     coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
                 target: NativeTargetClass::Terminal,
@@ -1407,10 +1483,10 @@ mod tests {
             .apply_provider_snapshot(vec![ProviderPaneSnapshot {
                 id: PaneId::new("pane-a"),
                 geometry: PaneGeometry {
-                    x: 0,
-                    y: 0,
-                    width: 640,
-                    height: 480,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 640.0,
+                    height: 480.0,
                     coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
             }])
@@ -1441,10 +1517,10 @@ mod tests {
             .apply_provider_snapshot(vec![ProviderPaneSnapshot {
                 id: PaneId::new("pane-a"),
                 geometry: PaneGeometry {
-                    x: 0,
-                    y: 0,
-                    width: 640,
-                    height: 480,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 640.0,
+                    height: 480.0,
                     coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
             }])
@@ -1515,10 +1591,10 @@ mod tests {
             .apply_provider_snapshot(vec![ProviderPaneSnapshot {
                 id: PaneId::new("pane-a"),
                 geometry: PaneGeometry {
-                    x: 0,
-                    y: 0,
-                    width: 640,
-                    height: 480,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 640.0,
+                    height: 480.0,
                     coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
             }])
@@ -1624,10 +1700,10 @@ mod tests {
                     launch_token: None,
                     revision: 0,
                     geometry: PaneGeometry {
-                        x: 10,
-                        y: 20,
-                        width: 300,
-                        height: 200,
+                        x: 10.0,
+                        y: 20.0,
+                        width: 300.0,
+                        height: 200.0,
                         coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
@@ -1653,7 +1729,7 @@ mod tests {
 
         assert!(launch_response.ok);
         let status = launch_response.status.expect("status should be returned");
-        assert_eq!(status.panes[0].geometry.x, 10);
+        assert_eq!(status.panes[0].geometry.x, 10.0);
         assert_eq!(
             status.panes[0].external_native_state,
             ExternalNativeLifecycleState::Launching { pid: 42 }
@@ -1680,10 +1756,10 @@ mod tests {
                     launch_token: None,
                     revision: 1,
                     geometry: PaneGeometry {
-                        x: 10,
-                        y: 20,
-                        width: 300,
-                        height: 200,
+                        x: 10.0,
+                        y: 20.0,
+                        width: 300.0,
+                        height: 200.0,
                         coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
@@ -1742,7 +1818,7 @@ mod tests {
         assert_eq!(native_host.binding_id.as_deref(), Some("binding-a"));
         assert_eq!(native_host.revision, 1);
         assert_eq!(native_host.surface_id, Some(101));
-        assert_eq!(status.panes[0].geometry.x, 10);
+        assert_eq!(status.panes[0].geometry.x, 10.0);
         assert!(status.overlay_role_policy.active_overlay_pane.is_none());
 
         let missing_response = handle_request(
@@ -1781,10 +1857,10 @@ mod tests {
                     launch_token: None,
                     revision: 1,
                     geometry: PaneGeometry {
-                        x: 10,
-                        y: 20,
-                        width: 300,
-                        height: 200,
+                        x: 10.0,
+                        y: 20.0,
+                        width: 300.0,
+                        height: 200.0,
                         coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
@@ -1815,10 +1891,10 @@ mod tests {
                     launch_token: None,
                     revision: 2,
                     geometry: PaneGeometry {
-                        x: 30,
-                        y: 40,
-                        width: 320,
-                        height: 220,
+                        x: 30.0,
+                        y: 40.0,
+                        width: 320.0,
+                        height: 220.0,
                         coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
@@ -1834,7 +1910,7 @@ mod tests {
         );
         assert!(update_response.ok);
         let status = update_response.status.expect("status should be returned");
-        assert_eq!(status.panes[0].geometry.x, 30);
+        assert_eq!(status.panes[0].geometry.x, 30.0);
         assert_eq!(
             status.panes[0].external_native_state,
             ExternalNativeLifecycleState::Launching { pid: 42 }
@@ -1876,10 +1952,10 @@ mod tests {
                 panes: vec![ProviderPaneSnapshot {
                     id: PaneId::new("pane-a"),
                     geometry: PaneGeometry {
-                        x: 10,
-                        y: 20,
-                        width: 300,
-                        height: 200,
+                        x: 10.0,
+                        y: 20.0,
+                        width: 300.0,
+                        height: 200.0,
                         coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                 }],
@@ -1898,10 +1974,10 @@ mod tests {
                     launch_token: None,
                     revision: 1,
                     geometry: PaneGeometry {
-                        x: 10,
-                        y: 20,
-                        width: 300,
-                        height: 200,
+                        x: 10.0,
+                        y: 20.0,
+                        width: 300.0,
+                        height: 200.0,
                         coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
@@ -1996,6 +2072,7 @@ mod tests {
     #[test]
     fn capture_screen_returns_error_when_no_frame_is_available() {
         let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.mark_runtime_resize(1, 1);
         let screen_capture = ScreenCaptureStore::default();
         let output_path = std::env::temp_dir().join("surf-ace-no-frame-capture.png");
 
@@ -2018,15 +2095,19 @@ mod tests {
     #[test]
     fn capture_screen_writes_png_to_requested_path() {
         let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.mark_runtime_resize(1, 1);
         let screen_capture = ScreenCaptureStore::default();
-        screen_capture.update_from_scanout_xrgb8888(
+        screen_capture.update_root4_scanout_xrgb8888(
             &[0x10, 0x20, 0x30, 0x00],
             4,
             1,
             1,
             false,
-            OutputRotation::Deg0,
+            state.root_geometry_snapshot().expect("root4 geometry"),
+            &[],
         );
+        let captured_generation = state.root_geometry_snapshot().unwrap().generation;
+        state.set_root4_display_scale(1.5).unwrap();
         let output_path = std::env::temp_dir().join(format!(
             "surf-ace-control-capture-{}.png",
             std::process::id()
@@ -2047,8 +2128,96 @@ mod tests {
             response.capture_path.as_deref(),
             Some(output_path_string.as_str())
         );
+        assert_eq!(
+            response.geometry.unwrap().root_geometry_generation,
+            captured_generation
+        );
         let metadata = std::fs::metadata(&output_path).expect("capture png should exist");
         assert!(metadata.len() > 0);
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn capture_pane_uses_committed_pane_rect_and_frame_generation() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.mark_runtime_resize(4, 4);
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: PaneId::new("pane"),
+                content_id: Some("content".to_string()),
+                binding_id: Some("binding".to_string()),
+                launch_token: None,
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+                target: NativeTargetClass::Terminal,
+                process: ProcessSpec {
+                    command: "foot".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                },
+            }])
+            .unwrap();
+        let geometry = state.root_geometry_snapshot().unwrap();
+        let screen_capture = ScreenCaptureStore::default();
+        let pane_capture =
+            geometry.capture_geometry(state.root4_pane_logical_rect(&PaneId::new("pane")).unwrap());
+        screen_capture.update_root4_scanout_xrgb8888(
+            &[0x44; 4 * 4 * 4],
+            16,
+            4,
+            4,
+            false,
+            geometry,
+            &[(PaneId::new("pane"), pane_capture)],
+        );
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: PaneId::new("pane"),
+                content_id: Some("content".to_string()),
+                binding_id: Some("binding".to_string()),
+                launch_token: None,
+                revision: 2,
+                geometry: PaneGeometry {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 2.0,
+                    height: 2.0,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+                target: NativeTargetClass::Terminal,
+                process: ProcessSpec {
+                    command: "foot".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                },
+            }])
+            .unwrap();
+        let output_path = std::env::temp_dir().join(format!(
+            "surf-ace-control-pane-capture-{}.png",
+            std::process::id()
+        ));
+        let response = handle_request_with_capture(
+            &mut state,
+            ControlRequest::CapturePane {
+                pane_id: PaneId::new("pane"),
+                output_path: output_path.display().to_string(),
+            },
+            None,
+            &screen_capture,
+        );
+        assert!(response.ok);
+        let applied = response.geometry.unwrap();
+        assert_eq!(applied.root_geometry_generation, geometry.generation);
+        assert_eq!(applied.physical_pixel_rect.width, 2);
+        assert_eq!(applied.physical_pixel_rect.height, 2);
         let _ = std::fs::remove_file(output_path);
     }
 
