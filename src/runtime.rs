@@ -120,7 +120,7 @@ use smithay::wayland::shm::{BufferAccessError, ShmHandler, ShmState, with_buffer
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::viewporter::ViewporterState;
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::OpenOptions;
 use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsFd, BorrowedFd};
@@ -1020,7 +1020,7 @@ pub fn run_host_with_control(
                     }
                 }
                 UdevEvent::Removed { device_id } => {
-                    if let Err(err) = data.host_backend.remove_device(device_id as u64) {
+                    if let Err(err) = data.handle_host_device_removed(device_id as u64) {
                         eprintln!("host backend failed to remove drm device: {err}");
                     }
                 }
@@ -1278,6 +1278,7 @@ impl HostRuntimeLoopData {
         // dispatched between pinning this identity and queuing its frame.
         self.wayland_state.presentation_root_geometry =
             self.wayland_state.staged_root_geometry.clone();
+        let flip_device_id = self.host_backend.presentation_device_id();
         let queued = self
             .host_backend
             .queue_claimed_presentation_tick(&mut self.wayland_state);
@@ -1289,7 +1290,10 @@ impl HostRuntimeLoopData {
                 .staged_root_geometry
                 .as_mut()
                 .expect("staged presentation must remain installed")
-                .mark_flip_queued(token);
+                .mark_flip_queued(
+                    token,
+                    flip_device_id.expect("queued presentation must retain its owning device"),
+                );
         }
         queued
     }
@@ -1588,6 +1592,47 @@ impl HostRuntimeLoopData {
         {
             return false;
         }
+        self.discard_staged_root_geometry_after_flip_resolution(error)
+    }
+
+    fn handle_host_device_removed(&mut self, device_id: u64) -> Result<(), RuntimeError> {
+        let removal = self.host_backend.remove_device(device_id);
+        self.resolve_lost_presentation_flip(device_id, "owning DRM device was removed");
+        removal
+    }
+
+    fn resolve_lost_presentation_flip(&mut self, device_id: u64, reason: &str) -> bool {
+        let Some((token, generation)) =
+            self.wayland_state
+                .staged_root_geometry
+                .as_ref()
+                .and_then(|transaction| {
+                    if transaction.pending_flip_device_id != Some(device_id) {
+                        return None;
+                    }
+                    Some((
+                        transaction.pending_flip?,
+                        transaction.committed.snapshot.generation,
+                    ))
+                })
+        else {
+            return false;
+        };
+
+        self.discard_staged_root_geometry_after_flip_resolution(
+            crate::root_geometry::RootGeometryError::DisplayScaleApplyFailed,
+        );
+        lock_state(&self.shared_state).record_runtime_diagnostic(format!(
+            "root4 presentation flip lost: device_id={device_id} token={} staged_generation={generation}; prior committed generation retained; {reason}",
+            token.0
+        ));
+        true
+    }
+
+    fn discard_staged_root_geometry_after_flip_resolution(
+        &mut self,
+        error: crate::root_geometry::RootGeometryError,
+    ) -> bool {
         if let Some(prepared) = self.wayland_state.staged_root_geometry.take() {
             self.host_backend
                 .discard_stage(prepared.committed.snapshot.generation);
@@ -1817,20 +1862,56 @@ fn bind_claimed_drm_event_source(
         .insert_source(
             Generic::new(drm_events_fd, Interest::READ, CalloopMode::Level),
             move |_, _fd, data| {
+                if data.host_backend.presentation_device_id() != Some(device_id) {
+                    let mut source = token_state_for_cb.borrow_mut();
+                    if source.device_id == Some(device_id) {
+                        *source = RegisteredDrmEventSource::default();
+                    }
+                    return Ok(PostAction::Remove);
+                }
                 if let Err(failure) = process_claimed_drm_event_source(data) {
                     if failure.is_reclaimable() {
                         let transaction_has_queued_flip = data
                             .wayland_state
                             .staged_root_geometry
                             .as_ref()
-                            .is_some_and(|transaction| transaction.pending_flip.is_some());
+                            .is_some_and(|transaction| {
+                                transaction.pending_flip.is_some()
+                                    && transaction.pending_flip_device_id == Some(device_id)
+                            });
                         if transaction_has_queued_flip
-                            || data.host_backend.claimed_pipeline_has_pending_flip()
+                            || data
+                                .host_backend
+                                .device_has_pending_presentation_flip(device_id)
                         {
-                            eprintln!(
-                                "host DRM event read failed while a presentation transaction is awaiting its exact KMS completion: {}",
-                                failure.error_ref()
+                            let event_error = failure.error_ref().to_string();
+                            let reset_result = data
+                                .host_backend
+                                .reset_device_after_event_stream_loss(device_id);
+                            let reset_detail = reset_result
+                                .err()
+                                .map(|error| format!("; device reset failed: {error}"))
+                                .unwrap_or_default();
+                            let transaction_resolved = data.resolve_lost_presentation_flip(
+                                device_id,
+                                "owning DRM event stream was lost",
                             );
+                            if !transaction_resolved {
+                                lock_state(&data.shared_state).record_runtime_diagnostic(format!(
+                                    "host DRM event stream lost with pending flip: device_id={device_id}; {event_error}{reset_detail}"
+                                ));
+                            }
+                            eprintln!(
+                                "host DRM event stream lost with a pending presentation flip on device {device_id}: {event_error}{reset_detail}"
+                            );
+                            if data.host_backend.needs_output_reclaim() {
+                                mark_host_output_reclaim_pending(
+                                    data,
+                                    format!(
+                                        "host DRM event stream lost on device {device_id}: {event_error}{reset_detail}"
+                                    ),
+                                );
+                            }
                             *token_state_for_cb.borrow_mut() =
                                 RegisteredDrmEventSource::default();
                             return Ok(PostAction::Remove);
@@ -2613,14 +2694,25 @@ impl HostBackendState {
         self.claimed_output.is_none() && self.prepared_reclaim_output.is_none()
     }
 
-    fn claimed_pipeline_has_pending_flip(&self) -> bool {
-        let Some(claimed) = self.claimed_output.as_ref() else {
-            return false;
-        };
+    fn device_has_pending_presentation_flip(&self, device_id: u64) -> bool {
         self.opened_devices
-            .get(&claimed.device_id)
-            .and_then(|opened| opened.claimed_pipeline.as_ref())
+            .get(&device_id)
+            .and_then(|opened| {
+                opened
+                    .claimed_pipeline
+                    .as_ref()
+                    .or(opened.prepared_pipeline.as_ref())
+            })
             .is_some_and(|pipeline| pipeline.flip_pending)
+    }
+
+    fn reset_device_after_event_stream_loss(&mut self, device_id: u64) -> Result<(), RuntimeError> {
+        let path = self.detected_devices.get(&device_id).cloned();
+        self.close_device(device_id)?;
+        if let Some(path) = path {
+            self.open_device(device_id, &path)?;
+        }
+        Ok(())
     }
 
     fn arm_prepared_reclaim_for_presentation(&mut self) -> Result<(), RuntimeError> {
@@ -5899,6 +5991,8 @@ struct RuntimeWaylandState {
     native_pane_toplevels: HashMap<PaneId, ToplevelSurface>,
     pending_toplevels: Vec<ToplevelSurface>,
     popups: Vec<ManagedPopup>,
+    pressed_pointer_buttons: HashSet<u32>,
+    canceled_pointer_button_releases: HashSet<u32>,
     pointer_location: Point<f64, Logical>,
     pointer_location_initialized: bool,
     start_time: std::time::Instant,
@@ -5929,6 +6023,7 @@ struct HostPresentationTransaction {
     topology: crate::model::StatusSnapshot,
     accepted_material_identity: Option<AcceptedMaterialIdentity>,
     pending_flip: Option<PresentationToken>,
+    pending_flip_device_id: Option<u64>,
     disappeared_native_owner: Option<PaneId>,
 }
 
@@ -5979,15 +6074,23 @@ enum Root4ConsumerStage {
 }
 
 impl HostPresentationTransaction {
-    fn mark_flip_queued(&mut self, token: PresentationToken) {
+    fn mark_flip_queued(&mut self, token: PresentationToken, device_id: u64) {
         debug_assert!(self.pending_flip.is_none());
         self.pending_flip = Some(token);
+        self.pending_flip_device_id = Some(device_id);
     }
 
     fn take_completed_flip(&mut self, completed: &[PresentationToken]) -> bool {
-        self.pending_flip
+        if self
+            .pending_flip
             .take_if(|pending| completed.contains(pending))
             .is_some()
+        {
+            self.pending_flip_device_id = None;
+            true
+        } else {
+            false
+        }
     }
 
     fn is_coherent(&self) -> bool {
@@ -6167,6 +6270,7 @@ fn stage_runtime_root_geometry_consumers(
         topology: status_snapshot,
         accepted_material_identity: None,
         pending_flip: None,
+        pending_flip_device_id: None,
         disappeared_native_owner: None,
     };
     if staged.is_coherent() {
@@ -7170,6 +7274,8 @@ impl RuntimeWaylandState {
             native_pane_toplevels: HashMap::new(),
             pending_toplevels: Vec::new(),
             popups: Vec::new(),
+            pressed_pointer_buttons: HashSet::new(),
+            canceled_pointer_button_releases: HashSet::new(),
             pointer_location: software_cursor_default_location(initial_pointer_output_size),
             pointer_location_initialized: false,
             start_time: std::time::Instant::now(),
@@ -7332,6 +7438,75 @@ impl RuntimeWaylandState {
         self.sync_runtime_dmabuf_protocol_status();
     }
 
+    fn forward_pointer_button(&mut self, button: u32, state: ButtonState, time: u32) {
+        if state == ButtonState::Pressed {
+            self.pressed_pointer_buttons.insert(button);
+        } else {
+            self.pressed_pointer_buttons.remove(&button);
+            if self.canceled_pointer_button_releases.remove(&button) {
+                return;
+            }
+        }
+
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let serial = SERIAL_COUNTER.next_serial();
+        if state == ButtonState::Pressed && !pointer.is_grabbed() {
+            let (_, status) = self.input_operation_snapshot();
+            let surface_under = self.surface_under_point_for_capture(
+                self.pointer_location,
+                OverlayCaptureCapability::PointerButton,
+                &status,
+            );
+            pointer.motion(
+                self,
+                surface_under.clone(),
+                &MotionEvent {
+                    location: self.pointer_location,
+                    serial,
+                    time,
+                },
+            );
+            let focus_target = surface_under.map(|(surface, _)| surface);
+            if let Some(keyboard) = self.seat.get_keyboard() {
+                keyboard.set_focus(self, focus_target, serial);
+            }
+        }
+        pointer.button(
+            self,
+            &ButtonEvent {
+                button,
+                state,
+                serial,
+                time,
+            },
+        );
+        pointer.frame(self);
+    }
+
+    fn forward_pointer_motion(&mut self, location: Point<f64, Logical>, time: u32) {
+        let location = self.update_pointer_location(location);
+        let (_, status) = self.input_operation_snapshot();
+        let under = self.surface_under_point_for_capture(
+            location,
+            OverlayCaptureCapability::PointerHover,
+            &status,
+        );
+        if let Some(pointer) = self.seat.get_pointer() {
+            pointer.motion(
+                self,
+                under,
+                &MotionEvent {
+                    location,
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time,
+                },
+            );
+            pointer.frame(self);
+        }
+    }
+
     fn forward_input_event<B: InputBackend>(&mut self, event: InputEvent<B>) {
         self.process_input_event(&event);
     }
@@ -7381,7 +7556,7 @@ impl RuntimeWaylandState {
             }
             InputEvent::PointerMotion { event, .. } => {
                 let delta = event.delta();
-                let (snapshot, status) = self.input_operation_snapshot();
+                let snapshot = self.input_operation_snapshot().0;
                 let (dx, dy) = snapshot
                     .map(|snapshot| {
                         let (dx, dy) = OutputRotationModel::new(snapshot.rotation)
@@ -7389,31 +7564,13 @@ impl RuntimeWaylandState {
                         (dx / snapshot.factor, dy / snapshot.factor)
                     })
                     .unwrap_or((delta.x, delta.y));
-                let pos = self.update_pointer_location(
+                self.forward_pointer_motion(
                     (self.pointer_location.x + dx, self.pointer_location.y + dy).into(),
+                    event.time_msec(),
                 );
-                let serial = SERIAL_COUNTER.next_serial();
-
-                let under = self.surface_under_point_for_capture(
-                    pos,
-                    OverlayCaptureCapability::PointerHover,
-                    &status,
-                );
-                if let Some(pointer) = self.seat.get_pointer() {
-                    pointer.motion(
-                        self,
-                        under,
-                        &MotionEvent {
-                            location: pos,
-                            serial,
-                            time: event.time_msec(),
-                        },
-                    );
-                    pointer.frame(self);
-                }
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
-                let (snapshot, status) = self.input_operation_snapshot();
+                let snapshot = self.input_operation_snapshot().0;
                 let physical_size = snapshot
                     .map(|snapshot| snapshot.physical_size_px)
                     .map(|size| Size::<i32, Physical>::from((size.width, size.height)))
@@ -7424,64 +7581,10 @@ impl RuntimeWaylandState {
                     .map(|snapshot| snapshot.physical_to_logical(physical_pos.x, physical_pos.y))
                     .map(Point::from)
                     .unwrap_or_else(|| self.map_physical_pointer_point_to_logical(physical_pos));
-                let pos = self.update_pointer_location(logical_pos);
-                let serial = SERIAL_COUNTER.next_serial();
-
-                let under = self.surface_under_point_for_capture(
-                    pos,
-                    OverlayCaptureCapability::PointerHover,
-                    &status,
-                );
-                if let Some(pointer) = self.seat.get_pointer() {
-                    pointer.motion(
-                        self,
-                        under,
-                        &MotionEvent {
-                            location: pos,
-                            serial,
-                            time: event.time_msec(),
-                        },
-                    );
-                    pointer.frame(self);
-                }
+                self.forward_pointer_motion(logical_pos, event.time_msec());
             }
             InputEvent::PointerButton { event, .. } => {
-                if let Some(pointer) = self.seat.get_pointer() {
-                    let serial = SERIAL_COUNTER.next_serial();
-                    if event.state() == ButtonState::Pressed && !pointer.is_grabbed() {
-                        // A native implicit grab keeps its original owner through release.
-                        let (_, status) = self.input_operation_snapshot();
-                        let surface_under = self.surface_under_point_for_capture(
-                            self.pointer_location,
-                            OverlayCaptureCapability::PointerButton,
-                            &status,
-                        );
-                        pointer.motion(
-                            self,
-                            surface_under.clone(),
-                            &MotionEvent {
-                                location: self.pointer_location,
-                                serial,
-                                time: event.time_msec(),
-                            },
-                        );
-                        let focus_target =
-                            surface_under.as_ref().map(|(surface, _)| surface.clone());
-                        if let Some(keyboard) = self.seat.get_keyboard() {
-                            keyboard.set_focus(self, focus_target, serial);
-                        }
-                    }
-                    pointer.button(
-                        self,
-                        &ButtonEvent {
-                            button: event.button_code(),
-                            state: event.state(),
-                            serial,
-                            time: event.time_msec(),
-                        },
-                    );
-                    pointer.frame(self);
-                }
+                self.forward_pointer_button(event.button_code(), event.state(), event.time_msec());
             }
             InputEvent::PointerAxis { event, .. } => {
                 if let Some(pointer) = self.seat.get_pointer() {
@@ -7613,7 +7716,105 @@ impl RuntimeWaylandState {
         }
     }
 
-    fn note_native_pane_owner_disappeared(&mut self, pane_id: &PaneId) {
+    fn native_pane_surface_tree_contains(
+        &self,
+        pane_id: &PaneId,
+        root: &WlSurface,
+        candidate: &WlSurface,
+    ) -> bool {
+        surface_tree_contains(root, candidate)
+            || self.popups.iter().any(|popup| {
+                matches!(
+                    &popup.owner_role,
+                    RuntimeSurfaceRole::NativePane(owner) if owner == pane_id
+                ) && surface_tree_contains(popup.surface.wl_surface(), candidate)
+            })
+    }
+
+    fn cancel_native_pane_grabs(
+        &mut self,
+        pane_id: &PaneId,
+        root: &WlSurface,
+    ) -> (bool, bool, usize) {
+        let pointer = self.seat.get_pointer();
+        let cancel_pointer = pointer
+            .as_ref()
+            .and_then(|pointer| pointer.grab_start_data())
+            .and_then(|start| start.focus.map(|(surface, _)| surface))
+            .is_some_and(|surface| self.native_pane_surface_tree_contains(pane_id, root, &surface));
+
+        let mut suppressed_pointer_releases = 0;
+        let pointer_grab_canceled = if cancel_pointer {
+            if let Some(pointer) = pointer {
+                let serial = SERIAL_COUNTER.next_serial();
+                let time = self.start_time.elapsed().as_millis() as u32;
+                pointer.unset_grab(self, serial, time);
+                pointer.motion(
+                    self,
+                    None,
+                    &MotionEvent {
+                        location: self.pointer_location,
+                        serial,
+                        time,
+                    },
+                );
+                pointer.frame(self);
+
+                let held_buttons = self.pressed_pointer_buttons.drain().collect::<Vec<_>>();
+                suppressed_pointer_releases = held_buttons.len();
+                for button in held_buttons.iter().copied() {
+                    pointer.button(
+                        self,
+                        &ButtonEvent {
+                            button,
+                            state: ButtonState::Released,
+                            serial,
+                            time,
+                        },
+                    );
+                }
+                if !held_buttons.is_empty() {
+                    pointer.frame(self);
+                    self.canceled_pointer_button_releases.extend(held_buttons);
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let keyboard_grab_canceled = self.seat.get_keyboard().is_some_and(|keyboard| {
+            let belongs_to_native_pane = keyboard
+                .grab_start_data()
+                .and_then(|start| start.focus)
+                .is_some_and(|surface| {
+                    self.native_pane_surface_tree_contains(pane_id, root, &surface)
+                });
+            if belongs_to_native_pane {
+                keyboard.unset_grab(self);
+            }
+            belongs_to_native_pane
+        });
+
+        (
+            pointer_grab_canceled,
+            keyboard_grab_canceled,
+            suppressed_pointer_releases,
+        )
+    }
+
+    fn note_native_pane_owner_disappeared(
+        &mut self,
+        pane_id: &PaneId,
+        pointer_grab_canceled: bool,
+        keyboard_grab_canceled: bool,
+        suppressed_pointer_releases: usize,
+    ) {
+        let interaction_diagnostic = format!(
+            "pointer grab canceled={pointer_grab_canceled}; keyboard grab canceled={keyboard_grab_canceled}; suppressed held pointer releases={suppressed_pointer_releases}"
+        );
         let affected_generation = self
             .staged_root_geometry
             .as_mut()
@@ -7634,16 +7835,16 @@ impl RuntimeWaylandState {
             });
         let diagnostic = match affected_generation {
             Some((generation, true)) => format!(
-                "native pane owner disappeared: pane_id={}; root4 generation {generation} remains tied to its queued KMS completion; native grab remains until release and future focus targets Surf Ace's main surface when available",
-                pane_id.0.as_str()
+                "native pane owner disappeared: pane_id={}; root4 generation {generation} remains tied to its queued KMS completion; {interaction_diagnostic}; future focus targets Surf Ace's main surface when available",
+                pane_id.0.as_str(),
             ),
             Some((generation, false)) => format!(
-                "native pane owner disappeared: pane_id={}; unqueued root4 generation {generation} canceled; native grab remains until release and future focus targets Surf Ace's main surface when available",
-                pane_id.0.as_str()
+                "native pane owner disappeared: pane_id={}; unqueued root4 generation {generation} canceled; {interaction_diagnostic}; future focus targets Surf Ace's main surface when available",
+                pane_id.0.as_str(),
             ),
             None => format!(
-                "native pane owner disappeared: pane_id={}; native grab remains until release and future focus targets Surf Ace's main surface when available",
-                pane_id.0.as_str()
+                "native pane owner disappeared: pane_id={}; {interaction_diagnostic}; future focus targets Surf Ace's main surface when available",
+                pane_id.0.as_str(),
             ),
         };
         lock_state(&self.shared_state).record_runtime_diagnostic(diagnostic);
@@ -9513,12 +9714,26 @@ impl XdgShellHandler for RuntimeWaylandState {
                     (surface_key(item.wl_surface()) == destroyed_id).then(|| pane_id.clone())
                 });
         if let Some(pane_id) = destroyed_native_pane {
+            let root_surface = self
+                .native_pane_toplevels
+                .get(&pane_id)
+                .map(|native| native.wl_surface().clone());
+            let (pointer_grab_canceled, keyboard_grab_canceled, suppressed_pointer_releases) =
+                root_surface
+                    .as_ref()
+                    .map(|root| self.cancel_native_pane_grabs(&pane_id, root))
+                    .unwrap_or((false, false, 0));
             if let Some(native) = self.native_pane_toplevels.remove(&pane_id) {
                 if let Some(pid) = self.client_pid_for_toplevel(&native) {
                     self.bridge_native_pane_surface_detached(pid);
                 }
             }
-            self.note_native_pane_owner_disappeared(&pane_id);
+            self.note_native_pane_owner_disappeared(
+                &pane_id,
+                pointer_grab_canceled,
+                keyboard_grab_canceled,
+                suppressed_pointer_releases,
+            );
         }
         let mut removed_popup_ids = Vec::new();
         self.popups.retain(|popup| {
@@ -10248,6 +10463,18 @@ fn same_surface(left: &WlSurface, right: &WlSurface) -> bool {
     surface_key(left) == surface_key(right)
 }
 
+fn surface_tree_contains(root: &WlSurface, candidate: &WlSurface) -> bool {
+    let mut found = false;
+    with_surface_tree_downward(
+        root,
+        (),
+        |_, _, &()| TraversalAction::DoChildren(()),
+        |surface, _, &()| found |= same_surface(surface, candidate),
+        |_, _, &()| true,
+    );
+    found
+}
+
 fn surface_id(surface: &WlSurface) -> u32 {
     surface.id().protocol_id()
 }
@@ -10323,7 +10550,7 @@ mod tests {
         remap_damage_to_materialized_destination, source_rect_from_bbox_and_geometry,
         stage_runtime_root_geometry_consumers,
         transform_from_rotation, embedded_toplevel_decoration_mode,
-        activate_root_geometry_stage, install_root_geometry_stage, lock_state,
+        activate_root_geometry_stage, install_root_geometry_stage, lock_state, ButtonState,
     };
     use crate::output_rotation_model::OutputRotationModel;
     use crate::model::{
@@ -10348,6 +10575,7 @@ mod tests {
     use smithay::reexports::drm::control::Mode as DrmMode;
     use smithay::utils::{Buffer as BufferCoords, Logical, Physical, Point, Rectangle, Size, Transform};
     use std::fs::OpenOptions;
+    use std::collections::HashSet;
     use std::os::fd::{AsFd, OwnedFd};
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
@@ -10356,11 +10584,226 @@ mod tests {
     use wayland_client::globals::registry_queue_init;
     use wayland_client::protocol::{
         wl_buffer, wl_callback, wl_compositor, wl_registry, wl_region, wl_shm, wl_shm_pool,
-        wl_subcompositor, wl_subsurface, wl_surface,
+        wl_pointer, wl_seat, wl_subcompositor, wl_subsurface, wl_surface,
     };
     use wayland_protocols::xdg::shell::client::{
         xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
     };
+
+    #[derive(Debug)]
+    enum NativeGrabClientEvent {
+        Created {
+            main_surface_id: u32,
+            native_surface_id: u32,
+        },
+        Ready,
+        Enter(u32),
+        Leave(u32),
+        Motion(Option<u32>),
+        Button {
+            focused_surface_id: Option<u32>,
+            button: u32,
+            pressed: bool,
+        },
+        NativeRoleDestroyed,
+    }
+
+    struct NativeGrabClientState {
+        events: mpsc::Sender<NativeGrabClientEvent>,
+        configured_surfaces: HashSet<u32>,
+        native_surface_id: u32,
+        focused_surface_id: Option<u32>,
+        native_toplevel: Option<xdg_toplevel::XdgToplevel>,
+        destroy_native_on_press: bool,
+        pointer: Option<wl_pointer::WlPointer>,
+    }
+
+    impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListContents>
+        for NativeGrabClientState
+    {
+        fn event(
+            _state: &mut Self,
+            _proxy: &wl_registry::WlRegistry,
+            _event: wl_registry::Event,
+            _data: &wayland_client::globals::GlobalListContents,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<xdg_wm_base::XdgWmBase, ()> for NativeGrabClientState {
+        fn event(
+            _state: &mut Self,
+            proxy: &xdg_wm_base::XdgWmBase,
+            event: xdg_wm_base::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            if let xdg_wm_base::Event::Ping { serial } = event {
+                proxy.pong(serial);
+            }
+        }
+    }
+
+    impl Dispatch<xdg_surface::XdgSurface, u32> for NativeGrabClientState {
+        fn event(
+            state: &mut Self,
+            proxy: &xdg_surface::XdgSurface,
+            event: xdg_surface::Event,
+            surface_id: &u32,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            if let xdg_surface::Event::Configure { serial } = event {
+                proxy.ack_configure(serial);
+                state.configured_surfaces.insert(*surface_id);
+            }
+        }
+    }
+
+    impl Dispatch<wl_seat::WlSeat, ()> for NativeGrabClientState {
+        fn event(
+            state: &mut Self,
+            proxy: &wl_seat::WlSeat,
+            event: wl_seat::Event,
+            _data: &(),
+            _conn: &Connection,
+            qh: &QueueHandle<Self>,
+        ) {
+            if let wl_seat::Event::Capabilities { capabilities } = event
+                && capabilities.contains(wl_seat::Capability::Pointer)
+                && state.pointer.is_none()
+            {
+                state.pointer = Some(proxy.get_pointer(qh, ()));
+            }
+        }
+    }
+
+    impl Dispatch<wl_pointer::WlPointer, ()> for NativeGrabClientState {
+        fn event(
+            state: &mut Self,
+            _proxy: &wl_pointer::WlPointer,
+            event: wl_pointer::Event,
+            _data: &(),
+            conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            match event {
+                wl_pointer::Event::Enter { surface, .. } => {
+                    let surface_id = surface.id().protocol_id();
+                    state.focused_surface_id = Some(surface_id);
+                    let _ = state.events.send(NativeGrabClientEvent::Enter(surface_id));
+                }
+                wl_pointer::Event::Leave { surface, .. } => {
+                    let surface_id = surface.id().protocol_id();
+                    if state.focused_surface_id == Some(surface_id) {
+                        state.focused_surface_id = None;
+                    }
+                    let _ = state.events.send(NativeGrabClientEvent::Leave(surface_id));
+                }
+                wl_pointer::Event::Motion { .. } => {
+                    let _ = state
+                        .events
+                        .send(NativeGrabClientEvent::Motion(state.focused_surface_id));
+                }
+                wl_pointer::Event::Button {
+                    button,
+                    state: button_state,
+                    ..
+                } => {
+                    let pressed = format!("{button_state:?}").contains("Pressed");
+                    let focused_surface_id = state.focused_surface_id;
+                    let _ = state.events.send(NativeGrabClientEvent::Button {
+                        focused_surface_id,
+                        button,
+                        pressed,
+                    });
+                    if pressed
+                        && focused_surface_id == Some(state.native_surface_id)
+                        && state.destroy_native_on_press
+                    {
+                        state.destroy_native_on_press = false;
+                        if let Some(toplevel) = state.native_toplevel.as_ref() {
+                            toplevel.destroy();
+                            let _ = conn.flush();
+                            let _ = state
+                                .events
+                                .send(NativeGrabClientEvent::NativeRoleDestroyed);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    delegate_noop!(NativeGrabClientState: ignore wl_compositor::WlCompositor);
+    delegate_noop!(NativeGrabClientState: ignore wl_surface::WlSurface);
+    delegate_noop!(NativeGrabClientState: ignore xdg_toplevel::XdgToplevel);
+
+    fn spawn_native_grab_client(
+        socket: UnixStream,
+        events: mpsc::Sender<NativeGrabClientEvent>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let connection = Connection::from_socket(socket).expect("client socket must connect");
+            let (globals, mut queue) = registry_queue_init::<NativeGrabClientState>(&connection)
+                .expect("native grab fixture globals must roundtrip");
+            let qh = queue.handle();
+            let compositor = globals
+                .bind::<wl_compositor::WlCompositor, _, _>(&qh, 1..=6, ())
+                .expect("wl_compositor must exist");
+            let wm_base = globals
+                .bind::<xdg_wm_base::XdgWmBase, _, _>(&qh, 1..=6, ())
+                .expect("xdg_wm_base must exist");
+            let seat = globals
+                .bind::<wl_seat::WlSeat, _, _>(&qh, 1..=9, ())
+                .expect("wl_seat must exist");
+
+            let main_surface = compositor.create_surface(&qh, ());
+            let main_surface_id = main_surface.id().protocol_id();
+            let main_xdg_surface = wm_base.get_xdg_surface(&main_surface, &qh, main_surface_id);
+            let _main_toplevel = main_xdg_surface.get_toplevel(&qh, ());
+            main_surface.commit();
+
+            let native_surface = compositor.create_surface(&qh, ());
+            let native_surface_id = native_surface.id().protocol_id();
+            let native_xdg_surface =
+                wm_base.get_xdg_surface(&native_surface, &qh, native_surface_id);
+            let native_toplevel = native_xdg_surface.get_toplevel(&qh, ());
+            native_surface.commit();
+
+            let mut state = NativeGrabClientState {
+                events: events.clone(),
+                configured_surfaces: HashSet::new(),
+                native_surface_id,
+                focused_surface_id: None,
+                native_toplevel: Some(native_toplevel),
+                destroy_native_on_press: true,
+                pointer: None,
+            };
+            connection.flush().expect("toplevel requests must flush");
+            events
+                .send(NativeGrabClientEvent::Created {
+                    main_surface_id,
+                    native_surface_id,
+                })
+                .expect("test must receive created surface ids");
+
+            while state.configured_surfaces.len() < 2 || state.pointer.is_none() {
+                queue
+                    .blocking_dispatch(&mut state)
+                    .expect("server must configure both real client toplevels and seat");
+            }
+            events
+                .send(NativeGrabClientEvent::Ready)
+                .expect("test must receive client readiness");
+
+            while queue.blocking_dispatch(&mut state).is_ok() {}
+        })
+    }
 
     #[derive(Default)]
     struct SurfaceTreeClient {
@@ -11296,7 +11739,7 @@ mod tests {
             .staged_root_geometry
             .as_mut()
             .unwrap()
-            .mark_flip_queued(PresentationToken(10));
+            .mark_flip_queued(PresentationToken(10), 1);
         assert!(!runtime.complete_root_geometry_presentations(&[PresentationToken(9)]));
         assert_eq!(
             lock_state(&runtime.shared_state).root_geometry_snapshot(),
@@ -11334,7 +11777,7 @@ mod tests {
             .staged_root_geometry
             .as_mut()
             .unwrap()
-            .mark_flip_queued(PresentationToken(11));
+            .mark_flip_queued(PresentationToken(11), 1);
         assert!(runtime.complete_root_geometry_presentations(&[PresentationToken(11)]));
         assert_eq!(rotation_rx.recv().unwrap(), Ok(()));
 
@@ -11655,7 +12098,7 @@ mod tests {
             .staged_root_geometry
             .as_mut()
             .unwrap()
-            .mark_flip_queued(PresentationToken(25));
+            .mark_flip_queued(PresentationToken(25), 1);
         assert!(!runtime.complete_root_geometry_presentations(&[PresentationToken(24)]));
         assert!(runtime.host_backend.retired_claim.is_some());
         assert_eq!(
@@ -11749,7 +12192,7 @@ mod tests {
 
         runtime
             .wayland_state
-            .note_native_pane_owner_disappeared(&pane_id);
+            .note_native_pane_owner_disappeared(&pane_id, false, false, 0);
         let failure = runtime
             .queue_pinned_presentation_tick()
             .expect_err("a disappeared native owner must cancel before KMS queueing");
@@ -11791,6 +12234,13 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("future focus targets Surf Ace's main surface when available")
+        );
+        assert!(
+            status
+                .last_diagnostic
+                .as_deref()
+                .unwrap()
+                .contains("pointer grab canceled=false; keyboard grab canceled=false; suppressed held pointer releases=0")
         );
     }
 
@@ -11834,12 +12284,12 @@ mod tests {
         let transaction = runtime.wayland_state.staged_root_geometry.as_mut().unwrap();
         let geometry_frame = PresentationToken(7);
         assert!(!transaction.take_completed_flip(&[geometry_frame]));
-        transaction.mark_flip_queued(geometry_frame);
+        transaction.mark_flip_queued(geometry_frame, 1);
         assert!(!transaction.take_completed_flip(&[]));
         assert!(!transaction.take_completed_flip(&[PresentationToken(6)]));
         assert!(transaction.take_completed_flip(&[geometry_frame]));
         assert!(!transaction.take_completed_flip(&[geometry_frame]));
-        transaction.mark_flip_queued(PresentationToken(8));
+        transaction.mark_flip_queued(PresentationToken(8), 1);
         assert!(!runtime.discard_staged_root_geometry(
             crate::root_geometry::RootGeometryError::DisplayScaleApplyFailed,
         ));
@@ -11854,6 +12304,89 @@ mod tests {
         );
         assert!(runtime.complete_root_geometry_presentations(&[PresentationToken(8)]));
         assert!(runtime.wayland_state.staged_root_geometry.is_none());
+    }
+
+    #[test]
+    fn removed_flip_owner_fails_head_and_continues_fifo_from_committed_generation() {
+        let (mut runtime, _event_loop, capture) = test_host_runtime_loop();
+        runtime
+            .host_backend
+            .detected_devices
+            .insert(41, PathBuf::from("/dev/dri/card-test"));
+        let active_generation = lock_state(&runtime.shared_state)
+            .root_geometry_snapshot()
+            .unwrap()
+            .generation;
+        let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+        runtime
+            .root_geometry_queue
+            .push(RuntimeGeometryMutation::Rotation {
+                rotation: OutputRotation::Deg90,
+                response: response_tx,
+            });
+        runtime
+            .root_geometry_queue
+            .push(RuntimeGeometryMutation::Scale {
+                factor: 1.25,
+                source: crate::root_geometry::DisplayScaleSource::Config,
+            });
+        runtime.stage_next_root_geometry_mutation();
+        let lost = PresentationToken(77);
+        runtime
+            .wayland_state
+            .staged_root_geometry
+            .as_mut()
+            .unwrap()
+            .mark_flip_queued(lost, 41);
+        assert!(!runtime.resolve_lost_presentation_flip(42, "unrelated device removed"));
+        assert!(runtime.wayland_state.staged_root_geometry.is_some());
+        let staged_generation = runtime
+            .wayland_state
+            .staged_root_geometry
+            .as_ref()
+            .unwrap()
+            .committed
+            .snapshot
+            .generation;
+        assert_eq!(
+            capture.root4_generations_for_test(),
+            (None, Some(staged_generation))
+        );
+
+        runtime
+            .handle_host_device_removed(41)
+            .expect("device removal boundary must resolve the lost flip");
+        assert!(!runtime.host_backend.detected_devices.contains_key(&41));
+
+        assert_eq!(
+            response_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("the rotation response must be completed"),
+            Err(crate::root_geometry::RootGeometryError::DisplayScaleApplyFailed)
+        );
+        assert!(runtime.wayland_state.staged_root_geometry.is_none());
+        assert_eq!(capture.root4_generations_for_test(), (None, None));
+        assert_eq!(
+            lock_state(&runtime.shared_state)
+                .root_geometry_snapshot()
+                .unwrap()
+                .generation,
+            active_generation,
+            "a removed flip owner must leave every committed consumer on its prior generation"
+        );
+        let diagnostic = lock_state(&runtime.shared_state)
+            .status_snapshot()
+            .runtime
+            .last_diagnostic
+            .expect("lost flip must publish a status diagnostic");
+        assert!(diagnostic.contains("device_id=41"));
+        assert!(diagnostic.contains("token=77"));
+        assert!(diagnostic.contains("prior committed generation retained"));
+
+        runtime.stage_next_root_geometry_mutation();
+        assert_eq!(runtime.pending_geometry_mutation, Some((2, "scale")));
+        assert!(runtime.wayland_state.staged_root_geometry.is_some());
+        assert!(runtime.root_geometry_queue.pending.is_empty());
     }
 
     #[test]
@@ -11881,7 +12414,7 @@ mod tests {
             .staged_root_geometry
             .as_mut()
             .unwrap()
-            .mark_flip_queued(matching);
+            .mark_flip_queued(matching, 1);
         assert_eq!(store.events, [("begin", prepared.snapshot.generation)]);
         assert_eq!(
             wayland.staged_root_geometry.as_ref().unwrap().pending_flip,
@@ -12255,6 +12788,270 @@ mod tests {
         );
         release_main.send(()).unwrap();
         release_overlay.send(()).unwrap();
+    }
+
+    #[test]
+    fn destroying_native_toplevel_cancels_held_pointer_grab_and_returns_input_to_main() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.mark_runtime_resize(1920, 1080);
+        let pane_id = PaneId::new("native-grab-owner");
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: pane_id.clone(),
+                content_id: Some("terminal-content".to_string()),
+                binding_id: Some("native-grab-binding".to_string()),
+                launch_token: None,
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 10.0,
+                    y: 10.0,
+                    width: 100.0,
+                    height: 100.0,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+                target: NativeTargetClass::Terminal,
+                process: ProcessSpec {
+                    command: "foot".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: Default::default(),
+                },
+            }])
+            .expect("native pane test plan must be accepted");
+        let shared_state = Arc::new(Mutex::new(state));
+        let mut display: Display<RuntimeWaylandState> = Display::new().unwrap();
+        let display_handle = display.handle();
+        let mut wayland =
+            RuntimeWaylandState::new(display_handle.clone(), Arc::clone(&shared_state)).unwrap();
+        let (server_socket, client_socket) = UnixStream::pair().unwrap();
+        display_handle
+            .insert_client(
+                server_socket,
+                Arc::new(super::RuntimeClientState::default()),
+            )
+            .unwrap();
+        let (events_tx, events_rx) = mpsc::channel();
+        let client_thread = spawn_native_grab_client(client_socket, events_tx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let (main_surface_id, native_surface_id) = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "real client must finish registry setup"
+            );
+            display.dispatch_clients(&mut wayland).unwrap();
+            display.flush_clients().unwrap();
+            match events_rx.try_recv() {
+                Ok(NativeGrabClientEvent::Created {
+                    main_surface_id,
+                    native_surface_id,
+                }) => break (main_surface_id, native_surface_id),
+                Ok(event) => panic!("unexpected real-client setup event: {event:?}"),
+                Err(mpsc::TryRecvError::Empty) => std::thread::yield_now(),
+                Err(error) => panic!("real client event stream ended during setup: {error}"),
+            }
+        };
+
+        let main_toplevel = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "both real client toplevels must be offered"
+            );
+            display.dispatch_clients(&mut wayland).unwrap();
+            display.flush_clients().unwrap();
+            let main = wayland
+                .pending_toplevels
+                .iter()
+                .find(|surface| super::surface_id(surface.wl_surface()) == main_surface_id)
+                .cloned();
+            let native = wayland
+                .pending_toplevels
+                .iter()
+                .find(|surface| super::surface_id(surface.wl_surface()) == native_surface_id)
+                .cloned();
+            if let (Some(main), Some(native)) = (main, native) {
+                wayland.pending_toplevels.retain(|surface| {
+                    let id = super::surface_id(surface.wl_surface());
+                    id != main_surface_id && id != native_surface_id
+                });
+                wayland.assign_main_role(main.clone());
+                wayland.assign_native_pane_role(native, pane_id.clone(), std::process::id());
+                break main;
+            }
+            std::thread::yield_now();
+        };
+        lock_state(&shared_state).set_runtime_focus_target(Some(RuntimeFocusTarget::NativePane {
+            pane_id: pane_id.clone(),
+        }));
+        wayland.apply_focus_route();
+        display.flush_clients().unwrap();
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "real client must acknowledge both toplevel configures and bind its pointer"
+            );
+            display.dispatch_clients(&mut wayland).unwrap();
+            display.flush_clients().unwrap();
+            match events_rx.try_recv() {
+                Ok(NativeGrabClientEvent::Ready) => break,
+                Ok(event) => panic!("unexpected event before real-client readiness: {event:?}"),
+                Err(mpsc::TryRecvError::Empty) => std::thread::yield_now(),
+                Err(error) => panic!("real client event stream ended before readiness: {error}"),
+            }
+        }
+
+        wayland.forward_pointer_motion((20.0, 20.0).into(), 10);
+        wayland.forward_pointer_button(0x110, ButtonState::Pressed, 11);
+        display.flush_clients().unwrap();
+        let mut saw_native_press = false;
+        let mut saw_native_role_destroy_request = false;
+        while !saw_native_press || !saw_native_role_destroy_request {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "real client must observe a held native-pane press and destroy its toplevel role"
+            );
+            match events_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(NativeGrabClientEvent::Button {
+                    focused_surface_id: Some(surface_id),
+                    button,
+                    pressed: true,
+                }) if surface_id == native_surface_id && button == 0x110 => {
+                    saw_native_press = true;
+                }
+                Ok(NativeGrabClientEvent::NativeRoleDestroyed) => {
+                    saw_native_role_destroy_request = true;
+                }
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    display.dispatch_clients(&mut wayland).unwrap();
+                    display.flush_clients().unwrap();
+                }
+                Err(error) => panic!("real client exited before native press: {error}"),
+            }
+        }
+
+        while wayland.native_pane_toplevels.contains_key(&pane_id) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "server must process the client's xdg_toplevel.destroy request"
+            );
+            display.dispatch_clients(&mut wayland).unwrap();
+            display.flush_clients().unwrap();
+            std::thread::yield_now();
+        }
+        let pointer = wayland.seat.get_pointer().unwrap();
+        assert!(
+            !pointer.is_grabbed(),
+            "native owner loss must end its click grab"
+        );
+        assert!(wayland.canceled_pointer_button_releases.contains(&0x110));
+        assert!(
+            lock_state(&shared_state)
+                .status_snapshot()
+                .runtime
+                .last_diagnostic
+                .as_deref()
+                .unwrap()
+                .contains("pointer grab canceled=true; keyboard grab canceled=false")
+        );
+
+        wayland.forward_pointer_motion((200.0, 200.0).into(), 12);
+        display.flush_clients().unwrap();
+        let mut saw_main_motion = false;
+        while !saw_main_motion {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "motion after native role destruction must reach the main surface"
+            );
+            match events_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(NativeGrabClientEvent::Motion(Some(surface_id)))
+                    if surface_id == main_surface_id =>
+                {
+                    saw_main_motion = true;
+                }
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    display.dispatch_clients(&mut wayland).unwrap();
+                    display.flush_clients().unwrap();
+                }
+                Err(error) => panic!("real client exited before main-surface motion: {error}"),
+            }
+        }
+
+        wayland.forward_pointer_button(0x110, ButtonState::Released, 13);
+        display.flush_clients().unwrap();
+        let release_deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        while std::time::Instant::now() < release_deadline {
+            if let Ok(NativeGrabClientEvent::Button {
+                focused_surface_id,
+                button,
+                pressed: false,
+            }) = events_rx.recv_timeout(std::time::Duration::from_millis(10))
+            {
+                panic!(
+                    "canceled held release must not reach any client surface: button={button} focused_surface={focused_surface_id:?}"
+                );
+            }
+        }
+
+        wayland.forward_pointer_button(0x110, ButtonState::Pressed, 14);
+        display.flush_clients().unwrap();
+        let mut saw_main_press = false;
+        while !saw_main_press {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a new button press after cancellation must reach Surf Ace's main surface"
+            );
+            match events_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(NativeGrabClientEvent::Button {
+                    focused_surface_id: Some(surface_id),
+                    button,
+                    pressed: true,
+                }) if surface_id == main_surface_id && button == 0x110 => {
+                    saw_main_press = true;
+                }
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    display.dispatch_clients(&mut wayland).unwrap();
+                    display.flush_clients().unwrap();
+                }
+                Err(error) => panic!("real client exited before main-surface press: {error}"),
+            }
+        }
+        wayland.forward_pointer_button(0x110, ButtonState::Released, 15);
+        display.flush_clients().unwrap();
+        let mut saw_main_release = false;
+        while !saw_main_release {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the new main-surface click must receive its matching release"
+            );
+            match events_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(NativeGrabClientEvent::Button {
+                    focused_surface_id: Some(surface_id),
+                    button,
+                    pressed: false,
+                }) if surface_id == main_surface_id && button == 0x110 => {
+                    saw_main_release = true;
+                }
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    display.dispatch_clients(&mut wayland).unwrap();
+                    display.flush_clients().unwrap();
+                }
+                Err(error) => panic!("real client exited before main-surface release: {error}"),
+            }
+        }
+
+        assert!(super::same_surface(
+            main_toplevel.wl_surface(),
+            wayland.main_toplevel.as_ref().unwrap().wl_surface()
+        ));
+        drop(wayland);
+        drop(display_handle);
+        drop(display);
+        client_thread
+            .join()
+            .expect("real Wayland client must exit after server disconnect");
     }
 
     #[test]
