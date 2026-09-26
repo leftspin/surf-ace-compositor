@@ -1614,11 +1614,7 @@ impl HostRuntimeLoopData {
         loop_handle: &LoopHandle<'_, HostRuntimeLoopData>,
         drm_events_source_token: &Rc<RefCell<RegisteredDrmEventSource>>,
     ) -> Result<(), RuntimeError> {
-        invalidate_drm_event_source_for_device(
-            loop_handle,
-            drm_events_source_token,
-            device_id,
-        );
+        invalidate_drm_event_source_for_device(loop_handle, drm_events_source_token, device_id);
         let refresh = self.host_backend.upsert_device(device_id, path);
         self.resolve_lost_presentation_flip(
             device_id,
@@ -12451,12 +12447,10 @@ mod tests {
         let event_source_token = loop_handle
             .insert_source(Timer::immediate(), |_, _, _| TimeoutAction::Drop)
             .expect("test DRM event source must register");
-        let event_source = std::rc::Rc::new(std::cell::RefCell::new(
-            RegisteredDrmEventSource {
-                token: Some(event_source_token),
-                device_id: Some(41),
-            },
-        ));
+        let event_source = std::rc::Rc::new(std::cell::RefCell::new(RegisteredDrmEventSource {
+            token: Some(event_source_token),
+            device_id: Some(41),
+        }));
         let path = PathBuf::from("/dev/null");
         runtime
             .host_backend
@@ -12464,10 +12458,10 @@ mod tests {
             .insert(41, path.clone());
         let mut pipeline = test_pipeline(false);
         pipeline.flip_pending = true;
-        runtime.host_backend.opened_devices.insert(
-            41,
-            test_opened_device("/dev/null", Some(pipeline), None),
-        );
+        runtime
+            .host_backend
+            .opened_devices
+            .insert(41, test_opened_device("/dev/null", Some(pipeline), None));
         runtime.host_backend.claimed_output = Some(test_claimed_output(41, "/dev/null"));
 
         let active_generation = lock_state(&runtime.shared_state)
@@ -12505,12 +12499,7 @@ mod tests {
             .mark_flip_queued(PresentationToken(77), 41);
 
         let _refresh_error = runtime
-            .handle_host_device_changed(
-                41,
-                path,
-                &loop_handle,
-                &event_source,
-            )
+            .handle_host_device_changed(41, path, &loop_handle, &event_source)
             .expect_err("/dev/null cannot be reopened as a DRM card");
         assert!(event_source.borrow().token.is_none());
         assert_eq!(event_source.borrow().device_id, None);
