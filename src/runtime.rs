@@ -12964,18 +12964,19 @@ mod tests {
 
         wayland.forward_pointer_motion((200.0, 200.0).into(), 12);
         display.flush_clients().unwrap();
-        let mut saw_main_motion = false;
+        let mut saw_main_pointer_focus = false;
         let mut observed_pointer_events = Vec::new();
-        while !saw_main_motion {
+        while !saw_main_pointer_focus {
             assert!(
                 std::time::Instant::now() < deadline,
-                "motion after native role destruction must reach the main surface; observed={observed_pointer_events:?}"
+                "pointer focus after native role destruction must reach the main surface; observed={observed_pointer_events:?}"
             );
             match events_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok(NativeGrabClientEvent::Motion(Some(surface_id)))
-                    if surface_id == main_surface_id =>
-                {
-                    saw_main_motion = true;
+                Ok(NativeGrabClientEvent::Enter(surface_id)
+                    | NativeGrabClientEvent::Motion(Some(surface_id)))
+                    if surface_id == main_surface_id => saw_main_pointer_focus = true,
+                Ok(NativeGrabClientEvent::Leave(surface_id)) => {
+                    observed_pointer_events.push(format!("Leave({surface_id})"));
                 }
                 Ok(event) => observed_pointer_events.push(format!("{event:?}")),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
