@@ -11760,10 +11760,14 @@ mod tests {
                 .to_string()
                 .contains("native pane owner native-owner disappeared")
         );
-        assert_eq!(capture.root4_generations_for_test(), (None, None));
+        assert_eq!(
+            capture.root4_generations_for_test(),
+            (None, Some(staged_generation))
+        );
         assert!(!runtime.discard_staged_root_geometry(
             crate::root_geometry::RootGeometryError::DisplayScaleApplyFailed,
         ));
+        assert_eq!(capture.root4_generations_for_test(), (None, None));
         assert!(runtime.wayland_state.staged_root_geometry.is_none());
         assert_eq!(
             lock_state(&runtime.shared_state)
