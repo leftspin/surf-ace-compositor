@@ -3031,6 +3031,9 @@ mod tests {
         state
             .launch_native_pane_hosts(Vec::new())
             .expect("empty launch set should launch all planned native panes");
+        state
+            .launch_native_pane_hosts(Vec::new())
+            .expect("repeated same-identity request should stay idempotent");
 
         let status = state.status_snapshot();
         assert_eq!(

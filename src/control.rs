@@ -708,7 +708,7 @@ fn main_app_binding_diagnostics(
     .to_string();
     let process_lineage_status = match expected.as_ref().map(|expectation| expectation.pid) {
         Some(expected_pid)
-            if evidence.process.pid == expected_pid || evidence.process.ppid == expected_pid =>
+            if crate::runtime::pid_matches_or_descends_from(evidence.process.pid, expected_pid) =>
         {
             "matched"
         }

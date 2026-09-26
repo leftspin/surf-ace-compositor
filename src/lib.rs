@@ -1,3 +1,4 @@
+pub mod child_supervisor;
 pub mod control;
 pub mod host_sun_schedule_profile;
 pub mod model;

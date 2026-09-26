@@ -402,6 +402,17 @@ enum Command {
         #[arg(long)]
         output_path: String,
     },
+    #[command(hide = true)]
+    ChildSupervisor {
+        #[arg(long)]
+        socket_path: String,
+        #[arg(long)]
+        nonce: String,
+        #[arg(long)]
+        unit_name: String,
+        #[arg(long)]
+        slot: u32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -416,6 +427,17 @@ struct RuntimeLaunchPlan {
 fn main() {
     let Cli { launch, command } = Cli::parse();
     match command {
+        Some(Command::ChildSupervisor {
+            socket_path,
+            nonce,
+            unit_name,
+            slot,
+        }) => std::process::exit(surf_ace_compositor::child_supervisor::run_supervisor(
+            &socket_path,
+            &nonce,
+            &unit_name,
+            slot,
+        )),
         None => {
             let launch = launch.as_deref().unwrap_or_else(|| {
                 eprintln!("missing subcommand; use 'serve' or pass --launch <command>");

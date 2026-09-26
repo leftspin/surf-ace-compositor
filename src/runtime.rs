@@ -6826,7 +6826,7 @@ fn toplevel_identity(surface: &ToplevelSurface) -> (Option<String>, Option<Strin
     })
 }
 
-fn pid_matches_or_descends_from(pid: u32, expected_ancestor: u32) -> bool {
+pub(crate) fn pid_matches_or_descends_from(pid: u32, expected_ancestor: u32) -> bool {
     if pid == expected_ancestor {
         return true;
     }
@@ -12787,6 +12787,34 @@ mod tests {
     fn process_lineage_match_accepts_exact_pid() {
         let pid = std::process::id();
         assert!(pid_matches_or_descends_from(pid, pid));
+    }
+
+    #[test]
+    fn process_lineage_match_accepts_multi_level_descendant() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+        use std::process::Stdio;
+
+        let script = "sh -c 'sleep 30 & echo $!; wait' & wait";
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdout(Stdio::piped())
+            .process_group(0);
+        let mut launch = command.spawn().expect("nested process tree should start");
+        let stdout = launch.stdout.take().expect("stdout should be piped");
+        let mut line = String::new();
+        std::io::BufReader::new(stdout)
+            .read_line(&mut line)
+            .expect("grandchild pid should be written");
+        let descendant = line.trim().parse::<u32>().expect("pid should be numeric");
+        assert!(pid_matches_or_descends_from(descendant, launch.id()));
+        let group = rustix::process::Pid::from_raw(launch.id() as i32)
+            .expect("spawned launch pid is positive");
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        let _ = launch.wait();
     }
 
     #[test]
