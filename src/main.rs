@@ -284,12 +284,20 @@ fn apply_current_appearance_inputs(
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
+    apply_appearance_inputs(&mut state, solar_status, preference);
+    next_transition
+}
+
+fn apply_appearance_inputs(
+    state: &mut CompositorState,
+    solar_status: SunScheduleAppearanceStatus,
+    preference: DesktopColorSchemePreference,
+) {
     state.set_runtime_sun_schedule_appearance(solar_status);
     state.set_runtime_desktop_color_scheme(
         preference.status_appearance(),
         preference.status_source(),
     );
-    next_transition
 }
 
 #[derive(Debug, Parser)]
@@ -1344,13 +1352,14 @@ fn parse_output_rotation(value: &str) -> Result<OutputRotation, String> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        Cli, Command, parse_main_app_launch_intent, parse_main_app_launch_shorthand,
-        resolve_main_app_launch_intent, resolve_root4_config_scale, resolve_runtime_launch_plan,
-        resolve_startup_output_rotation, spawn_root4_config_watcher,
-    };
+    #[cfg(test)]
+    mod tests {
+        use super::{
+            Cli, Command, apply_appearance_inputs, parse_main_app_launch_intent,
+            parse_main_app_launch_shorthand, resolve_main_app_launch_intent,
+            resolve_root4_config_scale, resolve_runtime_launch_plan,
+            resolve_startup_output_rotation, spawn_root4_config_watcher,
+        };
     use clap::Parser;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1358,11 +1367,16 @@ mod tests {
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
     use surf_ace_compositor::control::RuntimeControlCommand;
+    use surf_ace_compositor::host_sun_schedule_profile::DesktopColorSchemePreference;
     use surf_ace_compositor::model::{
-        MainAppLaunchIntent, MainAppLaunchState, MainAppSurfaceBinding, OutputRotation,
+        EnvironmentAppearance, EnvironmentAppearanceSource, MainAppLaunchIntent,
+        MainAppLaunchState, MainAppSurfaceBinding, NodeSunScheduleProfile, OutputRotation,
         RuntimeSelectionMode,
     };
     use surf_ace_compositor::output_rotation_memory::OutputRotationMemory;
+    use surf_ace_compositor::process_manager::LocalProcessController;
+    use surf_ace_compositor::state::CompositorState;
+    use surf_ace_compositor::sun_schedule::evaluate_sun_schedule;
 
     fn temp_rotation_path() -> PathBuf {
         let unique = SystemTime::now()
@@ -1523,6 +1537,53 @@ mod tests {
                 .error
                 .as_deref()
                 .is_some_and(|error| error.contains("/etc/localtime"))
+        );
+    }
+
+    #[test]
+    fn automatic_appearance_inputs_never_report_manual_source() {
+        let profile = NodeSunScheduleProfile {
+            node_id: "racter".to_string(),
+            timezone: "America/Los_Angeles".to_string(),
+            latitude: 37.7749,
+            longitude: -122.4194,
+            node_id_source: None,
+            timezone_source: None,
+            coordinates_source: None,
+            override_source: None,
+        };
+        let mut state = CompositorState::new(true, Box::<LocalProcessController>::default());
+
+        apply_appearance_inputs(
+            &mut state,
+            evaluate_sun_schedule(profile.clone(), 1_718_992_800),
+            DesktopColorSchemePreference::default(),
+        );
+        let solar = state.status_snapshot().runtime;
+        assert_eq!(solar.appearance, EnvironmentAppearance::Light);
+        assert_eq!(
+            solar.appearance_source,
+            EnvironmentAppearanceSource::SunSchedule
+        );
+
+        apply_appearance_inputs(
+            &mut state,
+            evaluate_sun_schedule(profile, 1_718_992_800),
+            DesktopColorSchemePreference {
+                appearance: Some(EnvironmentAppearance::Dark),
+                source_available: true,
+            },
+        );
+        let desktop = state.status_snapshot().runtime;
+        assert_eq!(desktop.appearance, EnvironmentAppearance::Dark);
+        assert_eq!(
+            desktop.appearance_source,
+            EnvironmentAppearanceSource::DesktopPreference
+        );
+        assert_ne!(solar.appearance_source, EnvironmentAppearanceSource::Manual);
+        assert_ne!(
+            desktop.appearance_source,
+            EnvironmentAppearanceSource::Manual
         );
     }
 
