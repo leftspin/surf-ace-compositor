@@ -1013,8 +1013,14 @@ pub fn run_host_with_control(
                     }
                 }
                 UdevEvent::Changed { device_id } => {
-                    if let Some(path) = data.host_backend.path_for(device_id as u64).cloned() {
-                        if let Err(err) = data.host_backend.upsert_device(device_id as u64, path) {
+                    let device_id = device_id as u64;
+                    if let Some(path) = data.host_backend.path_for(device_id).cloned() {
+                        if let Err(err) = data.handle_host_device_changed(
+                            device_id,
+                            path,
+                            &loop_handle_for_udev,
+                            &drm_events_source_token_for_udev,
+                        ) {
                             eprintln!("host backend failed to refresh changed drm device: {err}");
                         }
                     }
@@ -1601,6 +1607,26 @@ impl HostRuntimeLoopData {
         removal
     }
 
+    fn handle_host_device_changed(
+        &mut self,
+        device_id: u64,
+        path: PathBuf,
+        loop_handle: &LoopHandle<'_, HostRuntimeLoopData>,
+        drm_events_source_token: &Rc<RefCell<RegisteredDrmEventSource>>,
+    ) -> Result<(), RuntimeError> {
+        invalidate_drm_event_source_for_device(
+            loop_handle,
+            drm_events_source_token,
+            device_id,
+        );
+        let refresh = self.host_backend.upsert_device(device_id, path);
+        self.resolve_lost_presentation_flip(
+            device_id,
+            "owning DRM device was closed during a udev change",
+        );
+        refresh
+    }
+
     fn resolve_lost_presentation_flip(&mut self, device_id: u64, reason: &str) -> bool {
         let Some((token, generation)) =
             self.wayland_state
@@ -1954,6 +1980,26 @@ fn bind_claimed_drm_event_source(
         device_id: Some(device_id),
     };
     Ok(())
+}
+
+fn invalidate_drm_event_source_for_device(
+    loop_handle: &LoopHandle<'_, HostRuntimeLoopData>,
+    drm_events_source_token: &Rc<RefCell<RegisteredDrmEventSource>>,
+    device_id: u64,
+) {
+    let token = {
+        let mut source = drm_events_source_token.borrow_mut();
+        if source.device_id == Some(device_id) {
+            let token = source.token.take();
+            source.device_id = None;
+            token
+        } else {
+            None
+        }
+    };
+    if let Some(token) = token {
+        loop_handle.remove(token);
+    }
 }
 
 struct HostBackendState {
@@ -10535,7 +10581,8 @@ mod tests {
         RoleSurfaceMapping, Root4ConsumerStage,
         PresentationToken, RuntimeGeometryMutation, RootGeometryStageStore,
         RuntimeGeometryMutationQueue, RuntimeSurfaceRole, RuntimeWaylandState,
-        ShellOverlayToggleShortcut, StartupPresentOwnership, build_host_gles_renderer_state,
+        RegisteredDrmEventSource, ShellOverlayToggleShortcut, StartupPresentOwnership,
+        TimeoutAction, Timer, build_host_gles_renderer_state,
         compile_native_clip_program, complete_pipeline_flip_events,
         materialize_native_surface_elements,
         copy_renderer_pixels_to_dumb,
@@ -12395,6 +12442,115 @@ mod tests {
         assert_eq!(runtime.pending_geometry_mutation, Some((2, "scale")));
         assert!(runtime.wayland_state.staged_root_geometry.is_some());
         assert!(runtime.root_geometry_queue.pending.is_empty());
+    }
+
+    #[test]
+    fn changed_flip_owner_fails_head_and_continues_fifo_from_committed_generation() {
+        let (mut runtime, event_loop, capture) = test_host_runtime_loop();
+        let loop_handle = event_loop.handle();
+        let event_source_token = loop_handle
+            .insert_source(Timer::immediate(), |_, _, _| TimeoutAction::Drop)
+            .expect("test DRM event source must register");
+        let event_source = std::rc::Rc::new(std::cell::RefCell::new(
+            RegisteredDrmEventSource {
+                token: Some(event_source_token),
+                device_id: Some(41),
+            },
+        ));
+        let path = PathBuf::from("/dev/null");
+        runtime
+            .host_backend
+            .detected_devices
+            .insert(41, path.clone());
+        let mut pipeline = test_pipeline(false);
+        pipeline.flip_pending = true;
+        runtime.host_backend.opened_devices.insert(
+            41,
+            test_opened_device("/dev/null", Some(pipeline), None),
+        );
+        runtime.host_backend.claimed_output = Some(test_claimed_output(41, "/dev/null"));
+
+        let active_generation = lock_state(&runtime.shared_state)
+            .root_geometry_snapshot()
+            .unwrap()
+            .generation;
+        let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+        runtime
+            .root_geometry_queue
+            .push(RuntimeGeometryMutation::Rotation {
+                rotation: OutputRotation::Deg90,
+                response: response_tx,
+            });
+        runtime
+            .root_geometry_queue
+            .push(RuntimeGeometryMutation::Scale {
+                factor: 1.25,
+                source: crate::root_geometry::DisplayScaleSource::Config,
+            });
+        runtime.stage_next_root_geometry_mutation();
+        let staged_generation = runtime
+            .wayland_state
+            .staged_root_geometry
+            .as_ref()
+            .unwrap()
+            .committed
+            .snapshot
+            .generation;
+        stage_capture_for_pending_geometry(&runtime);
+        runtime
+            .wayland_state
+            .staged_root_geometry
+            .as_mut()
+            .unwrap()
+            .mark_flip_queued(PresentationToken(77), 41);
+
+        let _refresh_error = runtime
+            .handle_host_device_changed(
+                41,
+                path,
+                &loop_handle,
+                &event_source,
+            )
+            .expect_err("/dev/null cannot be reopened as a DRM card");
+        assert!(event_source.borrow().token.is_none());
+        assert_eq!(event_source.borrow().device_id, None);
+        assert!(!runtime.host_backend.opened_devices.contains_key(&41));
+
+        assert_eq!(
+            response_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("the rotation response must fail when udev resets its DRM owner"),
+            Err(crate::root_geometry::RootGeometryError::DisplayScaleApplyFailed)
+        );
+        assert!(runtime.wayland_state.staged_root_geometry.is_none());
+        assert_eq!(capture.root4_generations_for_test(), (None, None));
+        assert_eq!(
+            lock_state(&runtime.shared_state)
+                .root_geometry_snapshot()
+                .unwrap()
+                .generation,
+            active_generation,
+            "a changed flip owner must retain every consumer's prior committed generation"
+        );
+        assert_committed_root_geometry_generation(
+            &lock_state(&runtime.shared_state),
+            active_generation,
+        );
+        let diagnostic = lock_state(&runtime.shared_state)
+            .status_snapshot()
+            .runtime
+            .last_diagnostic
+            .expect("lost changed-device flip must publish a status diagnostic");
+        assert!(diagnostic.contains("device_id=41"));
+        assert!(diagnostic.contains("token=77"));
+        assert!(diagnostic.contains("prior committed generation retained"));
+        assert!(diagnostic.contains("closed during a udev change"));
+
+        runtime.stage_next_root_geometry_mutation();
+        assert_eq!(runtime.pending_geometry_mutation, Some((2, "scale")));
+        assert!(runtime.wayland_state.staged_root_geometry.is_some());
+        assert!(runtime.root_geometry_queue.pending.is_empty());
+        assert_ne!(staged_generation, active_generation);
     }
 
     #[test]
