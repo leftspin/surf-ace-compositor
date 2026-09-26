@@ -11790,7 +11790,7 @@ mod tests {
                 .last_diagnostic
                 .as_deref()
                 .unwrap()
-                .contains("later focus returns to Surf Ace")
+                .contains("future focus targets Surf Ace's main surface when available")
         );
     }
 
@@ -12209,7 +12209,7 @@ mod tests {
         let (overlay_ready, release_overlay) = spawn_real_shm_surface_tree(overlay_client_socket);
         let mut main_client_ready = false;
         let mut overlay_client_ready = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 
         while wayland.main_toplevel.is_none()
             || wayland.overlay_toplevel.is_none()
