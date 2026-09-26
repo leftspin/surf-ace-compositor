@@ -14,3 +14,7 @@ thiserror = "1.0.61"
 png = "0.17.16"
 smithay = { version = "0.7.0", default-features = false, features = ["backend_winit", "backend_drm", "backend_gbm", "backend_udev", "backend_libinput", "backend_session_libseat", "wayland_frontend"] }
 rustix = "1.0.7"
+
+[dev-dependencies]
+wayland-client = "=0.31.14"
+wayland-protocols = { version = "=0.32.12", features = ["client"] }
