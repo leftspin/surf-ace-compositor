@@ -15,6 +15,11 @@ use crate::output_rotation_memory::OutputRotationMemory;
 use crate::output_rotation_model::OutputRotationModel;
 use crate::overlay_role_policy::{OverlayRolePolicy, OverlayRolePolicyError};
 use crate::process_manager::ProcessController;
+use crate::root_geometry::{
+    CommittedRootGeometry, LogicalRect, RootGeometryAuthority, RootGeometryError,
+    RootGeometrySnapshot,
+};
+use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,7 +39,7 @@ const WAYLAND_TOOLKIT_DEFAULTS: &[(&str, &str)] = &[
     ("MOZ_ENABLE_WAYLAND", "1"),
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct PaneRuntimeState {
     provider_owned: bool,
     geometry: crate::model::PaneGeometry,
@@ -113,6 +118,9 @@ pub enum StateError {
 pub struct CompositorState {
     host_mode_active: bool,
     output_rotation: OutputRotation,
+    root_geometry: Option<RootGeometryAuthority>,
+    root4_surface_viewport: Option<crate::root_geometry::ViewportProjection>,
+    root4_pane_viewports: HashMap<PaneId, crate::root_geometry::ViewportProjection>,
     panes: HashMap<PaneId, PaneRuntimeState>,
     shell_overlay_process: Option<ProcessSpec>,
     shell_overlay_lifecycle: ExternalNativeLifecycleState,
@@ -189,9 +197,25 @@ impl CompositorState {
         process_controller: Box<dyn ProcessController>,
         output_rotation: OutputRotation,
     ) -> Self {
-        Self {
+        Self::new_with_root4_config(host_mode_active, process_controller, output_rotation, None)
+            .expect("default root4 display scale must be valid")
+    }
+
+    pub fn new_with_root4_config(
+        host_mode_active: bool,
+        process_controller: Box<dyn ProcessController>,
+        output_rotation: OutputRotation,
+        config: Option<&Value>,
+    ) -> Result<Self, RootGeometryError> {
+        let root_geometry = host_mode_active
+            .then(|| RootGeometryAuthority::from_config(config))
+            .transpose()?;
+        Ok(Self {
             host_mode_active,
             output_rotation,
+            root_geometry,
+            root4_surface_viewport: None,
+            root4_pane_viewports: HashMap::new(),
             panes: HashMap::new(),
             shell_overlay_process: None,
             shell_overlay_lifecycle: ExternalNativeLifecycleState::Absent,
@@ -205,7 +229,7 @@ impl CompositorState {
             process_controller,
             output_rotation_memory: None,
             launch_token_counter: 0,
-        }
+        })
     }
 
     pub fn remember_output_rotation_with(&mut self, memory: OutputRotationMemory) {
@@ -221,18 +245,199 @@ impl CompositorState {
     }
 
     pub fn set_output_rotation(&mut self, rotation: OutputRotation) {
-        if self.output_rotation == rotation {
-            self.persist_output_rotation(rotation);
-            return;
-        }
+        let _ = self.try_set_output_rotation(rotation);
+    }
+
+    pub fn try_set_output_rotation(
+        &mut self,
+        rotation: OutputRotation,
+    ) -> Result<(), RootGeometryError> {
         let previous_rotation = self.output_rotation;
+        if let Some(root_geometry) = self.root_geometry.as_mut()
+            && root_geometry.committed().is_some()
+        {
+            root_geometry.set_rotation(rotation)?;
+        }
         self.output_rotation = rotation;
-        self.rotate_native_pane_viewports(previous_rotation, rotation);
+        if previous_rotation != rotation {
+            self.rotate_native_pane_viewports(previous_rotation, rotation);
+        }
         self.persist_output_rotation(rotation);
+        Ok(())
     }
 
     pub fn output_rotation(&self) -> OutputRotation {
         self.output_rotation
+    }
+
+    pub fn root_geometry_snapshot(&self) -> Option<RootGeometrySnapshot> {
+        self.root_geometry
+            .as_ref()
+            .and_then(RootGeometryAuthority::committed)
+    }
+
+    pub fn root_geometry_projections(&self) -> Option<CommittedRootGeometry> {
+        self.root_geometry
+            .as_ref()
+            .and_then(RootGeometryAuthority::committed_projections)
+    }
+
+    pub fn root4_pane_logical_rect(&self, pane_id: &PaneId) -> Option<LogicalRect> {
+        let pane = self.panes.get(pane_id)?;
+        Some(LogicalRect {
+            x: pane.geometry.x as f64,
+            y: pane.geometry.y as f64,
+            width: pane.geometry.width as f64,
+            height: pane.geometry.height as f64,
+        })
+    }
+
+    pub fn set_root4_display_scale(
+        &mut self,
+        factor: f64,
+    ) -> Result<RootGeometrySnapshot, RootGeometryError> {
+        self.root_geometry
+            .as_mut()
+            .ok_or(RootGeometryError::DisplayScaleApplyFailed)?
+            .set_scale(factor)
+    }
+
+    pub fn set_root4_display_scale_from_config(
+        &mut self,
+        factor: f64,
+        source: crate::root_geometry::DisplayScaleSource,
+    ) -> Result<RootGeometrySnapshot, RootGeometryError> {
+        self.root_geometry
+            .as_mut()
+            .ok_or(RootGeometryError::DisplayScaleApplyFailed)?
+            .set_scale_from_source(factor, source)
+    }
+
+    pub fn prepare_root4_display_scale_from_config(
+        &self,
+        factor: f64,
+        source: crate::root_geometry::DisplayScaleSource,
+    ) -> Result<CommittedRootGeometry, RootGeometryError> {
+        self.root_geometry
+            .as_ref()
+            .ok_or(RootGeometryError::DisplayScaleApplyFailed)?
+            .prepare_scale(factor, source)
+    }
+
+    pub fn prepare_root4_rotation(
+        &self,
+        rotation: OutputRotation,
+    ) -> Result<CommittedRootGeometry, RootGeometryError> {
+        self.root_geometry
+            .as_ref()
+            .ok_or(RootGeometryError::DisplayScaleApplyFailed)?
+            .prepare_rotation(rotation)
+    }
+
+    pub fn prepare_root4_mode(
+        &self,
+        physical_width: i32,
+        physical_height: i32,
+    ) -> Result<CommittedRootGeometry, RootGeometryError> {
+        self.root_geometry
+            .as_ref()
+            .ok_or(RootGeometryError::DisplayScaleApplyFailed)?
+            .prepare_mode(physical_width, physical_height)
+    }
+
+    pub fn commit_root4_geometry(&mut self, prepared: CommittedRootGeometry) {
+        let previous = self.root_geometry_snapshot();
+        self.output_rotation = prepared.snapshot.rotation;
+        if let Some(authority) = self.root_geometry.as_mut() {
+            authority.commit_prepared(prepared);
+        }
+        if let Some(previous) = previous
+            && previous.rotation != prepared.snapshot.rotation
+        {
+            self.rotate_native_pane_viewports_for_root_geometry(previous, prepared.snapshot);
+            self.persist_output_rotation(self.output_rotation);
+        }
+        self.refresh_root4_viewports();
+    }
+
+    pub fn commit_root4_geometry_consumers(
+        &mut self,
+        prepared: CommittedRootGeometry,
+        surface_viewport: crate::root_geometry::ViewportProjection,
+        pane_viewports: &[(PaneId, crate::root_geometry::ViewportProjection)],
+    ) {
+        self.commit_root4_geometry(prepared);
+        self.root4_surface_viewport = Some(surface_viewport);
+        self.root4_pane_viewports = pane_viewports.iter().cloned().collect();
+    }
+
+    pub fn initialize_root4_geometry(
+        &mut self,
+        physical_width: i32,
+        physical_height: i32,
+    ) -> Result<RootGeometrySnapshot, RootGeometryError> {
+        let initialized = self
+            .root_geometry
+            .as_ref()
+            .ok_or(RootGeometryError::DisplayScaleApplyFailed)?
+            .committed()
+            .is_some();
+        let result = if initialized {
+            self.root_geometry
+                .as_mut()
+                .unwrap()
+                .set_mode(physical_width, physical_height)
+        } else {
+            self.root_geometry.as_mut().unwrap().initialize(
+                physical_width,
+                physical_height,
+                self.output_rotation,
+            )
+        };
+        if result.is_ok() {
+            self.refresh_root4_viewports();
+        }
+        result
+    }
+
+    fn refresh_root4_viewports(&mut self) {
+        let Some(snapshot) = self.root_geometry_snapshot() else {
+            self.root4_surface_viewport = None;
+            self.root4_pane_viewports.clear();
+            return;
+        };
+        self.root4_surface_viewport = Some(snapshot.viewport(LogicalRect {
+            x: 0.0,
+            y: 0.0,
+            width: snapshot.logical_size.width,
+            height: snapshot.logical_size.height,
+        }));
+        self.root4_pane_viewports = self
+            .panes
+            .iter()
+            .map(|(id, pane)| {
+                (
+                    id.clone(),
+                    snapshot.viewport(LogicalRect {
+                        x: pane.geometry.x as f64,
+                        y: pane.geometry.y as f64,
+                        width: pane.geometry.width as f64,
+                        height: pane.geometry.height as f64,
+                    }),
+                )
+            })
+            .collect();
+    }
+
+    pub fn prepare_initial_root4_geometry(
+        &self,
+        physical_width: i32,
+        physical_height: i32,
+    ) -> Result<CommittedRootGeometry, RootGeometryError> {
+        self.root_geometry
+            .as_ref()
+            .ok_or(RootGeometryError::DisplayScaleApplyFailed)?
+            .prepare_initialize(physical_width, physical_height, self.output_rotation)
     }
 
     fn persist_output_rotation(&self, rotation: OutputRotation) {
@@ -537,6 +742,26 @@ impl CompositorState {
     }
 
     pub fn mark_runtime_resize(&mut self, window_width: i32, window_height: i32) {
+        self.runtime.window_width = Some(window_width);
+        self.runtime.window_height = Some(window_height);
+        let Some(root_geometry) = self.root_geometry.as_mut() else {
+            return;
+        };
+        if root_geometry.committed().is_none() {
+            let _ = root_geometry.initialize(window_width, window_height, self.output_rotation);
+        } else if root_geometry.committed().is_some_and(|snapshot| {
+            snapshot.physical_size_px.width != window_width
+                || snapshot.physical_size_px.height != window_height
+        }) {
+            let _ = root_geometry.set_mode(window_width, window_height);
+        }
+    }
+
+    pub(crate) fn mark_runtime_root4_dimensions_committed(
+        &mut self,
+        window_width: i32,
+        window_height: i32,
+    ) {
         self.runtime.window_width = Some(window_width);
         self.runtime.window_height = Some(window_height);
     }
@@ -959,6 +1184,7 @@ impl CompositorState {
             self.panes.contains_key(pane_id) || is_shell_overlay_pane_id(pane_id)
         });
         self.prune_stale_overlay_regions();
+        self.refresh_root4_viewports();
         Ok(())
     }
 
@@ -1088,6 +1314,7 @@ impl CompositorState {
         }
 
         self.prune_stale_overlay_regions();
+        self.refresh_root4_viewports();
         Ok(())
     }
 
@@ -1586,6 +1813,7 @@ impl CompositorState {
             .map(|(id, state)| PaneStatus {
                 id: id.clone(),
                 geometry: state.geometry,
+                viewport: self.root4_pane_viewports.get(id).cloned(),
                 render_mode: state.render_mode.clone(),
                 external_native_state: state.external_native_state.clone(),
                 native_host: match &state.render_mode {
@@ -1629,6 +1857,10 @@ impl CompositorState {
         StatusSnapshot {
             host_mode_active: self.host_mode_active,
             output_rotation: self.output_rotation,
+            display_scale: self
+                .root_geometry_projections()
+                .map(|projections| projections.status.0.status()),
+            surface_viewport: self.root4_surface_viewport.clone(),
             panes,
             native_pane_window_groups,
             overlay_regions: self.overlay_regions_status(),
@@ -1669,6 +1901,10 @@ impl CompositorState {
     }
 
     fn runtime_logical_surface_size(&self) -> Option<(i32, i32)> {
+        if let Some(snapshot) = self.root_geometry_snapshot() {
+            let size = snapshot.logical_size_i32();
+            return Some((size.width, size.height));
+        }
         let width = self.runtime.window_width.filter(|value| *value > 0)?;
         let height = self.runtime.window_height.filter(|value| *value > 0)?;
         Some(OutputRotationModel::new(self.output_rotation).logical_size_i32(width, height))
@@ -1686,7 +1922,13 @@ impl CompositorState {
                 "geometry.coordinateSpace must be compositor_logical".to_string(),
             ));
         }
-        if geometry.width == 0 || geometry.height == 0 {
+        if !geometry.x.is_finite()
+            || !geometry.y.is_finite()
+            || !geometry.width.is_finite()
+            || !geometry.height.is_finite()
+            || geometry.width <= 0.0
+            || geometry.height <= 0.0
+        {
             return Err(StateError::InvalidPaneGeometry(
                 "width and height must be greater than zero".to_string(),
             ));
@@ -1696,14 +1938,14 @@ impl CompositorState {
             return Ok(());
         };
 
-        let left = i64::from(geometry.x);
-        let top = i64::from(geometry.y);
-        let right = left + i64::from(geometry.width);
-        let bottom = top + i64::from(geometry.height);
-        if left < 0
-            || top < 0
-            || right > i64::from(logical_width)
-            || bottom > i64::from(logical_height)
+        let left = geometry.x;
+        let top = geometry.y;
+        let right = left + geometry.width;
+        let bottom = top + geometry.height;
+        if left < 0.0
+            || top < 0.0
+            || right > f64::from(logical_width)
+            || bottom > f64::from(logical_height)
         {
             return Err(StateError::InvalidPaneGeometry(format!(
                 "pane geometry must be compositor_logical and fit logical surface {}x{}; got x={} y={} width={} height={}",
@@ -1719,6 +1961,31 @@ impl CompositorState {
         Ok(())
     }
 
+    fn rotate_native_pane_viewports_for_root_geometry(
+        &mut self,
+        previous: crate::root_geometry::RootGeometrySnapshot,
+        next: crate::root_geometry::RootGeometrySnapshot,
+    ) {
+        let mut changed = false;
+        for pane in self.panes.values_mut() {
+            if !matches!(pane.render_mode, PaneRenderMode::ExternalNative { .. }) {
+                continue;
+            }
+            if let Some(rotated) =
+                rotate_pane_geometry_between_root_geometries(pane.geometry, previous, next)
+            {
+                if rotated != pane.geometry {
+                    pane.geometry = rotated;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.bump_topology_epoch();
+            self.prune_stale_overlay_regions();
+        }
+    }
+
     fn rotate_native_pane_viewports(&mut self, previous: OutputRotation, next: OutputRotation) {
         let Some(physical_width) = self.runtime.window_width.filter(|value| *value > 0) else {
             return;
@@ -1726,7 +1993,6 @@ impl CompositorState {
         let Some(physical_height) = self.runtime.window_height.filter(|value| *value > 0) else {
             return;
         };
-
         let mut changed = false;
         for pane in self.panes.values_mut() {
             if !matches!(pane.render_mode, PaneRenderMode::ExternalNative { .. }) {
@@ -1738,11 +2004,10 @@ impl CompositorState {
                 next,
                 physical_width,
                 physical_height,
-            ) {
-                if rotated != pane.geometry {
-                    pane.geometry = rotated;
-                    changed = true;
-                }
+            ) && rotated != pane.geometry
+            {
+                pane.geometry = rotated;
+                changed = true;
             }
         }
         if changed {
@@ -2020,14 +2285,14 @@ fn rotate_pane_geometry_between_output_rotations(
     if previous == next || physical_width <= 0 || physical_height <= 0 {
         return Some(geometry);
     }
-    if geometry.width == 0 || geometry.height == 0 {
+    if geometry.width <= 0.0 || geometry.height <= 0.0 {
         return None;
     }
 
-    let left = f64::from(geometry.x);
-    let top = f64::from(geometry.y);
-    let right = left + f64::from(geometry.width);
-    let bottom = top + f64::from(geometry.height);
+    let left = geometry.x;
+    let top = geometry.y;
+    let right = left + geometry.width;
+    let bottom = top + geometry.height;
     let corners = [(left, top), (right, top), (left, bottom), (right, bottom)];
     let mapped: Vec<(f64, f64)> = corners
         .into_iter()
@@ -2062,17 +2327,55 @@ fn rotate_pane_geometry_between_output_rotations(
     let clamped_top = min_y.clamp(0.0, f64::from(logical_height.max(1)));
     let clamped_right = max_x.clamp(clamped_left, f64::from(logical_width.max(1)));
     let clamped_bottom = max_y.clamp(clamped_top, f64::from(logical_height.max(1)));
-    let width = (clamped_right - clamped_left).round() as u32;
-    let height = (clamped_bottom - clamped_top).round() as u32;
-    if width == 0 || height == 0 {
+    let width = clamped_right - clamped_left;
+    let height = clamped_bottom - clamped_top;
+    if width <= 0.0 || height <= 0.0 {
         return None;
     }
 
     Some(PaneGeometry {
-        x: clamped_left.round() as i32,
-        y: clamped_top.round() as i32,
+        x: clamped_left,
+        y: clamped_top,
         width,
         height,
+        coordinate_space: geometry.coordinate_space,
+    })
+}
+
+pub(crate) fn rotate_pane_geometry_between_root_geometries(
+    geometry: PaneGeometry,
+    previous: crate::root_geometry::RootGeometrySnapshot,
+    next: crate::root_geometry::RootGeometrySnapshot,
+) -> Option<PaneGeometry> {
+    if geometry.width <= 0.0 || geometry.height <= 0.0 {
+        return None;
+    }
+    let corners = [
+        (geometry.x, geometry.y),
+        (geometry.x + geometry.width, geometry.y),
+        (geometry.x, geometry.y + geometry.height),
+        (geometry.x + geometry.width, geometry.y + geometry.height),
+    ];
+    let mapped: Vec<_> = corners
+        .into_iter()
+        .map(|(x, y)| previous.logical_to_physical(x, y))
+        .map(|(x, y)| next.physical_to_logical(x, y))
+        .collect();
+    let min_x = mapped.iter().map(|(x, _)| *x).fold(f64::INFINITY, f64::min);
+    let min_y = mapped.iter().map(|(_, y)| *y).fold(f64::INFINITY, f64::min);
+    let max_x = mapped
+        .iter()
+        .map(|(x, _)| *x)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let max_y = mapped
+        .iter()
+        .map(|(_, y)| *y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    Some(PaneGeometry {
+        x: min_x,
+        y: min_y,
+        width: max_x - min_x,
+        height: max_y - min_y,
         coordinate_space: geometry.coordinate_space,
     })
 }
@@ -2257,10 +2560,10 @@ mod tests {
         ProviderPaneSnapshot {
             id: PaneId::new(id),
             geometry: PaneGeometry {
-                x,
-                y,
-                width,
-                height,
+                x: f64::from(x),
+                y: f64::from(y),
+                width: f64::from(width),
+                height: f64::from(height),
                 coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
             },
         }
@@ -2376,15 +2679,46 @@ mod tests {
             .expect("external switch should work");
 
         let status = state.status_snapshot();
-        assert_eq!(status.panes[0].geometry.width, 200);
-        assert_eq!(status.panes[0].geometry.height, 100);
+        assert_eq!(status.panes[0].geometry.width, 200.0);
+        assert_eq!(status.panes[0].geometry.height, 100.0);
 
         state
             .apply_provider_snapshot(vec![pane("p-1", 10, 5, 320, 180)])
             .expect("provider snapshot update should apply");
         let status = state.status_snapshot();
-        assert_eq!(status.panes[0].geometry.width, 320);
-        assert_eq!(status.panes[0].geometry.height, 180);
+        assert_eq!(status.panes[0].geometry.width, 320.0);
+        assert_eq!(status.panes[0].geometry.height, 180.0);
+    }
+
+    #[test]
+    fn root4_status_projects_surface_and_pane_viewports_from_one_generation() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state.mark_runtime_resize(3840, 2160);
+        state
+            .apply_provider_snapshot(vec![pane("p-1", 10, 20, 300, 200)])
+            .expect("provider snapshot should apply");
+
+        let status = state.status_snapshot();
+        let surface = status.surface_viewport.expect("surface viewport");
+        let pane = status.panes[0].viewport.clone().expect("pane viewport");
+        assert_eq!((surface.width, surface.height), (1920.0, 1080.0));
+        assert_eq!(
+            (pane.x, pane.y, pane.width, pane.height),
+            (10.0, 20.0, 300.0, 200.0)
+        );
+        assert_eq!(surface.coordinate_space, "root4_oriented_logical");
+        assert_eq!(pane.coordinate_space, "root4_oriented_logical");
+        assert_eq!(surface.display_scale_factor, 2.0);
+        assert_eq!(pane.display_scale_factor, 2.0);
+        assert_eq!(
+            surface.root_geometry_generation,
+            pane.root_geometry_generation
+        );
+        assert_eq!(
+            status.display_scale.unwrap().root_geometry_generation,
+            pane.root_geometry_generation
+        );
     }
 
     #[test]
@@ -2476,10 +2810,10 @@ mod tests {
                     launch_token: None,
                     revision: 1,
                     geometry: PaneGeometry {
-                        x: 0,
-                        y: 0,
-                        width: 640,
-                        height: 720,
+                        x: 0.0,
+                        y: 0.0,
+                        width: 640.0,
+                        height: 720.0,
                         coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
@@ -2492,10 +2826,10 @@ mod tests {
                     launch_token: None,
                     revision: 1,
                     geometry: PaneGeometry {
-                        x: 640,
-                        y: 0,
-                        width: 640,
-                        height: 720,
+                        x: 640.0,
+                        y: 0.0,
+                        width: 640.0,
+                        height: 720.0,
                         coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
@@ -2512,7 +2846,7 @@ mod tests {
         let status = state.status_snapshot();
         assert_eq!(status.panes.len(), 3);
         assert_eq!(status.panes[0].id, PaneId::new("left"));
-        assert_eq!(status.panes[0].geometry.width, 640);
+        assert_eq!(status.panes[0].geometry.width, 640.0);
         assert!(matches!(
             status.panes[0].render_mode,
             PaneRenderMode::ExternalNative { .. }
@@ -2522,7 +2856,7 @@ mod tests {
             ExternalNativeLifecycleState::Absent
         ));
         assert_eq!(status.panes[1].id, PaneId::new("right"));
-        assert_eq!(status.panes[1].geometry.x, 640);
+        assert_eq!(status.panes[1].geometry.x, 640.0);
         assert!(matches!(
             status.panes[1].render_mode,
             PaneRenderMode::ExternalNative { .. }
@@ -2566,10 +2900,10 @@ mod tests {
                 launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
-                    x: 0,
-                    y: 0,
-                    width: 640,
-                    height: 720,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 640.0,
+                    height: 720.0,
                     coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
                 target: NativeTargetClass::Terminal,
@@ -2610,10 +2944,10 @@ mod tests {
                     launch_token: None,
                     revision: 1,
                     geometry: PaneGeometry {
-                        x: 0,
-                        y: 0,
-                        width: 640,
-                        height: 720,
+                        x: 0.0,
+                        y: 0.0,
+                        width: 640.0,
+                        height: 720.0,
                         coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
@@ -2626,10 +2960,10 @@ mod tests {
                     launch_token: None,
                     revision: 1,
                     geometry: PaneGeometry {
-                        x: 640,
-                        y: 0,
-                        width: 640,
-                        height: 720,
+                        x: 640.0,
+                        y: 0.0,
+                        width: 640.0,
+                        height: 720.0,
                         coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
@@ -2748,10 +3082,10 @@ mod tests {
                 launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
-                    x: 0,
-                    y: 0,
-                    width: 640,
-                    height: 720,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 640.0,
+                    height: 720.0,
                     coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
                 target: NativeTargetClass::NativeApp,
@@ -2829,10 +3163,10 @@ mod tests {
                 launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
-                    x: 0,
-                    y: 0,
-                    width: 3840,
-                    height: 2160,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 3840.0,
+                    height: 2160.0,
                     coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
                 target: NativeTargetClass::Terminal,
@@ -2856,10 +3190,10 @@ mod tests {
                 launch_token: None,
                 revision: 2,
                 geometry: PaneGeometry {
-                    x: 0,
-                    y: 0,
-                    width: 2160,
-                    height: 3840,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 2160.0,
+                    height: 3840.0,
                     coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
                 target: NativeTargetClass::Terminal,
@@ -2869,8 +3203,8 @@ mod tests {
 
         let status = state.status_snapshot();
         assert_eq!(status.panes.len(), 1);
-        assert_eq!(status.panes[0].geometry.width, 2160);
-        assert_eq!(status.panes[0].geometry.height, 3840);
+        assert_eq!(status.panes[0].geometry.width, 2160.0);
+        assert_eq!(status.panes[0].geometry.height, 3840.0);
         assert_eq!(
             status.panes[0].geometry.coordinate_space,
             PaneGeometryCoordinateSpace::CompositorLogical
@@ -2896,10 +3230,10 @@ mod tests {
                 launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
-                    x: 0,
-                    y: 0,
-                    width: 3840,
-                    height: 1080,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 3840.0,
+                    height: 1080.0,
                     coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
                 target: NativeTargetClass::Terminal,
@@ -2927,10 +3261,10 @@ mod tests {
         assert_eq!(
             after.panes[0].geometry,
             PaneGeometry {
-                x: 1080,
-                y: 0,
-                width: 1080,
-                height: 3840,
+                x: 1080.0,
+                y: 0.0,
+                width: 1080.0,
+                height: 3840.0,
                 coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
             }
         );
@@ -2989,10 +3323,10 @@ mod tests {
                 launch_token: Some("provider-token-left".to_string()),
                 revision: 1,
                 geometry: PaneGeometry {
-                    x: 0,
-                    y: 0,
-                    width: 640,
-                    height: 720,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 640.0,
+                    height: 720.0,
                     coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
                 target: NativeTargetClass::Terminal,
@@ -3082,10 +3416,10 @@ mod tests {
                 launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
-                    x: 0,
-                    y: 0,
-                    width: 640,
-                    height: 480,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 640.0,
+                    height: 480.0,
                     coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
                 target: NativeTargetClass::Terminal,
@@ -3133,10 +3467,10 @@ mod tests {
                 launch_token: None,
                 revision: 7,
                 geometry: PaneGeometry {
-                    x: 0,
-                    y: 0,
-                    width: 640,
-                    height: 480,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 640.0,
+                    height: 480.0,
                     coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
                 target: NativeTargetClass::Terminal,
@@ -3203,10 +3537,10 @@ mod tests {
                 launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
-                    x: 0,
-                    y: 0,
-                    width: 640,
-                    height: 480,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 640.0,
+                    height: 480.0,
                     coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
                 target: NativeTargetClass::Terminal,
@@ -3312,10 +3646,10 @@ mod tests {
                 launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
-                    x: 0,
-                    y: 0,
-                    width: 300,
-                    height: 200,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 300.0,
+                    height: 200.0,
                     coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
                 target: NativeTargetClass::NativeApp,
@@ -3461,10 +3795,10 @@ mod tests {
                 launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
-                    x: 0,
-                    y: 0,
-                    width: 2160,
-                    height: 3840,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 2160.0,
+                    height: 3840.0,
                     coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
                 target: NativeTargetClass::Terminal,
@@ -3792,10 +4126,10 @@ mod tests {
                     launch_token: None,
                     revision: 0,
                     geometry: PaneGeometry {
-                        x: 0,
-                        y: 0,
-                        width: 100,
-                        height: 100,
+                        x: 0.0,
+                        y: 0.0,
+                        width: 100.0,
+                        height: 100.0,
                         coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
@@ -3808,10 +4142,10 @@ mod tests {
                     launch_token: None,
                     revision: 0,
                     geometry: PaneGeometry {
-                        x: 100,
-                        y: 0,
-                        width: 100,
-                        height: 100,
+                        x: 100.0,
+                        y: 0.0,
+                        width: 100.0,
+                        height: 100.0,
                         coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
@@ -3913,10 +4247,10 @@ mod tests {
                     launch_token: None,
                     revision: 1,
                     geometry: PaneGeometry {
-                        x: 0,
-                        y: 0,
-                        width: 2160,
-                        height: 3840,
+                        x: 0.0,
+                        y: 0.0,
+                        width: 2160.0,
+                        height: 3840.0,
                         coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
@@ -3929,10 +4263,10 @@ mod tests {
                     launch_token: None,
                     revision: 1,
                     geometry: PaneGeometry {
-                        x: 1080,
-                        y: 0,
-                        width: 1080,
-                        height: 3840,
+                        x: 1080.0,
+                        y: 0.0,
+                        width: 1080.0,
+                        height: 3840.0,
                         coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                     },
                     target: NativeTargetClass::Terminal,
@@ -4039,10 +4373,10 @@ mod tests {
                 launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
-                    x: 0,
-                    y: 0,
-                    width: 2160,
-                    height: 3840,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 2160.0,
+                    height: 3840.0,
                     coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
                 target: NativeTargetClass::Terminal,
@@ -4086,10 +4420,10 @@ mod tests {
                 launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
-                    x: 1080,
-                    y: 0,
-                    width: 1080,
-                    height: 3840,
+                    x: 1080.0,
+                    y: 0.0,
+                    width: 1080.0,
+                    height: 3840.0,
                     coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
                 target: NativeTargetClass::Terminal,
@@ -4127,10 +4461,10 @@ mod tests {
                 launch_token: None,
                 revision: 1,
                 geometry: PaneGeometry {
-                    x: 0,
-                    y: 0,
-                    width: 2160,
-                    height: 3840,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 2160.0,
+                    height: 3840.0,
                     coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
                 },
                 target: NativeTargetClass::Terminal,

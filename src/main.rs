@@ -20,8 +20,8 @@ use surf_ace_compositor::output_rotation_memory::{
 };
 use surf_ace_compositor::process_manager::LocalProcessController;
 use surf_ace_compositor::runtime::{
-    HostRuntimeOptions, RuntimeSelectionReport, parse_shell_overlay_toggle_shortcut, run_host,
-    run_winit,
+    HostRuntimeOptions, RuntimeSelectionReport, parse_shell_overlay_toggle_shortcut,
+    run_host_with_control, run_winit,
 };
 use surf_ace_compositor::screen_capture::ScreenCaptureStore;
 use surf_ace_compositor::state::CompositorState;
@@ -74,6 +74,8 @@ enum Command {
         host_drm_device: Option<PathBuf>,
         #[arg(long, env = HOST_OUTPUT_ENV)]
         host_output: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
         #[arg(
             long,
             env = OUTPUT_ROTATION_ENV,
@@ -193,6 +195,7 @@ fn main() {
                     forced_output_name: None,
                 },
                 None,
+                None,
                 Some(launch),
                 "Super+`",
                 false,
@@ -206,6 +209,7 @@ fn main() {
             runtime,
             host_drm_device,
             host_output,
+            config,
             output_rotation,
             output_rotation_state_path,
             main_app_launch_intent_json,
@@ -225,6 +229,7 @@ fn main() {
                     forced_drm_path: host_drm_device,
                     forced_output_name: host_output,
                 },
+                config.as_deref(),
                 main_app_launch_intent_json.as_deref(),
                 launch,
                 &shell_overlay_toggle_shortcut,
@@ -313,6 +318,7 @@ fn run_server(
     socket_path: PathBuf,
     runtime: &str,
     host_options: HostRuntimeOptions,
+    config_path: Option<&Path>,
     main_app_launch_intent_json: Option<&str>,
     launch: Option<&str>,
     shell_overlay_toggle_shortcut: &str,
@@ -321,6 +327,21 @@ fn run_server(
     output_rotation_state_path: Option<PathBuf>,
     sun_schedule_node: Option<&str>,
 ) {
+    let root4_config = match config_path {
+        Some(path) => match fs::read_to_string(path)
+            .map_err(|err| format!("failed to read config {}: {err}", path.display()))
+            .and_then(|contents| {
+                serde_json::from_str::<serde_json::Value>(&contents)
+                    .map_err(|err| format!("invalid config {}: {err}", path.display()))
+            }) {
+            Ok(config) => Some(config),
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
     let launch_plan = resolve_runtime_launch_plan(runtime, detect_host_runtime_capable());
     let output_rotation_memory = output_rotation_state_path
         .or_else(OutputRotationMemory::default_path)
@@ -350,11 +371,18 @@ fn run_server(
             std::process::exit(2);
         }
     };
-    let mut state = CompositorState::new_with_output_rotation(
+    let mut state = match CompositorState::new_with_root4_config(
         launch_plan.host_mode_active,
         Box::new(LocalProcessController::default()),
         startup_output_rotation,
-    );
+        root4_config.as_ref(),
+    ) {
+        Ok(state) => state,
+        Err(err) => {
+            eprintln!("{}", err.code());
+            std::process::exit(2);
+        }
+    };
     if let Some(memory) = output_rotation_memory {
         state.remember_output_rotation_with(memory);
     }
@@ -437,6 +465,10 @@ fn run_server(
             };
             persist_startup_output_rotation_if_explicit(&shared_state, output_rotation);
             let (runtime_control_tx, runtime_control_rx) = mpsc::channel::<RuntimeControlCommand>();
+            if let Some(path) = config_path.map(Path::to_path_buf) {
+                spawn_root4_config_watcher(path, runtime_control_tx.clone());
+            }
+            let runtime_control_rx = Arc::new(Mutex::new(runtime_control_rx));
             let control_state = shared_state.clone();
             let control_runtime_tx = runtime_control_tx.clone();
             let control_screen_capture = screen_capture.clone();
@@ -468,13 +500,22 @@ fn run_server(
 
             drop(runtime_control_tx);
 
-            while let Ok(command) = runtime_control_rx.recv() {
+            loop {
+                let command = {
+                    let receiver = match runtime_control_rx.lock() {
+                        Ok(receiver) => receiver,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    receiver.recv()
+                };
+                let Ok(command) = command else { break };
                 match command {
                     RuntimeControlCommand::StartHostRuntime => {
-                        if let Err(err) = run_host(
+                        if let Err(err) = run_host_with_control(
                             shared_state.clone(),
                             screen_capture.clone(),
                             host_options.clone(),
+                            Some(runtime_control_rx.clone()),
                         ) {
                             eprintln!("host runtime failed: {err}");
                             let mut state = match shared_state.lock() {
@@ -495,6 +536,12 @@ fn run_server(
                             }
                         }
                     }
+                    RuntimeControlCommand::Root4ConfigScaleSet { .. } => {}
+                    RuntimeControlCommand::SetOutputRotation { response, .. } => {
+                        let _ = response.send(Err(
+                            surf_ace_compositor::root_geometry::RootGeometryError::DisplayScaleApplyFailed,
+                        ));
+                    }
                 }
             }
 
@@ -508,6 +555,68 @@ fn run_server(
             std::process::exit(2);
         }
     };
+}
+
+fn spawn_root4_config_watcher(path: PathBuf, runtime_control: mpsc::Sender<RuntimeControlCommand>) {
+    thread::spawn(move || {
+        let read_revision = || {
+            let metadata = fs::metadata(&path).ok()?;
+            let modified = metadata.modified().ok()?;
+            let bytes = fs::read(&path).ok()?;
+            Some((modified, metadata.len(), bytes))
+        };
+        let mut observed = read_revision();
+        loop {
+            thread::sleep(std::time::Duration::from_millis(100));
+            let current = read_revision();
+            if current == observed {
+                continue;
+            }
+            observed.clone_from(&current);
+            let Some(contents) = current.and_then(|(_, _, bytes)| String::from_utf8(bytes).ok())
+            else {
+                continue;
+            };
+            let Ok((factor, source)) = resolve_root4_config_scale(&contents) else {
+                continue;
+            };
+            if runtime_control
+                .send(RuntimeControlCommand::Root4ConfigScaleSet { factor, source })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+}
+
+fn resolve_root4_config_scale(
+    contents: &str,
+) -> Result<
+    (f64, surf_ace_compositor::root_geometry::DisplayScaleSource),
+    surf_ace_compositor::root_geometry::RootGeometryError,
+> {
+    let config = serde_json::from_str::<serde_json::Value>(contents)
+        .map_err(|_| surf_ace_compositor::root_geometry::RootGeometryError::InvalidDisplayScale)?;
+    let nested = config
+        .as_object()
+        .and_then(|root| root.get("root4"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|root4| root4.get("display_scale_factor"));
+    match nested {
+        Some(value) => {
+            surf_ace_compositor::root_geometry::validate_factor_value(value).map(|factor| {
+                (
+                    factor,
+                    surf_ace_compositor::root_geometry::DisplayScaleSource::Config,
+                )
+            })
+        }
+        None => Ok((
+            surf_ace_compositor::root_geometry::DEFAULT_DISPLAY_SCALE_FACTOR,
+            surf_ace_compositor::root_geometry::DisplayScaleSource::Default,
+        )),
+    }
 }
 
 fn persist_startup_output_rotation_if_explicit(
@@ -966,12 +1075,16 @@ fn parse_output_rotation(value: &str) -> Result<OutputRotation, String> {
 mod tests {
     use super::{
         Cli, Command, parse_main_app_launch_intent, parse_main_app_launch_shorthand,
-        resolve_main_app_launch_intent, resolve_runtime_launch_plan,
-        resolve_startup_output_rotation,
+        resolve_main_app_launch_intent, resolve_root4_config_scale, resolve_runtime_launch_plan,
+        resolve_startup_output_rotation, spawn_root4_config_watcher,
     };
     use clap::Parser;
-    use std::path::PathBuf;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use surf_ace_compositor::control::RuntimeControlCommand;
     use surf_ace_compositor::model::{
         MainAppLaunchIntent, MainAppLaunchState, MainAppSurfaceBinding, OutputRotation,
         RuntimeSelectionMode,
@@ -1274,5 +1387,130 @@ mod tests {
             surf_ace_compositor::model::RuntimeStatus::default().main_app_launch_state,
             MainAppLaunchState::NotRequested
         );
+    }
+
+    #[test]
+    fn serve_cli_accepts_only_explicit_config_path_carrier() {
+        let cli = Cli::try_parse_from([
+            "surf-ace-compositor",
+            "serve",
+            "--config",
+            "/tmp/root4.json",
+        ])
+        .expect("explicit config path should parse");
+        let Some(Command::Serve { config, .. }) = cli.command else {
+            panic!("serve command should parse");
+        };
+        assert_eq!(config.as_deref(), Some(Path::new("/tmp/root4.json")));
+    }
+
+    #[test]
+    fn config_scale_resolution_uses_nested_field_or_hardcoded_default() {
+        assert_eq!(
+            resolve_root4_config_scale("{}").unwrap(),
+            (
+                2.0,
+                surf_ace_compositor::root_geometry::DisplayScaleSource::Default
+            )
+        );
+        assert_eq!(
+            resolve_root4_config_scale(r#"{"root4":{"display_scale_factor":1.5}}"#).unwrap(),
+            (
+                1.5,
+                surf_ace_compositor::root_geometry::DisplayScaleSource::Config
+            )
+        );
+        for factor in [1.0, 4.0] {
+            let config = format!(r#"{{"root4":{{"display_scale_factor":{factor}}}}}"#);
+            assert_eq!(resolve_root4_config_scale(&config).unwrap().0, factor);
+        }
+        for invalid in [
+            r#"{"root4":{"display_scale_factor":0.999}}"#,
+            r#"{"root4":{"display_scale_factor":4.001}}"#,
+            r#"{"root4":{"display_scale_factor":"2.0"}}"#,
+            r#"{"root4":{"display_scale_factor":null}}"#,
+            r#"{"root4":{"display_scale_factor":true}}"#,
+            r#"{"root4":{"display_scale_factor":[]}}"#,
+            r#"{"root4":{"display_scale_factor":{}}}"#,
+            r#"{"root4":{"display_scale_factor":NaN}}"#,
+        ] {
+            assert!(resolve_root4_config_scale(invalid).is_err(), "{invalid}");
+        }
+        assert_eq!(
+            resolve_root4_config_scale(
+                r#"{"root4.display_scale_factor":4.0,"root4":{"scale":4.0}}"#
+            )
+            .unwrap(),
+            (
+                2.0,
+                surf_ace_compositor::root_geometry::DisplayScaleSource::Default
+            )
+        );
+    }
+
+    #[test]
+    fn watched_config_emits_only_valid_atomic_scale_mutations() {
+        let path = temp_rotation_path().with_extension("root4.json");
+        fs::write(&path, "{}").unwrap();
+        let (tx, rx) = mpsc::channel();
+        spawn_root4_config_watcher(path.clone(), tx);
+        thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"{}",
+            "watcher must never migrate or write the selected config"
+        );
+
+        fs::write(&path, r#"{"root4":{"display_scale_factor":1.5}}"#).unwrap();
+        let command = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("valid watched edit should enter the compositor queue");
+        assert!(matches!(
+            command,
+            RuntimeControlCommand::Root4ConfigScaleSet {
+                factor: 1.5,
+                source: surf_ace_compositor::root_geometry::DisplayScaleSource::Config
+            }
+        ));
+
+        for invalid in [
+            r#"{"root4":{"display_scale_factor":0.999}}"#,
+            r#"{"root4":{"display_scale_factor":4.001}}"#,
+            r#"{"root4":{"display_scale_factor":"2.0"}}"#,
+            r#"{"root4":{"display_scale_factor":null}}"#,
+            r#"{"root4":{"display_scale_factor":false}}"#,
+            r#"{"root4":{"display_scale_factor":[]}}"#,
+            r#"{"root4":{"display_scale_factor":{}}}"#,
+            r#"{"root4":{"display_scale_factor":NaN}}"#,
+        ] {
+            fs::write(&path, invalid).unwrap();
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_millis(200))
+                    .is_err(),
+                "invalid watched edit must not enqueue a partial generation: {invalid}"
+            );
+        }
+
+        fs::write(&path, r#"{"root4":{"display_scale_factor":1.5}}"#).unwrap();
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+            RuntimeControlCommand::Root4ConfigScaleSet { factor: 1.5, .. }
+        ));
+
+        fs::remove_file(&path).unwrap();
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "an unreadable selected file must preserve the last valid scale"
+        );
+        fs::write(&path, "{}").unwrap();
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+            RuntimeControlCommand::Root4ConfigScaleSet {
+                factor: 2.0,
+                source: surf_ace_compositor::root_geometry::DisplayScaleSource::Default
+            }
+        ));
+        let _ = fs::remove_file(path);
     }
 }

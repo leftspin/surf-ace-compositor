@@ -554,3 +554,63 @@ fn serve_launch_shorthand_reuses_active_control_socket_instead_of_rebinding() {
 
     server.join().expect("server should finish");
 }
+
+#[test]
+fn host_config_failures_exit_before_runtime_device_preflight() {
+    let socket_path = unique_temp_path("surf-ace-config-preflight", ".sock");
+    let missing = unique_temp_path("surf-ace-missing-config", ".json");
+    let output = Command::new(env!("CARGO_BIN_EXE_surf-ace-compositor"))
+        .env("SURF_ACE_HOST_RUNTIME_FORCE_FAIL", "1")
+        .args([
+            "serve",
+            "--runtime",
+            "host",
+            "--socket-path",
+            socket_path.to_str().unwrap(),
+            "--config",
+            missing.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("failed to read config"));
+
+    let malformed = unique_temp_path("surf-ace-malformed-config", ".json");
+    fs::write(&malformed, "{").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_surf-ace-compositor"))
+        .env("SURF_ACE_HOST_RUNTIME_FORCE_FAIL", "1")
+        .args([
+            "serve",
+            "--runtime",
+            "host",
+            "--socket-path",
+            socket_path.to_str().unwrap(),
+            "--config",
+            malformed.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid config"));
+
+    let invalid_scale = unique_temp_path("surf-ace-invalid-scale", ".json");
+    fs::write(&invalid_scale, r#"{"root4":{"display_scale_factor":4.1}}"#).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_surf-ace-compositor"))
+        .env("SURF_ACE_HOST_RUNTIME_FORCE_FAIL", "1")
+        .args([
+            "serve",
+            "--runtime",
+            "host",
+            "--socket-path",
+            socket_path.to_str().unwrap(),
+            "--config",
+            invalid_scale.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid_display_scale"));
+
+    let _ = fs::remove_file(malformed);
+    let _ = fs::remove_file(invalid_scale);
+}
