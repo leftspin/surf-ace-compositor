@@ -1311,7 +1311,8 @@ impl HostRuntimeLoopData {
                 .primary_opened_path()
                 .unwrap_or_else(|| "<selected-root4-device>".to_string()),
             error: format!(
-                "root4 geometry transaction canceled because native pane owner {pane_id} disappeared"
+                "root4 geometry transaction canceled because native pane owner {} disappeared",
+                pane_id.0.as_str()
             ),
         })
     }
@@ -7633,13 +7634,16 @@ impl RuntimeWaylandState {
             });
         let diagnostic = match affected_generation {
             Some((generation, true)) => format!(
-                "native pane owner disappeared: pane_id={pane_id}; root4 generation {generation} remains tied to its queued KMS completion; native grab remains until release and future focus targets Surf Ace's main surface when available"
+                "native pane owner disappeared: pane_id={}; root4 generation {generation} remains tied to its queued KMS completion; native grab remains until release and future focus targets Surf Ace's main surface when available",
+                pane_id.0.as_str()
             ),
             Some((generation, false)) => format!(
-                "native pane owner disappeared: pane_id={pane_id}; unqueued root4 generation {generation} canceled; native grab remains until release and future focus targets Surf Ace's main surface when available"
+                "native pane owner disappeared: pane_id={}; unqueued root4 generation {generation} canceled; native grab remains until release and future focus targets Surf Ace's main surface when available",
+                pane_id.0.as_str()
             ),
             None => format!(
-                "native pane owner disappeared: pane_id={pane_id}; native grab remains until release and future focus targets Surf Ace's main surface when available"
+                "native pane owner disappeared: pane_id={}; native grab remains until release and future focus targets Surf Ace's main surface when available",
+                pane_id.0.as_str()
             ),
         };
         lock_state(&self.shared_state).record_runtime_diagnostic(diagnostic);
@@ -12182,8 +12186,8 @@ mod tests {
             Box::new(NoopProcessController),
         )));
         lock_state(&shared_state).mark_runtime_resize(1920, 1080);
-        let display: Display<RuntimeWaylandState> = Display::new().unwrap();
-        let display_handle = display.handle();
+        let mut display: Display<RuntimeWaylandState> = Display::new().unwrap();
+        let mut display_handle = display.handle();
         let mut wayland =
             RuntimeWaylandState::new(display_handle.clone(), Arc::clone(&shared_state)).unwrap();
         let (main_server, main_client_socket) = UnixStream::pair().unwrap();
