@@ -309,7 +309,7 @@ fn failed_explicit_start_does_not_overwrite_remembered_output_rotation() {
 }
 
 #[test]
-fn serve_with_sun_schedule_node_publishes_profile_status_on_startup() {
+fn serve_with_sun_schedule_node_reports_profile_or_discovery_error_on_startup() {
     let socket_path = unique_temp_path("surf-ace-sun-schedule-node", ".sock");
     let child = Command::new(env!("CARGO_BIN_EXE_surf-ace-compositor"))
         .args([
@@ -330,31 +330,43 @@ fn serve_with_sun_schedule_node_publishes_profile_status_on_startup() {
     let status = send_control_request(&socket_path, json!({ "type": "get_status" }));
 
     let runtime = &status["status"]["runtime"];
-    let profile = &runtime["sun_schedule"]["profile"];
-    assert_eq!(profile["nodeId"], json!("racter"));
-    assert_eq!(profile["nodeIdSource"], json!("deployment override"));
-    assert_eq!(profile["timezoneSource"], json!("/etc/localtime"));
-    assert_eq!(
-        profile["coordinatesSource"],
-        json!("/usr/share/zoneinfo/zone1970.tab")
-    );
-    assert_eq!(
-        profile["overrideSource"],
-        json!("--sun-schedule-node or SURF_ACE_COMPOSITOR_SUN_SCHEDULE_NODE")
-    );
-    assert!(
-        profile["timezone"]
-            .as_str()
-            .is_some_and(|value| !value.is_empty())
-    );
-    let latitude = profile["latitude"]
-        .as_f64()
-        .expect("latitude should be numeric");
-    let longitude = profile["longitude"]
-        .as_f64()
-        .expect("longitude should be numeric");
-    assert!(latitude.is_finite() && (-90.0..=90.0).contains(&latitude));
-    assert!(longitude.is_finite() && (-180.0..=180.0).contains(&longitude));
+    let sun_schedule = &runtime["sun_schedule"];
+    let profile = &sun_schedule["profile"];
+    if profile.is_null() {
+        assert_eq!(sun_schedule["appearance"], json!("unknown"));
+        assert_eq!(sun_schedule["reason"], json!("invalid_profile"));
+        assert!(
+            sun_schedule["error"]
+                .as_str()
+                .is_some_and(|error| !error.is_empty()),
+            "failed host discovery should be reported in status"
+        );
+    } else {
+        assert_eq!(profile["nodeId"], json!("racter"));
+        assert_eq!(profile["nodeIdSource"], json!("deployment override"));
+        assert_eq!(profile["timezoneSource"], json!("/etc/localtime"));
+        assert_eq!(
+            profile["coordinatesSource"],
+            json!("/usr/share/zoneinfo/zone1970.tab")
+        );
+        assert_eq!(
+            profile["overrideSource"],
+            json!("--sun-schedule-node or SURF_ACE_COMPOSITOR_SUN_SCHEDULE_NODE")
+        );
+        assert!(
+            profile["timezone"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        let latitude = profile["latitude"]
+            .as_f64()
+            .expect("latitude should be numeric");
+        let longitude = profile["longitude"]
+            .as_f64()
+            .expect("longitude should be numeric");
+        assert!(latitude.is_finite() && (-90.0..=90.0).contains(&latitude));
+        assert!(longitude.is_finite() && (-180.0..=180.0).contains(&longitude));
+    }
 
     let expected_source = match (
         runtime["desktop_color_scheme"].as_str(),
@@ -365,13 +377,15 @@ fn serve_with_sun_schedule_node_publishes_profile_status_on_startup() {
         _ => "unknown",
     };
     assert_eq!(runtime["appearance_source"], json!(expected_source));
-    assert!(
-        status["status"]["runtime"]["sun_schedule"]["sunriseUnixSeconds"].is_number(),
-        "status should expose evaluated sunrise"
+    assert_eq!(
+        sun_schedule["sunriseUnixSeconds"].is_number(),
+        profile.is_object(),
+        "sunrise should be present only when host discovery produced a profile"
     );
-    assert!(
-        status["status"]["runtime"]["sun_schedule"]["sunsetUnixSeconds"].is_number(),
-        "status should expose evaluated sunset"
+    assert_eq!(
+        sun_schedule["sunsetUnixSeconds"].is_number(),
+        profile.is_object(),
+        "sunset should be present only when host discovery produced a profile"
     );
 
     stop_child(child);
