@@ -2389,9 +2389,7 @@ impl HostBackendState {
         mut before_activation: Option<&mut dyn FnMut(u16, u16) -> Result<(), RuntimeError>>,
         defer_activation: bool,
     ) -> Result<ClaimedHostOutput, RuntimeError> {
-        if defer_activation
-            && let Some(prepared) = self.prepared_reclaim_output.as_ref()
-        {
+        if defer_activation && let Some(prepared) = self.prepared_reclaim_output.as_ref() {
             return Ok(prepared.clone());
         }
         let recovering = self.last_good_output_identity.is_some();
@@ -2693,7 +2691,10 @@ impl HostBackendState {
         let retired = self.retired_claim.as_ref()?;
         let restored_output = retired.output.clone();
         let opened = self.opened_devices.get_mut(&restored_output.device_id)?;
-        let retired = self.retired_claim.take().expect("retired claim was inspected");
+        let retired = self
+            .retired_claim
+            .take()
+            .expect("retired claim was inspected");
         opened.claimed_pipeline = Some(retired.pipeline);
         self.claimed_output = Some(restored_output.clone());
         self.last_good_output_identity = Some(restored_output.identity.clone());
@@ -11221,7 +11222,10 @@ mod tests {
             .root_geometry_snapshot()
             .unwrap();
         seed_committed_root_capture(&runtime);
-        assert_eq!(capture.root4_generations_for_test(), (Some(active.generation), None));
+        assert_eq!(
+            capture.root4_generations_for_test(),
+            (Some(active.generation), None)
+        );
         let (rotation_tx, rotation_rx) = std::sync::mpsc::sync_channel(1);
         runtime
             .root_geometry_queue
@@ -11253,16 +11257,23 @@ mod tests {
         assert!(staged.is_coherent());
         assert_eq!(staged.input.generation, staged_generation);
         assert_eq!(staged.status.root_geometry_generation, staged_generation);
-        assert!(staged
-            .viewports
-            .iter()
-            .all(|(_, viewport)| viewport.root_geometry_generation == staged_generation));
-        assert!(staged
-            .captures
-            .iter()
-            .all(|(_, capture)| capture.root_geometry_generation == staged_generation));
+        assert!(
+            staged
+                .viewports
+                .iter()
+                .all(|(_, viewport)| viewport.root_geometry_generation == staged_generation)
+        );
+        assert!(
+            staged
+                .captures
+                .iter()
+                .all(|(_, capture)| capture.root_geometry_generation == staged_generation)
+        );
         assert_eq!(
-            (staged.output_global.physical_width, staged.output_global.physical_height),
+            (
+                staged.output_global.physical_width,
+                staged.output_global.physical_height
+            ),
             (
                 staged.committed.snapshot.physical_size_px.width,
                 staged.committed.snapshot.physical_size_px.height
@@ -11374,7 +11385,10 @@ mod tests {
         let drained = complete_pipeline_flip_events(&mut pipeline, [crtc, crtc]);
 
         assert_eq!(drained, [PresentationToken(7)]);
-        assert_eq!((pipeline.dumb_front_buffer, pipeline.dumb_back_buffer), (1, 0));
+        assert_eq!(
+            (pipeline.dumb_front_buffer, pipeline.dumb_back_buffer),
+            (1, 0)
+        );
         assert!(!pipeline.flip_pending);
         assert_eq!(pipeline.pending_presentation_token, None);
 
@@ -11391,8 +11405,7 @@ mod tests {
 
     #[test]
     fn prepared_reclaim_is_reused_until_its_fifo_mode_transaction_arms_it() {
-        let mut backend =
-            HostBackendState::for_root_geometry_test(ScreenCaptureStore::default());
+        let mut backend = HostBackendState::for_root_geometry_test(ScreenCaptureStore::default());
         let prepared = test_claimed_output(2, "/dev/dri/card-test-new");
         backend.prepared_reclaim_output = Some(prepared.clone());
 
@@ -11402,7 +11415,10 @@ mod tests {
             .expect("prepared reclaim must be reused without opening another pipeline");
         assert_eq!(reused.device_id, prepared.device_id);
         assert_eq!(reused.identity, prepared.identity);
-        assert_eq!(backend.prepared_reclaim_output.as_ref().unwrap().device_id, 2);
+        assert_eq!(
+            backend.prepared_reclaim_output.as_ref().unwrap().device_id,
+            2
+        );
         assert!(backend.opened_devices.is_empty());
     }
 
@@ -11430,8 +11446,7 @@ mod tests {
 
     #[test]
     fn losing_a_reclaim_candidate_does_not_overwrite_the_committed_rollback_owner() {
-        let mut backend =
-            HostBackendState::for_root_geometry_test(ScreenCaptureStore::default());
+        let mut backend = HostBackendState::for_root_geometry_test(ScreenCaptureStore::default());
         seed_reclaim_lifecycle(&mut backend, 2);
         backend.arm_prepared_reclaim_for_presentation().unwrap();
 
@@ -11527,7 +11542,10 @@ mod tests {
             .root_geometry_snapshot()
             .unwrap();
         seed_committed_root_capture(&runtime);
-        assert_eq!(capture.root4_generations_for_test(), (Some(active.generation), None));
+        assert_eq!(
+            capture.root4_generations_for_test(),
+            (Some(active.generation), None)
+        );
         lock_state(&runtime.shared_state)
             .mark_runtime_host_output_reclaim_pending("candidate reclaim pending");
         runtime
@@ -11569,9 +11587,20 @@ mod tests {
         let status = lock_state(&runtime.shared_state).status_snapshot().runtime;
         assert!(status.host_output_ownership);
         assert_eq!(status.host_active_connector_name.as_deref(), Some("TEST-1"));
-        assert_eq!(capture.root4_generations_for_test(), (Some(active.generation), None));
+        assert_eq!(
+            capture.root4_generations_for_test(),
+            (Some(active.generation), None)
+        );
         assert!(runtime.host_backend.retired_claim.is_none());
-        assert_eq!(runtime.host_backend.claimed_output.as_ref().unwrap().device_id, 1);
+        assert_eq!(
+            runtime
+                .host_backend
+                .claimed_output
+                .as_ref()
+                .unwrap()
+                .device_id,
+            1
+        );
     }
 
     #[test]
@@ -11703,14 +11732,16 @@ mod tests {
             .committed
             .snapshot
             .generation;
-        assert!(runtime
-            .wayland_state
-            .staged_root_geometry
-            .as_ref()
-            .unwrap()
-            .native_materializations
-            .iter()
-            .any(|(staged_pane_id, _)| staged_pane_id == &pane_id));
+        assert!(
+            runtime
+                .wayland_state
+                .staged_root_geometry
+                .as_ref()
+                .unwrap()
+                .native_materializations
+                .iter()
+                .any(|(staged_pane_id, _)| staged_pane_id == &pane_id)
+        );
 
         runtime
             .wayland_state
@@ -11719,10 +11750,12 @@ mod tests {
             .queue_pinned_presentation_tick()
             .expect_err("a disappeared native owner must cancel before KMS queueing");
         assert!(failure.is_transaction());
-        assert!(failure
-            .error_ref()
-            .to_string()
-            .contains("native pane owner native-owner disappeared"));
+        assert!(
+            failure
+                .error_ref()
+                .to_string()
+                .contains("native pane owner native-owner disappeared")
+        );
         assert_eq!(capture.root4_generations_for_test(), (None, None));
         assert!(!runtime.discard_staged_root_geometry(
             crate::root_geometry::RootGeometryError::DisplayScaleApplyFailed,
@@ -11737,16 +11770,20 @@ mod tests {
         );
         let status = lock_state(&runtime.shared_state).status_snapshot().runtime;
         assert_eq!(status.phase, crate::model::RuntimePhase::Running);
-        assert!(status
-            .last_diagnostic
-            .as_deref()
-            .unwrap()
-            .contains(&format!("root4 generation {staged_generation} canceled")));
-        assert!(status
-            .last_diagnostic
-            .as_deref()
-            .unwrap()
-            .contains("later focus returns to Surf Ace"));
+        assert!(
+            status
+                .last_diagnostic
+                .as_deref()
+                .unwrap()
+                .contains(&format!("root4 generation {staged_generation} canceled"))
+        );
+        assert!(
+            status
+                .last_diagnostic
+                .as_deref()
+                .unwrap()
+                .contains("later focus returns to Surf Ace")
+        );
     }
 
     #[test]
@@ -11786,11 +11823,7 @@ mod tests {
                 source: crate::root_geometry::DisplayScaleSource::Config,
             });
         runtime.stage_next_root_geometry_mutation();
-        let transaction = runtime
-            .wayland_state
-            .staged_root_geometry
-            .as_mut()
-            .unwrap();
+        let transaction = runtime.wayland_state.staged_root_geometry.as_mut().unwrap();
         let geometry_frame = PresentationToken(7);
         assert!(!transaction.take_completed_flip(&[geometry_frame]));
         transaction.mark_flip_queued(geometry_frame);
@@ -11843,11 +11876,7 @@ mod tests {
             .mark_flip_queued(matching);
         assert_eq!(store.events, [("begin", prepared.snapshot.generation)]);
         assert_eq!(
-            wayland
-                .staged_root_geometry
-                .as_ref()
-                .unwrap()
-                .pending_flip,
+            wayland.staged_root_geometry.as_ref().unwrap().pending_flip,
             Some(matching)
         );
         assert_eq!(
@@ -12163,7 +12192,10 @@ mod tests {
             .insert_client(main_server, Arc::new(super::RuntimeClientState::default()))
             .unwrap();
         display_handle
-            .insert_client(overlay_server, Arc::new(super::RuntimeClientState::default()))
+            .insert_client(
+                overlay_server,
+                Arc::new(super::RuntimeClientState::default()),
+            )
             .unwrap();
         let (main_ready, release_main) = spawn_real_shm_surface_tree(main_client_socket);
         let (overlay_ready, release_overlay) = spawn_real_shm_surface_tree(overlay_client_socket);
@@ -12177,15 +12209,15 @@ mod tests {
             || !overlay_client_ready
         {
             assert!(
-                std::time::Instant::now()
-                    < deadline,
+                std::time::Instant::now() < deadline,
                 "fixture Wayland clients must become ready"
             );
             display.dispatch_clients(&mut wayland).unwrap();
             while let Some(toplevel) = wayland.pending_toplevels.first().cloned() {
                 wayland.pending_toplevels.remove(0);
                 if wayland.main_toplevel.is_none() {
-                    wayland.configure_toplevel_for_role(&toplevel, super::RuntimeSurfaceRole::MainApp);
+                    wayland
+                        .configure_toplevel_for_role(&toplevel, super::RuntimeSurfaceRole::MainApp);
                     wayland.main_toplevel = Some(toplevel);
                 } else if wayland.overlay_toplevel.is_none() {
                     wayland.configure_toplevel_for_role(
