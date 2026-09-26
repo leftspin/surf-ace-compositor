@@ -10615,6 +10615,7 @@ mod tests {
         focused_surface_id: Option<u32>,
         native_toplevel: Option<xdg_toplevel::XdgToplevel>,
         destroy_native_on_press: bool,
+        _seat: wl_seat::WlSeat,
         pointer: Option<wl_pointer::WlPointer>,
     }
 
@@ -10672,7 +10673,9 @@ mod tests {
             _conn: &Connection,
             qh: &QueueHandle<Self>,
         ) {
-            if let wl_seat::Event::Capabilities { capabilities } = event
+            if let wl_seat::Event::Capabilities {
+                capabilities: wayland_client::WEnum::Value(capabilities),
+            } = event
                 && capabilities.contains(wl_seat::Capability::Pointer)
                 && state.pointer.is_none()
             {
@@ -10782,6 +10785,7 @@ mod tests {
                 focused_surface_id: None,
                 native_toplevel: Some(native_toplevel),
                 destroy_native_on_press: true,
+                _seat: seat,
                 pointer: None,
             };
             connection.flush().expect("toplevel requests must flush");
@@ -12374,6 +12378,10 @@ mod tests {
             active_generation,
             "a removed flip owner must leave every committed consumer on its prior generation"
         );
+        assert_committed_root_geometry_generation(
+            &lock_state(&runtime.shared_state),
+            active_generation,
+        );
         let diagnostic = lock_state(&runtime.shared_state)
             .status_snapshot()
             .runtime
@@ -12820,7 +12828,7 @@ mod tests {
             .expect("native pane test plan must be accepted");
         let shared_state = Arc::new(Mutex::new(state));
         let mut display: Display<RuntimeWaylandState> = Display::new().unwrap();
-        let display_handle = display.handle();
+        let mut display_handle = display.handle();
         let mut wayland =
             RuntimeWaylandState::new(display_handle.clone(), Arc::clone(&shared_state)).unwrap();
         let (server_socket, client_socket) = UnixStream::pair().unwrap();
