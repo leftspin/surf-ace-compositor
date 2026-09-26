@@ -847,10 +847,11 @@ pub fn run_host_with_control(
         );
     }
 
-    let drm_events_source_token = Rc::new(RefCell::new(None));
+    let drm_events_source_token = Rc::new(RefCell::new(RegisteredDrmEventSource::default()));
     bind_claimed_drm_event_source(
         &loop_handle,
         drm_events_fd,
+        claimed_output.device_id,
         Rc::clone(&drm_events_source_token),
     )?;
     loop_handle
@@ -866,7 +867,7 @@ pub fn run_host_with_control(
     loop_handle
         .insert_source(Timer::immediate(), move |_, _, data| {
             data.wayland_state.prune_dead_surfaces();
-            if data.host_backend.claimed_output.is_none() {
+            if data.host_backend.needs_output_reclaim() {
                 sync_runtime_host_present_capabilities(&data.shared_state, &data.host_backend);
                 data.wayland_state.sync_dmabuf_protocol_formats(None);
                 if let Err(err) = reclaim_host_output_in_process(
@@ -883,6 +884,44 @@ pub fn run_host_with_control(
                 }
                 return TimeoutAction::ToDuration(Duration::from_millis(16));
             }
+            if let Some(device_id) = data.host_backend.presentation_device_id() {
+                let source_matches = {
+                    let source = drm_events_source_token_for_timer.borrow();
+                    source.token.is_some() && source.device_id == Some(device_id)
+                };
+                if !source_matches {
+                    let old_token = drm_events_source_token_for_timer
+                        .borrow_mut()
+                        .token
+                        .take();
+                    if let Some(old_token) = old_token {
+                        loop_handle_for_timer.remove(old_token);
+                    }
+                    drm_events_source_token_for_timer.borrow_mut().device_id = None;
+                    let Some(fd) = data.host_backend.claimed_device_event_fd() else {
+                        mark_host_output_reclaim_pending(
+                            data,
+                            "claimed output has no DRM event fd for its presentation device"
+                                .to_string(),
+                        );
+                        return TimeoutAction::ToDuration(Duration::from_millis(250));
+                    };
+                    if let Err(err) = bind_claimed_drm_event_source(
+                        &loop_handle_for_timer,
+                        fd,
+                        device_id,
+                        Rc::clone(&drm_events_source_token_for_timer),
+                    ) {
+                        mark_host_output_reclaim_pending(
+                            data,
+                            format!(
+                                "failed to bind DRM events for the active presentation device: {err}"
+                            ),
+                        );
+                        return TimeoutAction::ToDuration(Duration::from_millis(250));
+                    }
+                }
+            }
             data.stage_next_root_geometry_mutation();
             if !data.wayland_state.staged_native_materializations_ready() {
                 return TimeoutAction::ToDuration(Duration::from_millis(16));
@@ -892,7 +931,7 @@ pub fn run_host_with_control(
                 Ok(Some(_)) => {}
                 Ok(None) => {}
                 Err(failure) => {
-                    data.discard_staged_root_geometry(
+                    let restored_previous = data.discard_staged_root_geometry(
                         crate::root_geometry::RootGeometryError::DisplayScaleApplyFailed,
                     );
                     if failure.is_transaction() {
@@ -900,6 +939,9 @@ pub fn run_host_with_control(
                         return TimeoutAction::ToDuration(Duration::from_millis(16));
                     }
                     if failure.is_reclaimable() {
+                        if restored_previous {
+                            return TimeoutAction::ToDuration(Duration::from_millis(16));
+                        }
                         data.host_backend.mark_claim_lost();
                         sync_runtime_host_present_capabilities(&data.shared_state, &data.host_backend);
                         data.wayland_state.sync_dmabuf_protocol_formats(None);
@@ -1033,7 +1075,6 @@ pub fn run_host_with_control(
         pending_rotation_response: None,
         root_geometry_queue: RuntimeGeometryMutationQueue::default(),
         pending_geometry_mutation: None,
-        root_geometry_flip_boundary: RootGeometryFlipBoundary::default(),
         pending_reclaim_publication: None,
         #[cfg(test)]
         root_geometry_stage_failure: None,
@@ -1068,7 +1109,6 @@ struct HostRuntimeLoopData {
         Option<std::sync::mpsc::SyncSender<Result<(), crate::root_geometry::RootGeometryError>>>,
     root_geometry_queue: RuntimeGeometryMutationQueue,
     pending_geometry_mutation: Option<(u64, &'static str)>,
-    root_geometry_flip_boundary: RootGeometryFlipBoundary,
     pending_reclaim_publication: Option<PendingReclaimPublication>,
     #[cfg(test)]
     root_geometry_stage_failure: Option<Root4ConsumerStage>,
@@ -1087,24 +1127,9 @@ struct PendingReclaimPublication {
 }
 
 #[derive(Default)]
-struct RootGeometryFlipBoundary {
-    queued: Option<PresentationToken>,
-}
-
-impl RootGeometryFlipBoundary {
-    fn mark_queued(&mut self, token: PresentationToken) {
-        self.queued = Some(token);
-    }
-
-    fn take_completed(&mut self, completed: &[PresentationToken]) -> bool {
-        self.queued
-            .take_if(|queued| completed.contains(queued))
-            .is_some()
-    }
-
-    fn discard(&mut self) {
-        self.queued = None;
-    }
+struct RegisteredDrmEventSource {
+    token: Option<RegistrationToken>,
+    device_id: Option<u64>,
 }
 
 /// The narrow side-effect boundary used by the root4 transaction engine.
@@ -1133,7 +1158,7 @@ impl RootGeometryStageStore for HostBackendState {
 fn install_root_geometry_stage(
     wayland_state: &mut RuntimeWaylandState,
     stage_store: &mut impl RootGeometryStageStore,
-    staged: StagedRuntimeRootGeometry,
+    staged: HostPresentationTransaction,
 ) {
     stage_store.begin_stage(staged.committed.snapshot.generation);
     wayland_state.staged_root_geometry = Some(staged.clone());
@@ -1147,7 +1172,7 @@ fn activate_root_geometry_stage(
     wayland_state: &mut RuntimeWaylandState,
     stage_store: &mut impl RootGeometryStageStore,
     publish: impl FnOnce(&mut CompositorState),
-) -> Option<StagedRuntimeRootGeometry> {
+) -> Option<HostPresentationTransaction> {
     let prepared = wayland_state.staged_root_geometry.take()?;
     let mut state = lock_state(shared_state);
     state.mark_runtime_root4_dimensions_committed(
@@ -1214,7 +1239,12 @@ enum RuntimeGeometryMutation {
 
 impl HostRuntimeLoopData {
     fn complete_root_geometry_presentations(&mut self, completed: &[PresentationToken]) -> bool {
-        if self.root_geometry_flip_boundary.take_completed(completed) {
+        let completed_pending = self
+            .wayland_state
+            .staged_root_geometry
+            .as_mut()
+            .is_some_and(|transaction| transaction.take_completed_flip(completed));
+        if completed_pending {
             self.commit_staged_root_geometry();
             true
         } else {
@@ -1236,27 +1266,30 @@ impl HostRuntimeLoopData {
         if !identity_accepted {
             return Err(self.material_identity_changed_failure());
         }
+        if let Some(pane_id) = self
+            .wayland_state
+            .staged_root_geometry
+            .as_ref()
+            .and_then(|transaction| transaction.disappeared_native_owner.as_ref())
+        {
+            return Err(self.disappeared_native_owner_failure(pane_id));
+        }
+        // Surface-tree state is event-loop owned, so no client commit can be
+        // dispatched between pinning this identity and queuing its frame.
         self.wayland_state.presentation_root_geometry =
             self.wayland_state.staged_root_geometry.clone();
         let queued = self
             .host_backend
             .queue_claimed_presentation_tick(&mut self.wayland_state);
-        let materials_unchanged = self
-            .wayland_state
-            .presentation_root_geometry
-            .as_ref()
-            .is_none_or(|presentation| {
-                presentation.accepted_material_identity.as_ref()
-                    == Some(&self.wayland_state.accepted_material_identity())
-            });
         self.wayland_state.presentation_root_geometry = None;
-        if !materials_unchanged {
-            return Err(self.material_identity_changed_failure());
-        }
         if let Ok(Some(token)) = queued
             && self.wayland_state.staged_root_geometry.is_some()
         {
-            self.root_geometry_flip_boundary.mark_queued(token);
+            self.wayland_state
+                .staged_root_geometry
+                .as_mut()
+                .expect("staged presentation must remain installed")
+                .mark_flip_queued(token);
         }
         queued
     }
@@ -1271,7 +1304,19 @@ impl HostRuntimeLoopData {
         })
     }
 
-    fn install_staged_root_geometry(&mut self, staged: StagedRuntimeRootGeometry) {
+    fn disappeared_native_owner_failure(&self, pane_id: &PaneId) -> HostPresentFailure {
+        HostPresentFailure::transaction(RuntimeError::HostOutputClaim {
+            path: self
+                .host_backend
+                .primary_opened_path()
+                .unwrap_or_else(|| "<selected-root4-device>".to_string()),
+            error: format!(
+                "root4 geometry transaction canceled because native pane owner {pane_id} disappeared"
+            ),
+        })
+    }
+
+    fn install_staged_root_geometry(&mut self, staged: HostPresentationTransaction) {
         install_root_geometry_stage(&mut self.wayland_state, &mut self.host_backend, staged);
     }
 
@@ -1424,7 +1469,7 @@ impl HostRuntimeLoopData {
                 }) {
                 Ok(()) => self.pending_geometry_mutation = Some((sequence, "mode")),
                 Err(_err) => {
-                    self.host_backend.discard_unactivated_reclaim();
+                    self.discard_unactivated_reclaim_and_restore_status();
                     eprintln!(
                         "{{\"ok\":false,\"error\":\"display_scale_apply_failed\",\"mutation\":\"mode\",\"sequence\":{sequence}}}"
                     );
@@ -1435,7 +1480,6 @@ impl HostRuntimeLoopData {
     }
 
     fn commit_staged_root_geometry(&mut self) {
-        self.root_geometry_flip_boundary.discard();
         let activated_reclaim = self
             .pending_geometry_mutation
             .is_some_and(|(_, mutation)| mutation == "mode");
@@ -1498,8 +1542,51 @@ impl HostRuntimeLoopData {
         }
     }
 
-    fn discard_staged_root_geometry(&mut self, error: crate::root_geometry::RootGeometryError) {
-        self.root_geometry_flip_boundary.discard();
+    fn discard_unactivated_reclaim_and_restore_status(&mut self) -> bool {
+        self.pending_reclaim_publication = None;
+        let Some(restored) = self.host_backend.discard_unactivated_reclaim() else {
+            return false;
+        };
+        let rotation = lock_state(&self.shared_state).output_rotation();
+        let publication = self
+            .host_backend
+            .reclaim_publication_for(&restored, rotation);
+        let seat_name = self.host_backend.seat_name.clone();
+        let detected = self.host_backend.detected_count();
+        let opened = self.host_backend.opened_count();
+        let path = self.host_backend.primary_opened_path();
+        let mut state = lock_state(&self.shared_state);
+        state.set_runtime_host_backend_snapshot(Some(seat_name), detected, opened, path);
+        state.mark_runtime_host_output_reclaimed(
+            publication.mode_width,
+            publication.mode_height,
+            publication.active_connector_name,
+            publication.active_connector_id,
+            publication.last_selection_attempt,
+            publication.last_selection_result,
+            publication.ownership,
+            publication.atomic_enabled,
+            publication.overlay_capable,
+        );
+        drop(state);
+        self.wayland_state.sync_dmabuf_protocol_formats(
+            self.host_backend.claimed_dmabuf_protocol_advertisement(),
+        );
+        true
+    }
+
+    fn discard_staged_root_geometry(
+        &mut self,
+        error: crate::root_geometry::RootGeometryError,
+    ) -> bool {
+        if self
+            .wayland_state
+            .staged_root_geometry
+            .as_ref()
+            .is_some_and(|transaction| transaction.pending_flip.is_some())
+        {
+            return false;
+        }
         if let Some(prepared) = self.wayland_state.staged_root_geometry.take() {
             self.host_backend
                 .discard_stage(prepared.committed.snapshot.generation);
@@ -1509,19 +1596,21 @@ impl HostRuntimeLoopData {
         if let Some(response) = self.pending_rotation_response.take() {
             let _ = response.send(Err(error));
         }
-        if self
+        let restored_previous = if self
             .pending_geometry_mutation
             .is_some_and(|(_, mutation)| mutation == "mode")
         {
-            self.pending_reclaim_publication = None;
-            self.host_backend.discard_unactivated_reclaim();
-        }
+            self.discard_unactivated_reclaim_and_restore_status()
+        } else {
+            false
+        };
         if let Some((sequence, mutation)) = self.pending_geometry_mutation.take() {
             eprintln!(
                 "{{\"ok\":false,\"error\":\"{}\",\"mutation\":\"{mutation}\",\"sequence\":{sequence}}}",
                 error.code()
             );
         }
+        restored_previous
     }
 }
 
@@ -1653,7 +1742,7 @@ fn sync_runtime_host_selection_status(
 fn reclaim_host_output_in_process(
     data: &mut HostRuntimeLoopData,
     loop_handle: &LoopHandle<'_, HostRuntimeLoopData>,
-    drm_events_source_token: &Rc<RefCell<Option<RegistrationToken>>>,
+    drm_events_source_token: &Rc<RefCell<RegisteredDrmEventSource>>,
     reclaim_required_ownership: Option<StartupPresentOwnership>,
 ) -> Result<(), RuntimeError> {
     let root_geometry_queue = &mut data.root_geometry_queue;
@@ -1675,7 +1764,9 @@ fn reclaim_host_output_in_process(
             return Err(err);
         }
     };
-    if let Some(old_token) = drm_events_source_token.borrow_mut().take() {
+    let old_token = drm_events_source_token.borrow_mut().token.take();
+    drm_events_source_token.borrow_mut().device_id = None;
+    if let Some(old_token) = old_token {
         loop_handle.remove(old_token);
     }
     let drm_events_fd = data.host_backend.claimed_device_event_fd().ok_or_else(|| {
@@ -1690,33 +1781,14 @@ fn reclaim_host_output_in_process(
     bind_claimed_drm_event_source(
         loop_handle,
         drm_events_fd,
+        claimed_output.device_id,
         Rc::clone(drm_events_source_token),
     )?;
-    let (mode_w, mode_h) = claimed_output.mode.size();
-    let active_connector_name = Some(claimed_output.identity.connector_name.clone());
-    let active_connector_id = Some(claimed_output.identity.connector_id);
-    let (last_selection_attempt, last_selection_result) = data.host_backend.selection_logs();
     let rotation = { lock_state(&data.shared_state).output_rotation() };
-    let (mut ownership, atomic_enabled, overlay_capable) = data
-        .host_backend
-        .present_capabilities_for(&claimed_output)
-        .unwrap_or((RuntimeHostPresentOwnership::None, false, false));
-    if matches!(ownership, RuntimeHostPresentOwnership::DirectGbm)
-        && !direct_present_supported_for_rotation(rotation)
-    {
-        ownership = RuntimeHostPresentOwnership::Dumb;
-    }
-    data.pending_reclaim_publication = Some(PendingReclaimPublication {
-        mode_width: mode_w as i32,
-        mode_height: mode_h as i32,
-        active_connector_name,
-        active_connector_id,
-        last_selection_attempt,
-        last_selection_result,
-        ownership,
-        atomic_enabled,
-        overlay_capable,
-    });
+    data.pending_reclaim_publication = Some(
+        data.host_backend
+            .reclaim_publication_for(&claimed_output, rotation),
+    );
     Ok(())
 }
 
@@ -1736,7 +1808,8 @@ fn mark_host_output_reclaim_pending(data: &mut HostRuntimeLoopData, error: Strin
 fn bind_claimed_drm_event_source(
     loop_handle: &LoopHandle<'_, HostRuntimeLoopData>,
     drm_events_fd: OwnedFd,
-    drm_events_source_token: Rc<RefCell<Option<RegistrationToken>>>,
+    device_id: u64,
+    drm_events_source_token: Rc<RefCell<RegisteredDrmEventSource>>,
 ) -> Result<(), RuntimeError> {
     let token_state_for_cb = Rc::clone(&drm_events_source_token);
     let token = loop_handle
@@ -1745,6 +1818,31 @@ fn bind_claimed_drm_event_source(
             move |_, _fd, data| {
                 if let Err(failure) = process_claimed_drm_event_source(data) {
                     if failure.is_reclaimable() {
+                        let transaction_has_queued_flip = data
+                            .wayland_state
+                            .staged_root_geometry
+                            .as_ref()
+                            .is_some_and(|transaction| transaction.pending_flip.is_some());
+                        if transaction_has_queued_flip
+                            || data.host_backend.claimed_pipeline_has_pending_flip()
+                        {
+                            eprintln!(
+                                "host DRM event read failed while a presentation transaction is awaiting its exact KMS completion: {}",
+                                failure.error_ref()
+                            );
+                            *token_state_for_cb.borrow_mut() =
+                                RegisteredDrmEventSource::default();
+                            return Ok(PostAction::Remove);
+                        }
+                        if data.wayland_state.staged_root_geometry.is_some()
+                            && data.discard_staged_root_geometry(
+                                crate::root_geometry::RootGeometryError::DisplayScaleApplyFailed,
+                            )
+                        {
+                            *token_state_for_cb.borrow_mut() =
+                                RegisteredDrmEventSource::default();
+                            return Ok(PostAction::Remove);
+                        }
                         eprintln!(
                             "host backend lost present/event stream after commit/present error: {}; scheduling in-process reclaim",
                             failure.error_ref()
@@ -1752,7 +1850,8 @@ fn bind_claimed_drm_event_source(
                         data.host_backend.mark_claim_lost();
                         sync_runtime_host_present_capabilities(&data.shared_state, &data.host_backend);
                         data.wayland_state.sync_dmabuf_protocol_formats(None);
-                        *token_state_for_cb.borrow_mut() = None;
+                        *token_state_for_cb.borrow_mut() =
+                            RegisteredDrmEventSource::default();
                         return Ok(PostAction::Remove);
                     }
                     let mut state = lock_state(&data.shared_state);
@@ -1761,14 +1860,17 @@ fn bind_claimed_drm_event_source(
                         failure.into_error()
                     ));
                     data.loop_signal.stop();
-                    *token_state_for_cb.borrow_mut() = None;
+                    *token_state_for_cb.borrow_mut() = RegisteredDrmEventSource::default();
                     return Ok(PostAction::Remove);
                 }
                 Ok(PostAction::Continue)
             },
         )
         .map_err(|err| RuntimeError::RegisterSource(err.to_string()))?;
-    *drm_events_source_token.borrow_mut() = Some(token);
+    *drm_events_source_token.borrow_mut() = RegisteredDrmEventSource {
+        token: Some(token),
+        device_id: Some(device_id),
+    };
     Ok(())
 }
 
@@ -2127,6 +2229,13 @@ impl HostBackendState {
     }
 
     fn mark_claim_lost(&mut self) {
+        if self.retired_claim.is_some() {
+            self.last_selection_result = Some(
+                "reclaim candidate lost its event stream; preserving the prior committed claim for rollback"
+                    .to_string(),
+            );
+            return;
+        }
         let Some(output) = self.claimed_output.take() else {
             return;
         };
@@ -2135,6 +2244,20 @@ impl HostBackendState {
             .get_mut(&output.device_id)
             .and_then(|opened| opened.claimed_pipeline.take());
         self.retired_claim = pipeline.map(|pipeline| RetiredHostClaim { output, pipeline });
+    }
+
+    fn drain_retired_pipeline_before_reclaim(&mut self) -> Result<(), RuntimeError> {
+        let Some(retired) = self.retired_claim.as_mut() else {
+            return Ok(());
+        };
+        let Some(opened) = self.opened_devices.get_mut(&retired.output.device_id) else {
+            return Err(RuntimeError::HostOutputClaim {
+                path: retired.output.identity.device_path.display().to_string(),
+                error: "retired output device disappeared before its KMS completion was drained"
+                    .to_string(),
+            });
+        };
+        drain_pipeline_before_reclaim(&opened.fd, &opened.path, &mut retired.pipeline)
     }
 
     fn new(
@@ -2266,6 +2389,11 @@ impl HostBackendState {
         mut before_activation: Option<&mut dyn FnMut(u16, u16) -> Result<(), RuntimeError>>,
         defer_activation: bool,
     ) -> Result<ClaimedHostOutput, RuntimeError> {
+        if defer_activation
+            && let Some(prepared) = self.prepared_reclaim_output.as_ref()
+        {
+            return Ok(prepared.clone());
+        }
         let recovering = self.last_good_output_identity.is_some();
         let forced_drm_path = self.forced_drm_path.clone();
         let forced_output_name = self.forced_output_name.clone();
@@ -2396,6 +2524,10 @@ impl HostBackendState {
             first
         };
 
+        if defer_activation {
+            self.drain_retired_pipeline_before_reclaim()?;
+        }
+
         let Some(opened) = self.opened_devices.get_mut(&chosen.device_id) else {
             return Err(RuntimeError::HostNoConnectedOutputRoute);
         };
@@ -2471,6 +2603,27 @@ impl HostBackendState {
         dup(opened.fd.as_fd()).ok()
     }
 
+    fn presentation_device_id(&self) -> Option<u64> {
+        self.claimed_output
+            .as_ref()
+            .or(self.prepared_reclaim_output.as_ref())
+            .map(|output| output.device_id)
+    }
+
+    fn needs_output_reclaim(&self) -> bool {
+        self.claimed_output.is_none() && self.prepared_reclaim_output.is_none()
+    }
+
+    fn claimed_pipeline_has_pending_flip(&self) -> bool {
+        let Some(claimed) = self.claimed_output.as_ref() else {
+            return false;
+        };
+        self.opened_devices
+            .get(&claimed.device_id)
+            .and_then(|opened| opened.claimed_pipeline.as_ref())
+            .is_some_and(|pipeline| pipeline.flip_pending)
+    }
+
     fn arm_prepared_reclaim_for_presentation(&mut self) -> Result<(), RuntimeError> {
         let prepared =
             self.prepared_reclaim_output
@@ -2503,47 +2656,53 @@ impl HostBackendState {
         Ok(())
     }
 
-    fn discard_unactivated_reclaim(&mut self) {
-        if let Some(prepared) = self.prepared_reclaim_output.take() {
-            if let Some(opened) = self.opened_devices.get_mut(&prepared.device_id) {
-                if let Some(pipeline) = opened.prepared_pipeline.take() {
-                    destroy_claimed_pipeline_resources(&opened.fd, pipeline);
-                }
+    fn discard_unactivated_reclaim(&mut self) -> Option<ClaimedHostOutput> {
+        if let Some(prepared) = self.prepared_reclaim_output.as_ref() {
+            let opened = self.opened_devices.get(&prepared.device_id)?;
+            if opened
+                .prepared_pipeline
+                .as_ref()
+                .is_some_and(|pipeline| pipeline.flip_pending)
+            {
+                return None;
             }
-            return;
+        } else if let Some(failed) = self.claimed_output.as_ref() {
+            let opened = self.opened_devices.get(&failed.device_id)?;
+            if opened
+                .claimed_pipeline
+                .as_ref()
+                .is_some_and(|pipeline| pipeline.flip_pending)
+            {
+                return None;
+            }
         }
-        let Some(failed) = self.claimed_output.take() else {
-            return;
-        };
-        let Some(opened) = self.opened_devices.get_mut(&failed.device_id) else {
-            if let Some(retired) = self.retired_claim.take() {
-                if let Some(retired_opened) = self.opened_devices.get_mut(&retired.output.device_id)
-                {
-                    retired_opened.claimed_pipeline = Some(retired.pipeline);
-                }
-                self.claimed_output = Some(retired.output);
-            }
-            return;
-        };
-        let can_restore = opened
-            .claimed_pipeline
-            .as_ref()
-            .is_some_and(|pipeline| pipeline.pending_atomic_modeset);
-        if can_restore {
-            let failed_pipeline = opened.claimed_pipeline.take();
-            if let Some(failed_pipeline) = failed_pipeline {
-                destroy_claimed_pipeline_resources(&opened.fd, failed_pipeline);
-            }
-            if let Some(retired) = self.retired_claim.take() {
-                if let Some(retired_opened) = self.opened_devices.get_mut(&retired.output.device_id)
-                {
-                    retired_opened.claimed_pipeline = Some(retired.pipeline);
-                }
-                self.claimed_output = Some(retired.output);
-            }
-        } else {
-            self.claimed_output = Some(failed);
+
+        if let Some(prepared) = self.prepared_reclaim_output.take()
+            && let Some(opened) = self.opened_devices.get_mut(&prepared.device_id)
+            && let Some(pipeline) = opened.prepared_pipeline.take()
+        {
+            destroy_claimed_pipeline_resources(&opened.fd, pipeline);
         }
+        if let Some(failed) = self.claimed_output.take()
+            && let Some(opened) = self.opened_devices.get_mut(&failed.device_id)
+            && let Some(pipeline) = opened.claimed_pipeline.take()
+        {
+            destroy_claimed_pipeline_resources(&opened.fd, pipeline);
+        }
+
+        let retired = self.retired_claim.as_ref()?;
+        let restored_output = retired.output.clone();
+        let opened = self.opened_devices.get_mut(&restored_output.device_id)?;
+        let retired = self.retired_claim.take().expect("retired claim was inspected");
+        opened.claimed_pipeline = Some(retired.pipeline);
+        self.claimed_output = Some(restored_output.clone());
+        self.last_good_output_identity = Some(restored_output.identity.clone());
+        self.last_selection_result = Some(format!(
+            "reclaim candidate was discarded before activation; restored {} on {}",
+            restored_output.identity.connector_name,
+            restored_output.identity.device_path.display()
+        ));
+        Some(restored_output)
     }
 
     fn finish_reclaim_activation(&mut self) {
@@ -2595,6 +2754,33 @@ impl HostBackendState {
                 .map(|atomic| atomic.overlay_alpha_blending_supported)
                 .unwrap_or(false);
         Some((ownership, atomic_enabled, overlay_capable))
+    }
+
+    fn reclaim_publication_for(
+        &self,
+        claimed: &ClaimedHostOutput,
+        rotation: OutputRotation,
+    ) -> PendingReclaimPublication {
+        let (mut ownership, atomic_enabled, overlay_capable) = self
+            .present_capabilities_for(claimed)
+            .unwrap_or((RuntimeHostPresentOwnership::None, false, false));
+        if matches!(ownership, RuntimeHostPresentOwnership::DirectGbm)
+            && !direct_present_supported_for_rotation(rotation)
+        {
+            ownership = RuntimeHostPresentOwnership::Dumb;
+        }
+        let (mode_width, mode_height) = claimed.mode.size();
+        PendingReclaimPublication {
+            mode_width: mode_width as i32,
+            mode_height: mode_height as i32,
+            active_connector_name: Some(claimed.identity.connector_name.clone()),
+            active_connector_id: Some(claimed.identity.connector_id),
+            last_selection_attempt: self.last_selection_attempt.clone(),
+            last_selection_result: self.last_selection_result.clone(),
+            ownership,
+            atomic_enabled,
+            overlay_capable,
+        }
     }
 
     fn queue_claimed_presentation_tick(
@@ -2964,18 +3150,13 @@ impl HostBackendState {
             })
         })?;
 
-        let mut completed = Vec::new();
-        for event in events {
-            if let drm_api::control::Event::PageFlip(flip) = event {
-                if flip.crtc == pipeline.crtc && pipeline.flip_pending {
-                    if let Some(token) = complete_pipeline_flip(pipeline) {
-                        completed.push(token);
-                    }
-                }
-            }
-        }
-
-        Ok(completed)
+        Ok(complete_pipeline_flip_events(
+            pipeline,
+            events.into_iter().filter_map(|event| match event {
+                drm_api::control::Event::PageFlip(flip) => Some(flip.crtc),
+                _ => None,
+            }),
+        ))
     }
 
     fn close_device(&mut self, device_id: u64) -> Result<(), RuntimeError> {
@@ -3068,28 +3249,55 @@ fn complete_pipeline_flip(pipeline: &mut ClaimedPresentationPipeline) -> Option<
     pipeline.pending_presentation_token.take()
 }
 
+fn complete_pipeline_flip_for_crtc(
+    pipeline: &mut ClaimedPresentationPipeline,
+    event_crtc: drm_crtc::Handle,
+) -> Option<PresentationToken> {
+    if !pipeline.flip_pending || event_crtc != pipeline.crtc {
+        return None;
+    }
+    complete_pipeline_flip(pipeline)
+}
+
+fn complete_pipeline_flip_events(
+    pipeline: &mut ClaimedPresentationPipeline,
+    event_crtcs: impl IntoIterator<Item = drm_crtc::Handle>,
+) -> Vec<PresentationToken> {
+    event_crtcs
+        .into_iter()
+        .filter_map(|event_crtc| complete_pipeline_flip_for_crtc(pipeline, event_crtc))
+        .collect()
+}
+
 fn drain_prior_pipeline_before_reclaim(opened: &mut OpenedHostDevice) -> Result<(), RuntimeError> {
     let Some(pipeline) = opened.claimed_pipeline.as_mut() else {
         return Ok(());
     };
-    if !pipeline.flip_pending {
-        return Ok(());
-    }
-    let card = HostKmsCard::new(&opened.fd);
+    drain_pipeline_before_reclaim(&opened.fd, &opened.path, pipeline)
+}
+
+fn drain_pipeline_before_reclaim(
+    fd: &OwnedFd,
+    path: &std::path::Path,
+    pipeline: &mut ClaimedPresentationPipeline,
+) -> Result<(), RuntimeError> {
+    let card = HostKmsCard::new(fd);
     let events = card
         .receive_events()
         .map_err(|err| RuntimeError::HostOutputClaim {
-            path: opened.path.display().to_string(),
+            path: path.display().to_string(),
             error: format!("failed to drain prior presentation before reclaim: {err}"),
         })?;
-    if events.into_iter().any(|event| {
-        matches!(event, drm_api::control::Event::PageFlip(flip) if flip.crtc == pipeline.crtc)
-    }) {
-        complete_pipeline_flip(pipeline);
-    }
+    complete_pipeline_flip_events(
+        pipeline,
+        events.into_iter().filter_map(|event| match event {
+            drm_api::control::Event::PageFlip(flip) => Some(flip.crtc),
+            _ => None,
+        }),
+    );
     if pipeline.flip_pending {
         return Err(RuntimeError::HostOutputClaim {
-            path: opened.path.display().to_string(),
+            path: path.display().to_string(),
             error: "prior presentation is still pending before reclaim activation".to_string(),
         });
     }
@@ -5698,15 +5906,15 @@ struct RuntimeWaylandState {
     backend_output_size: Size<i32, Physical>,
     applied_output_rotation: OutputRotation,
     applied_root_geometry_generation: u64,
-    staged_root_geometry: Option<StagedRuntimeRootGeometry>,
-    presentation_root_geometry: Option<StagedRuntimeRootGeometry>,
-    active_root_geometry_consumers: Option<StagedRuntimeRootGeometry>,
+    staged_root_geometry: Option<HostPresentationTransaction>,
+    presentation_root_geometry: Option<HostPresentationTransaction>,
+    active_root_geometry_consumers: Option<HostPresentationTransaction>,
     native_clip_program: Option<GlesTexProgram>,
     shell_overlay_toggle_shortcut: ShellOverlayToggleShortcut,
 }
 
 #[derive(Clone)]
-struct StagedRuntimeRootGeometry {
+struct HostPresentationTransaction {
     committed: crate::root_geometry::CommittedRootGeometry,
     output_global: StagedOutputGlobalState,
     root_layout: crate::root_geometry::ViewportProjection,
@@ -5718,6 +5926,8 @@ struct StagedRuntimeRootGeometry {
     status: crate::root_geometry::DisplayScaleStatus,
     topology: crate::model::StatusSnapshot,
     accepted_material_identity: Option<AcceptedMaterialIdentity>,
+    pending_flip: Option<PresentationToken>,
+    disappeared_native_owner: Option<PaneId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5766,7 +5976,18 @@ enum Root4ConsumerStage {
     Status,
 }
 
-impl StagedRuntimeRootGeometry {
+impl HostPresentationTransaction {
+    fn mark_flip_queued(&mut self, token: PresentationToken) {
+        debug_assert!(self.pending_flip.is_none());
+        self.pending_flip = Some(token);
+    }
+
+    fn take_completed_flip(&mut self, completed: &[PresentationToken]) -> bool {
+        self.pending_flip
+            .take_if(|pending| completed.contains(pending))
+            .is_some()
+    }
+
     fn is_coherent(&self) -> bool {
         let generation = self.committed.snapshot.generation;
         self.root_layout.root_geometry_generation == generation
@@ -5810,7 +6031,7 @@ fn stage_runtime_root_geometry_consumers(
     state: &CompositorState,
     committed: crate::root_geometry::CommittedRootGeometry,
     #[cfg(test)] fail_at: Option<Root4ConsumerStage>,
-) -> Result<StagedRuntimeRootGeometry, crate::root_geometry::RootGeometryError> {
+) -> Result<HostPresentationTransaction, crate::root_geometry::RootGeometryError> {
     let snapshot = committed.snapshot;
     macro_rules! stage {
         ($consumer:expr, $expression:expr) => {{
@@ -5931,7 +6152,7 @@ fn stage_runtime_root_geometry_consumers(
     );
     let input = stage!(Root4ConsumerStage::Input, committed.input.0);
     let status = stage!(Root4ConsumerStage::Status, committed.status.0.status());
-    let staged = StagedRuntimeRootGeometry {
+    let staged = HostPresentationTransaction {
         committed,
         output_global,
         root_layout,
@@ -5943,6 +6164,8 @@ fn stage_runtime_root_geometry_consumers(
         status,
         topology: status_snapshot,
         accepted_material_identity: None,
+        pending_flip: None,
+        disappeared_native_owner: None,
     };
     if staged.is_coherent() {
         Ok(staged)
@@ -7224,6 +7447,7 @@ impl RuntimeWaylandState {
                 if let Some(pointer) = self.seat.get_pointer() {
                     let serial = SERIAL_COUNTER.next_serial();
                     if event.state() == ButtonState::Pressed && !pointer.is_grabbed() {
+                        // A native implicit grab keeps its original owner through release.
                         let (_, status) = self.input_operation_snapshot();
                         let surface_under = self.surface_under_point_for_capture(
                             self.pointer_location,
@@ -7314,6 +7538,11 @@ impl RuntimeWaylandState {
                 state.shell_overlay_focus_requested(),
             )
         };
+        let requested_native_owner_disappeared = matches!(
+            requested_target.as_ref(),
+            Some(RuntimeFocusTarget::NativePane { pane_id })
+                if !self.native_pane_toplevels.contains_key(pane_id)
+        );
         let resolved = shell_overlay_focus_requested
             .then(|| {
                 self.overlay_toplevel.as_ref().map(|surface| {
@@ -7348,12 +7577,16 @@ impl RuntimeWaylandState {
                 None => None,
             })
             .or_else(|| {
-                self.overlay_toplevel.as_ref().map(|surface| {
-                    (
-                        RuntimeFocusTarget::OverlayNative,
-                        surface.wl_surface().clone(),
-                    )
-                })
+                if requested_native_owner_disappeared {
+                    None
+                } else {
+                    self.overlay_toplevel.as_ref().map(|surface| {
+                        (
+                            RuntimeFocusTarget::OverlayNative,
+                            surface.wl_surface().clone(),
+                        )
+                    })
+                }
             })
             .or_else(|| {
                 self.main_toplevel
@@ -7376,6 +7609,39 @@ impl RuntimeWaylandState {
             }
             state.set_runtime_focus_target(resolved_target);
         }
+    }
+
+    fn note_native_pane_owner_disappeared(&mut self, pane_id: &PaneId) {
+        let affected_generation = self
+            .staged_root_geometry
+            .as_mut()
+            .filter(|transaction| {
+                transaction
+                    .native_materializations
+                    .iter()
+                    .any(|(staged_pane_id, _)| staged_pane_id == pane_id)
+            })
+            .map(|transaction| {
+                if transaction.pending_flip.is_none() {
+                    transaction.disappeared_native_owner = Some(pane_id.clone());
+                }
+                (
+                    transaction.committed.snapshot.generation,
+                    transaction.pending_flip.is_some(),
+                )
+            });
+        let diagnostic = match affected_generation {
+            Some((generation, true)) => format!(
+                "native pane owner disappeared: pane_id={pane_id}; root4 generation {generation} remains tied to its queued KMS completion; native grab remains until release and future focus targets Surf Ace's main surface when available"
+            ),
+            Some((generation, false)) => format!(
+                "native pane owner disappeared: pane_id={pane_id}; unqueued root4 generation {generation} canceled; native grab remains until release and future focus targets Surf Ace's main surface when available"
+            ),
+            None => format!(
+                "native pane owner disappeared: pane_id={pane_id}; native grab remains until release and future focus targets Surf Ace's main surface when available"
+            ),
+        };
+        lock_state(&self.shared_state).record_runtime_diagnostic(diagnostic);
     }
 
     fn handle_shell_overlay_toggle(&mut self) {
@@ -9247,6 +9513,7 @@ impl XdgShellHandler for RuntimeWaylandState {
                     self.bridge_native_pane_surface_detached(pid);
                 }
             }
+            self.note_native_pane_owner_disappeared(&pane_id);
         }
         let mut removed_popup_ids = Vec::new();
         self.popups.retain(|popup| {
@@ -10034,10 +10301,11 @@ mod tests {
         ClaimedHostOutput, ClaimedPresentationPipeline, GLES_INTERMEDIATE_RENDER_FORMAT,
         HostBackendState, HostRuntimeLoopData, OpenedHostDevice, OutputIdentity, PlaneSelection,
         RoleSurfaceMapping, Root4ConsumerStage,
-        PresentationToken, RootGeometryFlipBoundary, RuntimeGeometryMutation,
-        RootGeometryStageStore, RuntimeGeometryMutationQueue, RuntimeSurfaceRole, RuntimeWaylandState,
+        PresentationToken, RuntimeGeometryMutation, RootGeometryStageStore,
+        RuntimeGeometryMutationQueue, RuntimeSurfaceRole, RuntimeWaylandState,
         ShellOverlayToggleShortcut, StartupPresentOwnership, build_host_gles_renderer_state,
-        compile_native_clip_program, materialize_native_surface_elements,
+        compile_native_clip_program, complete_pipeline_flip_events,
+        materialize_native_surface_elements,
         copy_renderer_pixels_to_dumb,
         direct_present_supported_for_rotation, native_materialized_destination_rect,
         native_materialized_local_clip, native_materialized_source_rect, native_source_sample,
@@ -10330,7 +10598,6 @@ mod tests {
                 pending_rotation_response: None,
                 root_geometry_queue: RuntimeGeometryMutationQueue::default(),
                 pending_geometry_mutation: None,
-                root_geometry_flip_boundary: RootGeometryFlipBoundary::default(),
                 pending_reclaim_publication: None,
                 root_geometry_stage_failure: None,
             },
@@ -10357,6 +10624,38 @@ mod tests {
                 staged.committed.snapshot,
                 &staged.captures,
             );
+    }
+
+    fn seed_committed_root_capture(runtime: &HostRuntimeLoopData) {
+        let committed = lock_state(&runtime.shared_state)
+            .root_geometry_snapshot()
+            .expect("host root geometry must have a committed snapshot");
+        runtime
+            .host_backend
+            .screen_capture
+            .update_root4_scanout_xrgb8888(&[0, 0, 0, 0], 4, 1, 1, false, committed, &[]);
+    }
+
+    fn assert_committed_root_geometry_generation(state: &CompositorState, generation: u64) {
+        let committed = state
+            .root_geometry_projections()
+            .expect("host root geometry projections must be committed");
+        assert_eq!(committed.snapshot.generation, generation);
+        assert_eq!(committed.root_layout.0.generation, generation);
+        assert_eq!(committed.composited_content.0.generation, generation);
+        assert_eq!(committed.native_materialization.0.generation, generation);
+        assert_eq!(committed.viewports.0.generation, generation);
+        assert_eq!(committed.captures.0.generation, generation);
+        assert_eq!(committed.input.0.generation, generation);
+        assert_eq!(committed.status.0.generation, generation);
+        assert_eq!(
+            state
+                .status_snapshot()
+                .display_scale
+                .expect("host mode must publish display scale status")
+                .root_geometry_generation,
+            generation
+        );
     }
 
     fn test_pipeline(pending_atomic_modeset: bool) -> ClaimedPresentationPipeline {
@@ -10921,6 +11220,8 @@ mod tests {
         let active = lock_state(&runtime.shared_state)
             .root_geometry_snapshot()
             .unwrap();
+        seed_committed_root_capture(&runtime);
+        assert_eq!(capture.root4_generations_for_test(), (Some(active.generation), None));
         let (rotation_tx, rotation_rx) = std::sync::mpsc::sync_channel(1);
         runtime
             .root_geometry_queue
@@ -10943,18 +11244,68 @@ mod tests {
 
         runtime.stage_next_root_geometry_mutation();
         stage_capture_for_pending_geometry(&runtime);
+        let staged = runtime
+            .wayland_state
+            .staged_root_geometry
+            .as_ref()
+            .expect("geometry transaction must remain staged until KMS completion");
+        let staged_generation = staged.committed.snapshot.generation;
+        assert!(staged.is_coherent());
+        assert_eq!(staged.input.generation, staged_generation);
+        assert_eq!(staged.status.root_geometry_generation, staged_generation);
+        assert!(staged
+            .viewports
+            .iter()
+            .all(|(_, viewport)| viewport.root_geometry_generation == staged_generation));
+        assert!(staged
+            .captures
+            .iter()
+            .all(|(_, capture)| capture.root_geometry_generation == staged_generation));
+        assert_eq!(
+            (staged.output_global.physical_width, staged.output_global.physical_height),
+            (
+                staged.committed.snapshot.physical_size_px.width,
+                staged.committed.snapshot.physical_size_px.height
+            )
+        );
+        assert_eq!(
+            capture.root4_generations_for_test(),
+            (Some(active.generation), Some(staged_generation))
+        );
+        assert_committed_root_geometry_generation(
+            &lock_state(&runtime.shared_state),
+            active.generation,
+        );
         runtime
-            .root_geometry_flip_boundary
-            .mark_queued(PresentationToken(10));
+            .wayland_state
+            .staged_root_geometry
+            .as_mut()
+            .unwrap()
+            .mark_flip_queued(PresentationToken(10));
         assert!(!runtime.complete_root_geometry_presentations(&[PresentationToken(9)]));
         assert_eq!(
             lock_state(&runtime.shared_state).root_geometry_snapshot(),
             Some(active)
         );
-        assert!(runtime.complete_root_geometry_presentations(&[PresentationToken(10)]));
         assert_eq!(
             capture.root4_generations_for_test(),
-            (Some(active.generation + 1), None)
+            (Some(active.generation), Some(staged_generation))
+        );
+        assert!(runtime.complete_root_geometry_presentations(&[PresentationToken(10)]));
+        assert_committed_root_geometry_generation(
+            &lock_state(&runtime.shared_state),
+            staged_generation,
+        );
+        let active_transaction = runtime
+            .wayland_state
+            .active_root_geometry_consumers
+            .as_ref()
+            .expect("completed transaction must become the active runtime projection");
+        assert!(active_transaction.is_coherent());
+        assert_eq!(active_transaction.pending_flip, None);
+        assert_eq!(
+            capture.root4_generations_for_test(),
+            (Some(staged_generation), None)
         );
 
         runtime.stage_next_root_geometry_mutation();
@@ -10964,8 +11315,11 @@ mod tests {
         ));
         stage_capture_for_pending_geometry(&runtime);
         runtime
-            .root_geometry_flip_boundary
-            .mark_queued(PresentationToken(11));
+            .wayland_state
+            .staged_root_geometry
+            .as_mut()
+            .unwrap()
+            .mark_flip_queued(PresentationToken(11));
         assert!(runtime.complete_root_geometry_presentations(&[PresentationToken(11)]));
         assert_eq!(rotation_rx.recv().unwrap(), Ok(()));
 
@@ -11009,6 +11363,87 @@ mod tests {
     }
 
     #[test]
+    fn retired_kms_drain_advances_buffers_and_consumes_same_crtc_stale_events() {
+        let crtc = drm_api::control::from_u32(1).unwrap();
+        let mut pipeline = test_pipeline(false);
+        pipeline.crtc = crtc;
+        pipeline.flip_pending = true;
+        pipeline.pending_flip_source = Some(super::QueuedFlipSource::Dumb);
+        pipeline.pending_presentation_token = Some(PresentationToken(7));
+
+        let drained = complete_pipeline_flip_events(&mut pipeline, [crtc, crtc]);
+
+        assert_eq!(drained, [PresentationToken(7)]);
+        assert_eq!((pipeline.dumb_front_buffer, pipeline.dumb_back_buffer), (1, 0));
+        assert!(!pipeline.flip_pending);
+        assert_eq!(pipeline.pending_presentation_token, None);
+
+        pipeline.flip_pending = true;
+        pipeline.pending_flip_source = Some(super::QueuedFlipSource::Dumb);
+        pipeline.pending_presentation_token = Some(PresentationToken(8));
+        assert!(complete_pipeline_flip_events(&mut pipeline, []).is_empty());
+        assert!(pipeline.flip_pending);
+        assert_eq!(
+            complete_pipeline_flip_events(&mut pipeline, [crtc]),
+            [PresentationToken(8)]
+        );
+    }
+
+    #[test]
+    fn prepared_reclaim_is_reused_until_its_fifo_mode_transaction_arms_it() {
+        let mut backend =
+            HostBackendState::for_root_geometry_test(ScreenCaptureStore::default());
+        let prepared = test_claimed_output(2, "/dev/dri/card-test-new");
+        backend.prepared_reclaim_output = Some(prepared.clone());
+
+        assert!(!backend.needs_output_reclaim());
+        let reused = backend
+            .claim_output_ownership(None, None, true)
+            .expect("prepared reclaim must be reused without opening another pipeline");
+        assert_eq!(reused.device_id, prepared.device_id);
+        assert_eq!(reused.identity, prepared.identity);
+        assert_eq!(backend.prepared_reclaim_output.as_ref().unwrap().device_id, 2);
+        assert!(backend.opened_devices.is_empty());
+    }
+
+    #[test]
+    fn discarding_prepared_same_or_cross_device_reclaim_restores_the_committed_owner() {
+        for replacement_device_id in [1, 2] {
+            let mut backend =
+                HostBackendState::for_root_geometry_test(ScreenCaptureStore::default());
+            seed_reclaim_lifecycle(&mut backend, replacement_device_id);
+
+            let restored = backend
+                .discard_unactivated_reclaim()
+                .expect("unarmed candidate must return the retained committed claim");
+
+            assert_eq!(restored.device_id, 1);
+            assert_eq!(backend.claimed_output.as_ref().unwrap().device_id, 1);
+            assert!(backend.retired_claim.is_none());
+            if replacement_device_id == 1 {
+                assert!(backend.opened_devices[&1].prepared_pipeline.is_none());
+            } else {
+                assert!(backend.opened_devices[&2].prepared_pipeline.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn losing_a_reclaim_candidate_does_not_overwrite_the_committed_rollback_owner() {
+        let mut backend =
+            HostBackendState::for_root_geometry_test(ScreenCaptureStore::default());
+        seed_reclaim_lifecycle(&mut backend, 2);
+        backend.arm_prepared_reclaim_for_presentation().unwrap();
+
+        backend.mark_claim_lost();
+
+        assert_eq!(backend.retired_claim.as_ref().unwrap().output.device_id, 1);
+        assert_eq!(backend.claimed_output.as_ref().unwrap().device_id, 2);
+        assert!(backend.opened_devices[&1].claimed_pipeline.is_none());
+        assert!(backend.opened_devices[&2].claimed_pipeline.is_some());
+    }
+
+    #[test]
     fn host_backend_same_and_cross_device_reclaim_failure_restore_the_retired_claim() {
         for replacement_device_id in [1, 2] {
             let mut backend =
@@ -11020,8 +11455,11 @@ mod tests {
                 replacement_device_id
             );
 
-            backend.discard_unactivated_reclaim();
+            let restored = backend
+                .discard_unactivated_reclaim()
+                .expect("pre-activation failure must restore the previous claim");
 
+            assert_eq!(restored.device_id, 1);
             assert_eq!(backend.claimed_output.as_ref().unwrap().device_id, 1);
             assert!(backend.retired_claim.is_none());
             assert!(
@@ -11082,12 +11520,68 @@ mod tests {
     }
 
     #[test]
+    fn host_runtime_mode_failure_restores_the_previous_geometry_capture_and_status() {
+        let (mut runtime, _event_loop, capture) = test_host_runtime_loop();
+        seed_reclaim_lifecycle(&mut runtime.host_backend, 2);
+        let active = lock_state(&runtime.shared_state)
+            .root_geometry_snapshot()
+            .unwrap();
+        seed_committed_root_capture(&runtime);
+        assert_eq!(capture.root4_generations_for_test(), (Some(active.generation), None));
+        lock_state(&runtime.shared_state)
+            .mark_runtime_host_output_reclaim_pending("candidate reclaim pending");
+        runtime
+            .root_geometry_queue
+            .push(RuntimeGeometryMutation::Mode {
+                width: 1920,
+                height: 1080,
+            });
+
+        runtime.stage_next_root_geometry_mutation();
+        assert!(runtime.wayland_state.staged_root_geometry.is_some());
+        let candidate_generation = runtime
+            .wayland_state
+            .staged_root_geometry
+            .as_ref()
+            .unwrap()
+            .committed
+            .snapshot
+            .generation;
+        assert_eq!(
+            capture.root4_generations_for_test(),
+            (Some(active.generation), Some(candidate_generation))
+        );
+        assert!(
+            !lock_state(&runtime.shared_state)
+                .status_snapshot()
+                .runtime
+                .host_output_ownership
+        );
+
+        assert!(runtime.discard_staged_root_geometry(
+            crate::root_geometry::RootGeometryError::DisplayScaleApplyFailed,
+        ));
+
+        assert_eq!(
+            lock_state(&runtime.shared_state).root_geometry_snapshot(),
+            Some(active)
+        );
+        let status = lock_state(&runtime.shared_state).status_snapshot().runtime;
+        assert!(status.host_output_ownership);
+        assert_eq!(status.host_active_connector_name.as_deref(), Some("TEST-1"));
+        assert_eq!(capture.root4_generations_for_test(), (Some(active.generation), None));
+        assert!(runtime.host_backend.retired_claim.is_none());
+        assert_eq!(runtime.host_backend.claimed_output.as_ref().unwrap().device_id, 1);
+    }
+
+    #[test]
     fn host_runtime_mode_reclaim_activates_at_the_same_exact_completion_boundary() {
         let (mut runtime, _event_loop, capture) = test_host_runtime_loop();
         seed_reclaim_lifecycle(&mut runtime.host_backend, 2);
         let active = lock_state(&runtime.shared_state)
             .root_geometry_snapshot()
             .unwrap();
+        seed_committed_root_capture(&runtime);
         runtime
             .root_geometry_queue
             .push(RuntimeGeometryMutation::Mode {
@@ -11106,22 +11600,49 @@ mod tests {
             2
         );
         assert!(runtime.host_backend.retired_claim.is_some());
+        let staged_generation = runtime
+            .wayland_state
+            .staged_root_geometry
+            .as_ref()
+            .unwrap()
+            .committed
+            .snapshot
+            .generation;
+        assert_eq!(
+            capture.root4_generations_for_test(),
+            (Some(active.generation), Some(staged_generation))
+        );
         assert_eq!(
             lock_state(&runtime.shared_state).root_geometry_snapshot(),
             Some(active)
         );
         stage_capture_for_pending_geometry(&runtime);
         runtime
-            .root_geometry_flip_boundary
-            .mark_queued(PresentationToken(25));
+            .wayland_state
+            .staged_root_geometry
+            .as_mut()
+            .unwrap()
+            .mark_flip_queued(PresentationToken(25));
         assert!(!runtime.complete_root_geometry_presentations(&[PresentationToken(24)]));
         assert!(runtime.host_backend.retired_claim.is_some());
+        assert_eq!(
+            capture.root4_generations_for_test(),
+            (Some(active.generation), Some(staged_generation))
+        );
+        assert_committed_root_geometry_generation(
+            &lock_state(&runtime.shared_state),
+            active.generation,
+        );
         assert!(runtime.complete_root_geometry_presentations(&[PresentationToken(25)]));
 
         let committed = lock_state(&runtime.shared_state)
             .root_geometry_snapshot()
             .unwrap();
-        assert_eq!(committed.generation, active.generation + 1);
+        assert_eq!(committed.generation, staged_generation);
+        assert_committed_root_geometry_generation(
+            &lock_state(&runtime.shared_state),
+            staged_generation,
+        );
         assert_eq!(
             (
                 committed.physical_size_px.width,
@@ -11134,6 +11655,98 @@ mod tests {
             (Some(committed.generation), None)
         );
         assert!(runtime.host_backend.retired_claim.is_none());
+    }
+
+    #[test]
+    fn disappeared_native_owner_cancels_unqueued_generation_with_status_diagnostic() {
+        let (mut runtime, _event_loop, capture) = test_host_runtime_loop();
+        let pane_id = PaneId::new("native-owner");
+        lock_state(&runtime.shared_state)
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: pane_id.clone(),
+                content_id: Some("terminal-content".to_string()),
+                binding_id: Some("native-owner-binding".to_string()),
+                launch_token: None,
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 10.25,
+                    y: 20.5,
+                    width: 100.25,
+                    height: 50.75,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+                target: NativeTargetClass::Terminal,
+                process: ProcessSpec {
+                    command: "foot".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: Default::default(),
+                },
+            }])
+            .expect("native pane plan must be accepted");
+        let active_generation = lock_state(&runtime.shared_state)
+            .root_geometry_snapshot()
+            .unwrap()
+            .generation;
+        runtime
+            .root_geometry_queue
+            .push(RuntimeGeometryMutation::Scale {
+                factor: 1.25,
+                source: crate::root_geometry::DisplayScaleSource::Config,
+            });
+        runtime.stage_next_root_geometry_mutation();
+        let staged_generation = runtime
+            .wayland_state
+            .staged_root_geometry
+            .as_ref()
+            .unwrap()
+            .committed
+            .snapshot
+            .generation;
+        assert!(runtime
+            .wayland_state
+            .staged_root_geometry
+            .as_ref()
+            .unwrap()
+            .native_materializations
+            .iter()
+            .any(|(staged_pane_id, _)| staged_pane_id == &pane_id));
+
+        runtime
+            .wayland_state
+            .note_native_pane_owner_disappeared(&pane_id);
+        let failure = runtime
+            .queue_pinned_presentation_tick()
+            .expect_err("a disappeared native owner must cancel before KMS queueing");
+        assert!(failure.is_transaction());
+        assert!(failure
+            .error_ref()
+            .to_string()
+            .contains("native pane owner native-owner disappeared"));
+        assert_eq!(capture.root4_generations_for_test(), (None, None));
+        assert!(!runtime.discard_staged_root_geometry(
+            crate::root_geometry::RootGeometryError::DisplayScaleApplyFailed,
+        ));
+        assert!(runtime.wayland_state.staged_root_geometry.is_none());
+        assert_eq!(
+            lock_state(&runtime.shared_state)
+                .root_geometry_snapshot()
+                .unwrap()
+                .generation,
+            active_generation
+        );
+        let status = lock_state(&runtime.shared_state).status_snapshot().runtime;
+        assert_eq!(status.phase, crate::model::RuntimePhase::Running);
+        assert!(status
+            .last_diagnostic
+            .as_deref()
+            .unwrap()
+            .contains(&format!("root4 generation {staged_generation} canceled")));
+        assert!(status
+            .last_diagnostic
+            .as_deref()
+            .unwrap()
+            .contains("later focus returns to Surf Ace"));
     }
 
     #[test]
@@ -11165,17 +11778,41 @@ mod tests {
 
     #[test]
     fn production_geometry_activation_waits_for_a_queued_flip_completion() {
-        let mut boundary = RootGeometryFlipBoundary::default();
+        let (mut runtime, _event_loop, _capture) = test_host_runtime_loop();
+        runtime
+            .root_geometry_queue
+            .push(RuntimeGeometryMutation::Scale {
+                factor: 1.5,
+                source: crate::root_geometry::DisplayScaleSource::Config,
+            });
+        runtime.stage_next_root_geometry_mutation();
+        let transaction = runtime
+            .wayland_state
+            .staged_root_geometry
+            .as_mut()
+            .unwrap();
         let geometry_frame = PresentationToken(7);
-        assert!(!boundary.take_completed(&[geometry_frame]));
-        boundary.mark_queued(geometry_frame);
-        assert!(!boundary.take_completed(&[]));
-        assert!(!boundary.take_completed(&[PresentationToken(6)]));
-        assert!(boundary.take_completed(&[geometry_frame]));
-        assert!(!boundary.take_completed(&[geometry_frame]));
-        boundary.mark_queued(PresentationToken(8));
-        boundary.discard();
-        assert!(!boundary.take_completed(&[PresentationToken(8)]));
+        assert!(!transaction.take_completed_flip(&[geometry_frame]));
+        transaction.mark_flip_queued(geometry_frame);
+        assert!(!transaction.take_completed_flip(&[]));
+        assert!(!transaction.take_completed_flip(&[PresentationToken(6)]));
+        assert!(transaction.take_completed_flip(&[geometry_frame]));
+        assert!(!transaction.take_completed_flip(&[geometry_frame]));
+        transaction.mark_flip_queued(PresentationToken(8));
+        assert!(!runtime.discard_staged_root_geometry(
+            crate::root_geometry::RootGeometryError::DisplayScaleApplyFailed,
+        ));
+        assert_eq!(
+            runtime
+                .wayland_state
+                .staged_root_geometry
+                .as_ref()
+                .unwrap()
+                .pending_flip,
+            Some(PresentationToken(8))
+        );
+        assert!(runtime.complete_root_geometry_presentations(&[PresentationToken(8)]));
+        assert!(runtime.wayland_state.staged_root_geometry.is_none());
     }
 
     #[test]
@@ -11190,37 +11827,67 @@ mod tests {
             )
             .unwrap();
         let staged = stage_runtime_root_geometry_consumers(&state, prepared, None).unwrap();
+        assert!(staged.is_coherent());
         let shared_state = Arc::new(Mutex::new(state));
         let display: Display<RuntimeWaylandState> = Display::new().unwrap();
         let mut wayland =
             RuntimeWaylandState::new(display.handle(), Arc::clone(&shared_state)).unwrap();
         let mut store = DeterministicStageStore::default();
-        let mut boundary = RootGeometryFlipBoundary::default();
         let matching = PresentationToken(42);
 
         install_root_geometry_stage(&mut wayland, &mut store, staged);
-        boundary.mark_queued(matching);
+        wayland
+            .staged_root_geometry
+            .as_mut()
+            .unwrap()
+            .mark_flip_queued(matching);
         assert_eq!(store.events, [("begin", prepared.snapshot.generation)]);
+        assert_eq!(
+            wayland
+                .staged_root_geometry
+                .as_ref()
+                .unwrap()
+                .pending_flip,
+            Some(matching)
+        );
         assert_eq!(
             lock_state(&shared_state).root_geometry_snapshot(),
             Some(active)
         );
+        assert_committed_root_geometry_generation(&lock_state(&shared_state), active.generation);
 
         // A retired operation on the same physical CRTC cannot publish this stage.
-        assert!(!boundary.take_completed(&[PresentationToken(41)]));
+        assert!(
+            !wayland
+                .staged_root_geometry
+                .as_mut()
+                .unwrap()
+                .take_completed_flip(&[PresentationToken(41)])
+        );
         assert!(wayland.staged_root_geometry.is_some());
         assert_eq!(
             lock_state(&shared_state).root_geometry_snapshot(),
             Some(active)
         );
+        assert_committed_root_geometry_generation(&lock_state(&shared_state), active.generation);
 
-        assert!(boundary.take_completed(&[matching]));
+        assert!(
+            wayland
+                .staged_root_geometry
+                .as_mut()
+                .unwrap()
+                .take_completed_flip(&[matching])
+        );
         let activated =
             activate_root_geometry_stage(&shared_state, &mut wayland, &mut store, |_| {}).unwrap();
         assert_eq!(activated.committed.snapshot, prepared.snapshot);
         assert_eq!(
             lock_state(&shared_state).root_geometry_snapshot(),
             Some(prepared.snapshot)
+        );
+        assert_committed_root_geometry_generation(
+            &lock_state(&shared_state),
+            prepared.snapshot.generation,
         );
         assert_eq!(
             store.events,
@@ -11477,6 +12144,77 @@ mod tests {
                 pane_id: PaneId::new("pane-a")
             }
         );
+    }
+
+    #[test]
+    fn missing_native_focus_owner_returns_to_main_surface_not_overlay() {
+        let shared_state = Arc::new(Mutex::new(CompositorState::new(
+            true,
+            Box::new(NoopProcessController),
+        )));
+        lock_state(&shared_state).mark_runtime_resize(1920, 1080);
+        let display: Display<RuntimeWaylandState> = Display::new().unwrap();
+        let display_handle = display.handle();
+        let mut wayland =
+            RuntimeWaylandState::new(display_handle.clone(), Arc::clone(&shared_state)).unwrap();
+        let (main_server, main_client_socket) = UnixStream::pair().unwrap();
+        let (overlay_server, overlay_client_socket) = UnixStream::pair().unwrap();
+        display_handle
+            .insert_client(main_server, Arc::new(super::RuntimeClientState::default()))
+            .unwrap();
+        display_handle
+            .insert_client(overlay_server, Arc::new(super::RuntimeClientState::default()))
+            .unwrap();
+        let (main_ready, release_main) = spawn_real_shm_surface_tree(main_client_socket);
+        let (overlay_ready, release_overlay) = spawn_real_shm_surface_tree(overlay_client_socket);
+        let mut main_client_ready = false;
+        let mut overlay_client_ready = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        while wayland.main_toplevel.is_none()
+            || wayland.overlay_toplevel.is_none()
+            || !main_client_ready
+            || !overlay_client_ready
+        {
+            assert!(
+                std::time::Instant::now()
+                    < deadline,
+                "fixture Wayland clients must become ready"
+            );
+            display.dispatch_clients(&mut wayland).unwrap();
+            while let Some(toplevel) = wayland.pending_toplevels.first().cloned() {
+                wayland.pending_toplevels.remove(0);
+                if wayland.main_toplevel.is_none() {
+                    wayland.configure_toplevel_for_role(&toplevel, super::RuntimeSurfaceRole::MainApp);
+                    wayland.main_toplevel = Some(toplevel);
+                } else if wayland.overlay_toplevel.is_none() {
+                    wayland.configure_toplevel_for_role(
+                        &toplevel,
+                        super::RuntimeSurfaceRole::OverlayNative,
+                    );
+                    wayland.overlay_toplevel = Some(toplevel);
+                }
+            }
+            display.flush_clients().unwrap();
+            main_client_ready |= main_ready.try_recv().is_ok();
+            overlay_client_ready |= overlay_ready.try_recv().is_ok();
+            std::thread::yield_now();
+        }
+
+        lock_state(&shared_state).set_runtime_focus_target(Some(RuntimeFocusTarget::NativePane {
+            pane_id: PaneId::new("disappeared-native-pane"),
+        }));
+        wayland.apply_focus_route();
+
+        assert_eq!(
+            lock_state(&shared_state)
+                .status_snapshot()
+                .runtime
+                .active_focus_target,
+            Some(RuntimeFocusTarget::MainApp)
+        );
+        release_main.send(()).unwrap();
+        release_overlay.send(()).unwrap();
     }
 
     #[test]

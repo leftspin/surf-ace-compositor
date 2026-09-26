@@ -702,6 +702,8 @@ pub struct RuntimeStatus {
     pub denied_toplevel_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_diagnostic: Option<String>,
 }
 
 impl Default for RuntimeStatus {
@@ -765,6 +767,7 @@ impl Default for RuntimeStatus {
             overlay_region_debug_borders: false,
             denied_toplevel_count: 0,
             last_error: None,
+            last_diagnostic: None,
         }
     }
 }

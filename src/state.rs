@@ -919,6 +919,10 @@ impl CompositorState {
         self.runtime.active_focus_target = target;
     }
 
+    pub fn record_runtime_diagnostic(&mut self, diagnostic: impl Into<String>) {
+        self.runtime.last_diagnostic = Some(diagnostic.into());
+    }
+
     pub fn configure_sun_schedule_profile(&mut self, profile: NodeSunScheduleProfile) {
         self.configured_sun_schedule_profile = Some(profile);
     }
