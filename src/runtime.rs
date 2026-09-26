@@ -12907,19 +12907,24 @@ mod tests {
                 "fixture Wayland clients must become ready"
             );
             display.dispatch_clients(&mut wayland).unwrap();
-            while let Some(toplevel) = wayland.pending_toplevels.first().cloned() {
-                wayland.pending_toplevels.remove(0);
-                if wayland.main_toplevel.is_none() {
-                    wayland
-                        .configure_toplevel_for_role(&toplevel, super::RuntimeSurfaceRole::MainApp);
-                    wayland.main_toplevel = Some(toplevel);
-                } else if wayland.overlay_toplevel.is_none() {
-                    wayland.configure_toplevel_for_role(
-                        &toplevel,
-                        super::RuntimeSurfaceRole::OverlayNative,
-                    );
-                    wayland.overlay_toplevel = Some(toplevel);
-                }
+            // Assign both roles together so a later new_toplevel dispatch cannot
+            // evict the first client while the main-app binding expectation is absent.
+            if wayland.main_toplevel.is_none()
+                && wayland.overlay_toplevel.is_none()
+                && wayland.pending_toplevels.len() >= 2
+            {
+                let main_toplevel = wayland.pending_toplevels.remove(0);
+                let overlay_toplevel = wayland.pending_toplevels.remove(0);
+                wayland.configure_toplevel_for_role(
+                    &main_toplevel,
+                    super::RuntimeSurfaceRole::MainApp,
+                );
+                wayland.main_toplevel = Some(main_toplevel);
+                wayland.configure_toplevel_for_role(
+                    &overlay_toplevel,
+                    super::RuntimeSurfaceRole::OverlayNative,
+                );
+                wayland.overlay_toplevel = Some(overlay_toplevel);
             }
             display.flush_clients().unwrap();
             main_client_ready |= main_ready.try_recv().is_ok();
