@@ -50,6 +50,10 @@ pub enum SupervisorEvent {
         pid: u32,
         supervisor_pid: u32,
     },
+    ChildExited {
+        exit_code: Option<i32>,
+        sanitizer_failed: bool,
+    },
     StartFailed {
         reason: String,
     },
@@ -404,6 +408,7 @@ fn finish_child(
     let mut child_reaped = false;
     let mut sanitizer_failed = false;
     let mut failure_reported = false;
+    let mut child_exit_reported = false;
 
     while !child_reaped || !pump_threads_finished(child) {
         if !sanitizer_failed {
@@ -440,6 +445,14 @@ fn finish_child(
                 Ok(Some(status)) => {
                     exit_code = status.code();
                     child_reaped = true;
+                    let _ = write_frame(
+                        stream,
+                        &SupervisorEvent::ChildExited {
+                            exit_code,
+                            sanitizer_failed,
+                        },
+                    );
+                    child_exit_reported = true;
                 }
                 Ok(None) => thread::sleep(Duration::from_millis(10)),
                 Err(_) => {
@@ -497,6 +510,15 @@ fn finish_child(
                 },
             );
         }
+    }
+    if child_reaped && !child_exit_reported {
+        let _ = write_frame(
+            stream,
+            &SupervisorEvent::ChildExited {
+                exit_code,
+                sanitizer_failed,
+            },
+        );
     }
 
     ChildOutcome {
@@ -563,7 +585,7 @@ fn pump_stream<R: Read, W: Write>(
             if *byte == b'\n' {
                 if !discarding && !reported {
                     if let Err(failure) =
-                        emit_record(&mut writer, &record, unit_name, stream, secrets)
+                        emit_record_or_discard(&mut writer, &record, unit_name, stream, secrets)
                     {
                         report_pump_failure(
                             &mut writer,
@@ -588,16 +610,23 @@ fn pump_stream<R: Read, W: Write>(
             if record.len() == MAX_RECORD_BYTES {
                 record.clear();
                 discarding = true;
-                report_pump_failure(
+                if let Err(failure) = emit_discarded_record(
                     &mut writer,
                     unit_name,
                     stream,
                     PumpFailure::RecordTooLong,
-                    secrets,
-                    failure_tx,
-                    failed,
-                    &mut reported,
-                );
+                ) {
+                    report_pump_failure(
+                        &mut writer,
+                        unit_name,
+                        stream,
+                        failure,
+                        secrets,
+                        failure_tx,
+                        failed,
+                        &mut reported,
+                    );
+                }
                 continue;
             }
             record.push(*byte);
@@ -605,7 +634,9 @@ fn pump_stream<R: Read, W: Write>(
     }
 
     if !reported && !discarding && !record.is_empty() {
-        if let Err(failure) = emit_record(&mut writer, &record, unit_name, stream, secrets) {
+        if let Err(failure) =
+            emit_record_or_discard(&mut writer, &record, unit_name, stream, secrets)
+        {
             report_pump_failure(
                 &mut writer,
                 unit_name,
@@ -633,6 +664,44 @@ fn emit_record<W: Write>(
     let safe = sanitize_record(record, secrets);
     writer
         .write_all(format!("unit={unit_name} stream={} {safe}\n", stream.label()).as_bytes())
+        .and_then(|()| writer.flush())
+        .map_err(|_| PumpFailure::JournalWriteFailure)
+}
+
+fn emit_record_or_discard<W: Write>(
+    writer: &mut W,
+    bytes: &[u8],
+    unit_name: &str,
+    stream: StreamKind,
+    secrets: &[String],
+) -> Result<(), PumpFailure> {
+    match emit_record(writer, bytes, unit_name, stream, secrets) {
+        Err(PumpFailure::InvalidUtf8) => {
+            emit_discarded_record(writer, unit_name, stream, PumpFailure::InvalidUtf8)
+        }
+        result => result,
+    }
+}
+
+fn emit_discarded_record<W: Write>(
+    writer: &mut W,
+    unit_name: &str,
+    stream: StreamKind,
+    reason: PumpFailure,
+) -> Result<(), PumpFailure> {
+    let reason = match reason {
+        PumpFailure::InvalidUtf8 => "invalid_utf8",
+        PumpFailure::RecordTooLong => "record_too_long",
+        PumpFailure::ReadFailure | PumpFailure::JournalWriteFailure => {
+            return Err(reason);
+        }
+    };
+    let message = format!(
+        "unit={unit_name} stream={} stage=output_record_discarded reason={reason}\n",
+        stream.label()
+    );
+    writer
+        .write_all(message.as_bytes())
         .and_then(|()| writer.flush())
         .map_err(|_| PumpFailure::JournalWriteFailure)
 }
@@ -729,6 +798,12 @@ fn redact_sensitive_assignments(record: &str) -> String {
                 while separator < bytes.len() && bytes[separator].is_ascii_whitespace() {
                     separator += 1;
                 }
+                if separator < bytes.len() && matches!(bytes[separator], b'\'' | b'"') {
+                    separator += 1;
+                    while separator < bytes.len() && bytes[separator].is_ascii_whitespace() {
+                        separator += 1;
+                    }
+                }
                 if separator < bytes.len() && (bytes[separator] == b'=' || bytes[separator] == b':')
                 {
                     output.extend_from_slice(&bytes[key_start..=separator]);
@@ -787,6 +862,10 @@ fn sensitive_value_replacement(bytes: &[u8], start: usize, key: &str) -> (usize,
         if token_end > token_start {
             return (token_end, format!("Bearer [REDACTED]"));
         }
+    }
+
+    if key.to_ascii_lowercase().contains("cookie") {
+        return (bytes.len(), "[REDACTED]".to_string());
     }
 
     if key.to_ascii_lowercase().contains("authorization") {
@@ -994,6 +1073,19 @@ mod tests {
     }
 
     #[test]
+    fn sanitizer_redacts_quoted_keys_and_the_entire_cookie_header_value() {
+        let json = sanitize_record(r#"{"password":"hunter2","safe":"visible"}"#, &[]);
+        assert_eq!(json, r#"{"password":"[REDACTED]","safe":"visible"}"#);
+
+        let yaml = sanitize_record("'api_key' : 'synthetic-key' safe: visible", &[]);
+        assert_eq!(yaml, "'api_key' : '[REDACTED]' safe: visible");
+
+        let cookie = sanitize_record("Cookie: theme=dark; sid=synthetic-cookie", &[]);
+        assert_eq!(cookie, "Cookie: [REDACTED]");
+        assert!(!cookie.contains("synthetic-cookie"));
+    }
+
+    #[test]
     fn sanitizer_redacts_exact_launch_token_even_without_sensitive_assignment() {
         let safe = sanitize_record(
             "application reported opaque-value in diagnostics",
@@ -1003,7 +1095,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_sanitizer_handles_newline_tail_and_fails_closed_on_oversized_record() {
+    fn stream_sanitizer_discards_invalid_and_oversized_records_but_keeps_safe_records() {
         let (failure_tx, failure_rx) = mpsc::channel();
         let failed = AtomicBool::new(false);
         let mut output = Vec::new();
@@ -1025,7 +1117,8 @@ mod tests {
         let (failure_tx, failure_rx) = mpsc::channel();
         let failed = AtomicBool::new(false);
         let mut output = Vec::new();
-        let oversized = vec![b'x'; MAX_RECORD_BYTES + 1];
+        let mut oversized = vec![b'x'; MAX_RECORD_BYTES + 1];
+        oversized.extend_from_slice(b"\nnext=visible\n");
         pump_stream(
             Cursor::new(oversized),
             &mut output,
@@ -1035,15 +1128,75 @@ mod tests {
             &failure_tx,
             &failed,
         );
-        let output = String::from_utf8(output).expect("failure marker is utf-8");
-        assert!(output.contains("stage=sanitizer_failure"));
-        assert!(output.contains("record_too_long"));
-        assert!(failed.load(Ordering::Acquire));
-        assert_eq!(
-            failure_rx.try_recv().expect("failure reaches supervisor"),
-            (StreamKind::Stdout, PumpFailure::RecordTooLong)
-        );
+        let output = String::from_utf8(output).expect("discard marker is utf-8");
+        assert!(output.contains("stage=output_record_discarded reason=record_too_long"));
+        assert!(output.contains("next=visible"));
+        assert!(!failed.load(Ordering::Acquire));
+        assert!(failure_rx.try_recv().is_err());
         assert!(!output.contains(&"x".repeat(MAX_RECORD_BYTES)));
+
+        let mut invalid = b"prefix=".to_vec();
+        invalid.push(0xff);
+        invalid.extend_from_slice(b"synthetic-value\nnext=also-visible");
+        let (failure_tx, failure_rx) = mpsc::channel();
+        let failed = AtomicBool::new(false);
+        let mut output = Vec::new();
+        pump_stream(
+            Cursor::new(invalid),
+            &mut output,
+            "surface1-foot.service",
+            StreamKind::Stderr,
+            &[],
+            &failure_tx,
+            &failed,
+        );
+        let output = String::from_utf8(output).expect("invalid-record marker is utf-8");
+        assert!(output.contains("stage=output_record_discarded reason=invalid_utf8"));
+        assert!(output.contains("next=also-visible"));
+        assert!(!output.contains("synthetic-value"));
+        assert!(!failed.load(Ordering::Acquire));
+        assert!(failure_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn child_exit_is_reported_before_descendant_closes_output_pipes() {
+        let spec = ProcessSpec {
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 1 & exit 7".to_string()],
+            cwd: None,
+            env: BTreeMap::new(),
+        };
+        let request = LaunchRequest {
+            nonce: "test-nonce".to_string(),
+            unit_name: "surface1-sh.service".to_string(),
+            slot: 1,
+            environment: effective_child_environment(&spec, &BTreeMap::new()),
+            spec,
+        };
+        let secrets = sensitive_environment_values(&request.environment);
+        let mut child = start_child(&request, secrets.clone()).expect("shell child starts");
+        let (mut supervisor, mut parent) = UnixStream::pair().expect("socket pair");
+        parent
+            .set_read_timeout(Some(Duration::from_millis(700)))
+            .expect("read timeout");
+        let started_at = std::time::Instant::now();
+        let finisher = thread::spawn(move || finish_child(&mut child, &secrets, &mut supervisor));
+
+        let first: SupervisorEvent = read_frame(&mut parent).expect("early child exit event");
+        assert!(matches!(
+            first,
+            SupervisorEvent::ChildExited {
+                exit_code: Some(7),
+                sanitizer_failed: false,
+            }
+        ));
+        assert!(started_at.elapsed() < Duration::from_millis(700));
+
+        let outcome = finisher
+            .join()
+            .expect("supervisor drains descendant output");
+        assert_eq!(outcome.exit_code, Some(7));
+        assert!(read_frame::<_, SupervisorEvent>(&mut parent).is_err());
     }
 
     #[test]

@@ -10,7 +10,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,7 +28,60 @@ pub struct ProcessExit {
     pub exit_code: Option<i32>,
 }
 
+pub type ProcessRequestId = u64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessControllerEvent {
+    SpawnStarted {
+        request_id: ProcessRequestId,
+        pid: u32,
+    },
+    SpawnFailed {
+        request_id: ProcessRequestId,
+        reason: String,
+    },
+    Terminated {
+        pid: u32,
+        result: Result<(), String>,
+    },
+    Exited(ProcessExit),
+}
+
 pub trait ProcessController: Send {
+    fn spawn(
+        &mut self,
+        spec: &ProcessSpec,
+        extra_env: &BTreeMap<String, String>,
+    ) -> Result<ProcessRequestId, String>;
+    fn terminate(&mut self, pid: u32) -> Result<(), String>;
+    fn poll_events(&mut self) -> Vec<ProcessControllerEvent>;
+}
+
+enum ProcessWorkerCommand {
+    Spawn {
+        request_id: ProcessRequestId,
+        spec: ProcessSpec,
+        extra_env: BTreeMap<String, String>,
+    },
+    Terminate {
+        pid: u32,
+    },
+    Shutdown,
+}
+
+pub struct LocalProcessController {
+    commands: Sender<ProcessWorkerCommand>,
+    events: Receiver<ProcessControllerEvent>,
+    shutdown: Arc<AtomicBool>,
+    next_request_id: ProcessRequestId,
+}
+
+#[derive(Default)]
+struct SystemdProcessManager {
+    children: HashMap<u32, UnitChild>,
+}
+
+trait ProcessManagerOperations: Send + 'static {
     fn spawn(
         &mut self,
         spec: &ProcessSpec,
@@ -35,11 +89,6 @@ pub trait ProcessController: Send {
     ) -> Result<u32, String>;
     fn terminate(&mut self, pid: u32) -> Result<(), String>;
     fn reap_exited(&mut self) -> Vec<ProcessExit>;
-}
-
-#[derive(Default)]
-pub struct LocalProcessController {
-    children: HashMap<u32, UnitChild>,
 }
 
 struct UnitChild {
@@ -51,6 +100,7 @@ struct UnitChild {
     events: Receiver<Result<SupervisorEvent, ()>>,
     event_reader: Option<JoinHandle<()>>,
     final_event: Option<(Option<i32>, bool)>,
+    app_exit_reported: bool,
     event_stream_closed: bool,
     supervisor_status: Option<ExitStatus>,
     stop_requested: bool,
@@ -76,7 +126,130 @@ enum StartAttempt {
     Failure { stage: &'static str, reason: String },
 }
 
+impl Default for LocalProcessController {
+    fn default() -> Self {
+        Self::with_manager(SystemdProcessManager::default())
+    }
+}
+
+impl LocalProcessController {
+    fn with_manager<M: ProcessManagerOperations>(manager: M) -> Self {
+        let (command_tx, command_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = shutdown.clone();
+        thread::Builder::new()
+            .name("child-process-manager".to_string())
+            .spawn(move || process_worker(command_rx, event_tx, manager, worker_shutdown))
+            .expect("child process manager worker thread should start");
+        Self {
+            commands: command_tx,
+            events: event_rx,
+            shutdown,
+            next_request_id: 0,
+        }
+    }
+}
+
+impl Drop for LocalProcessController {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        let _ = self.commands.send(ProcessWorkerCommand::Shutdown);
+    }
+}
+
 impl ProcessController for LocalProcessController {
+    fn spawn(
+        &mut self,
+        spec: &ProcessSpec,
+        extra_env: &BTreeMap<String, String>,
+    ) -> Result<ProcessRequestId, String> {
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        let request_id = self.next_request_id;
+        self.commands
+            .send(ProcessWorkerCommand::Spawn {
+                request_id,
+                spec: spec.clone(),
+                extra_env: extra_env.clone(),
+            })
+            .map_err(|_| "child process manager worker is unavailable".to_string())?;
+        Ok(request_id)
+    }
+
+    fn terminate(&mut self, pid: u32) -> Result<(), String> {
+        self.commands
+            .send(ProcessWorkerCommand::Terminate { pid })
+            .map_err(|_| "child process manager worker is unavailable".to_string())
+    }
+
+    fn poll_events(&mut self) -> Vec<ProcessControllerEvent> {
+        self.events.try_iter().collect()
+    }
+}
+
+fn process_worker(
+    commands: Receiver<ProcessWorkerCommand>,
+    events: Sender<ProcessControllerEvent>,
+    mut manager: impl ProcessManagerOperations,
+    shutdown: Arc<AtomicBool>,
+) {
+    loop {
+        match commands.recv_timeout(Duration::from_millis(25)) {
+            Ok(ProcessWorkerCommand::Spawn {
+                request_id,
+                spec,
+                extra_env,
+            }) => {
+                if shutdown.load(Ordering::Acquire) {
+                    continue;
+                }
+                match manager.spawn(&spec, &extra_env) {
+                    Ok(pid) => {
+                        if shutdown.load(Ordering::Acquire)
+                            || events
+                                .send(ProcessControllerEvent::SpawnStarted { request_id, pid })
+                                .is_err()
+                        {
+                            let _ = manager.terminate(pid);
+                            return;
+                        }
+                    }
+                    Err(reason) => {
+                        if shutdown.load(Ordering::Acquire)
+                            || events
+                                .send(ProcessControllerEvent::SpawnFailed { request_id, reason })
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+            Ok(ProcessWorkerCommand::Terminate { pid }) => {
+                if events
+                    .send(ProcessControllerEvent::Terminated {
+                        pid,
+                        result: manager.terminate(pid),
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Ok(ProcessWorkerCommand::Shutdown) => return,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+
+        for exit in manager.reap_exited() {
+            if events.send(ProcessControllerEvent::Exited(exit)).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+impl SystemdProcessManager {
     fn spawn(
         &mut self,
         spec: &ProcessSpec,
@@ -118,7 +291,7 @@ impl ProcessController for LocalProcessController {
         let occupied_slots: HashSet<u32> = self
             .children
             .values()
-            .filter_map(|child| unit_slot_for_child(&child.unit_name, &encoded_basename))
+            .filter_map(|child| unit_slot_for_name(&child.unit_name))
             .collect();
         let mut attempted_slots = HashSet::new();
         let mut collision_unit = None;
@@ -232,7 +405,7 @@ impl ProcessController for LocalProcessController {
                 reason,
                 &secrets,
             );
-            return Err(format!("failed to stop child unit {unit_name}"));
+            return Err("systemctl_user_stop_failed".to_string());
         }
 
         if let Some(child) = self.children.get_mut(&pid) {
@@ -303,6 +476,12 @@ impl ProcessController for LocalProcessController {
                         sanitizer_failed,
                     })) => {
                         child.final_event = Some((exit_code, sanitizer_failed));
+                    }
+                    Ok(Ok(SupervisorEvent::ChildExited { exit_code, .. })) => {
+                        if !child.app_exit_reported {
+                            exited.push(ProcessExit { pid, exit_code });
+                            child.app_exit_reported = true;
+                        }
                     }
                     Ok(Ok(SupervisorEvent::StartFailed { reason })) => {
                         child.final_event = Some((None, true));
@@ -375,7 +554,10 @@ impl ProcessController for LocalProcessController {
                         ),
                         &child.secrets,
                     );
-                    exited.push(ProcessExit { pid, exit_code });
+                    if !child.app_exit_reported {
+                        exited.push(ProcessExit { pid, exit_code });
+                        child.app_exit_reported = true;
+                    }
                 } else {
                     let _ = child_supervisor::emit_compositor_diagnostic(
                         child.slot,
@@ -384,10 +566,13 @@ impl ProcessController for LocalProcessController {
                         "application_exit_status_unknown",
                         &child.secrets,
                     );
-                    exited.push(ProcessExit {
-                        pid,
-                        exit_code: None,
-                    });
+                    if !child.app_exit_reported {
+                        exited.push(ProcessExit {
+                            pid,
+                            exit_code: None,
+                        });
+                        child.app_exit_reported = true;
+                    }
                 }
                 if let Some(reader) = child.stderr_reader.take() {
                     let _ = reader.join();
@@ -419,6 +604,24 @@ impl ProcessController for LocalProcessController {
             self.children.remove(&pid);
         }
         exited
+    }
+}
+
+impl ProcessManagerOperations for SystemdProcessManager {
+    fn spawn(
+        &mut self,
+        spec: &ProcessSpec,
+        extra_env: &BTreeMap<String, String>,
+    ) -> Result<u32, String> {
+        SystemdProcessManager::spawn(self, spec, extra_env)
+    }
+
+    fn terminate(&mut self, pid: u32) -> Result<(), String> {
+        SystemdProcessManager::terminate(self, pid)
+    }
+
+    fn reap_exited(&mut self) -> Vec<ProcessExit> {
+        SystemdProcessManager::reap_exited(self)
     }
 }
 
@@ -653,6 +856,7 @@ fn start_unit(slot: u32, unit_name: &str, mut request: LaunchRequest) -> StartAt
         events,
         event_reader: Some(event_reader),
         final_event: None,
+        app_exit_reported: false,
         event_stream_closed: false,
         supervisor_status: None,
         stop_requested: false,
@@ -865,13 +1069,13 @@ fn max_slot_for_child(encoded_basename: &str) -> Option<u32> {
     }
 }
 
-fn unit_slot_for_child(unit_name: &str, encoded_basename: &str) -> Option<u32> {
-    let suffix = format!("-{encoded_basename}.service");
-    unit_name
+fn unit_slot_for_name(unit_name: &str) -> Option<u32> {
+    let child_name = unit_name
+        .strip_suffix(".service")?
         .strip_prefix("surface")?
-        .strip_suffix(&suffix)?
-        .parse()
-        .ok()
+        .split_once('-')?
+        .0;
+    child_name.parse().ok()
 }
 
 fn next_candidate_slot(
@@ -889,6 +1093,154 @@ fn next_candidate_slot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    struct GatedProcessManager {
+        started: Sender<()>,
+        release: Receiver<()>,
+    }
+
+    struct GatedStopManager {
+        started: Sender<()>,
+        release: Receiver<()>,
+    }
+
+    impl ProcessManagerOperations for GatedProcessManager {
+        fn spawn(
+            &mut self,
+            _spec: &ProcessSpec,
+            _extra_env: &BTreeMap<String, String>,
+        ) -> Result<u32, String> {
+            let _ = self.started.send(());
+            self.release
+                .recv()
+                .map_err(|_| "test worker release was dropped".to_string())?;
+            Ok(77)
+        }
+
+        fn terminate(&mut self, _pid: u32) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn reap_exited(&mut self) -> Vec<ProcessExit> {
+            Vec::new()
+        }
+    }
+
+    impl ProcessManagerOperations for GatedStopManager {
+        fn spawn(
+            &mut self,
+            _spec: &ProcessSpec,
+            _extra_env: &BTreeMap<String, String>,
+        ) -> Result<u32, String> {
+            Err("test stop manager does not spawn".to_string())
+        }
+
+        fn terminate(&mut self, _pid: u32) -> Result<(), String> {
+            let _ = self.started.send(());
+            self.release
+                .recv()
+                .map_err(|_| "test stop release was dropped".to_string())
+        }
+
+        fn reap_exited(&mut self) -> Vec<ProcessExit> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn spawn_request_returns_while_systemd_worker_is_blocked() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut controller = LocalProcessController::with_manager(GatedProcessManager {
+            started: started_tx,
+            release: release_rx,
+        });
+        let (request_id_tx, request_id_rx) = mpsc::channel();
+        let (return_controller_tx, return_controller_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let spec = ProcessSpec {
+            command: "/bin/true".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+        };
+        let caller = thread::spawn(move || {
+            let request_id = controller.spawn(&spec, &BTreeMap::new()).unwrap();
+            request_id_tx.send(request_id).unwrap();
+            continue_rx.recv().unwrap();
+            return_controller_tx.send(controller).unwrap();
+        });
+
+        let started_at = Instant::now();
+        let request_id = request_id_rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("spawn request is enqueued without waiting for systemd");
+        started_rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("background worker reaches the gated systemd operation");
+        assert!(started_at.elapsed() < Duration::from_millis(300));
+
+        release_tx.send(()).expect("release background worker");
+        continue_tx.send(()).expect("return the controller");
+        let mut controller = return_controller_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("caller returns controller");
+        caller.join().expect("caller thread completes");
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let event = loop {
+            if let Some(event) = controller.poll_events().into_iter().next() {
+                break event;
+            }
+            if Instant::now() >= deadline {
+                panic!("worker result event was not returned");
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(
+            event,
+            ProcessControllerEvent::SpawnStarted {
+                request_id,
+                pid: 77,
+            }
+        );
+    }
+
+    #[test]
+    fn terminate_request_returns_while_systemd_worker_is_blocked() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut controller = LocalProcessController::with_manager(GatedStopManager {
+            started: started_tx,
+            release: release_rx,
+        });
+
+        let started_at = Instant::now();
+        controller
+            .terminate(77)
+            .expect("stop request should be enqueued");
+        assert!(started_at.elapsed() < Duration::from_millis(300));
+        started_rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("background worker reaches the gated systemd operation");
+
+        release_tx.send(()).expect("release background worker");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(ProcessControllerEvent::Terminated {
+                pid: 77,
+                result: Ok(()),
+            }) = controller.poll_events().into_iter().next()
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("worker stop result event was not returned");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
 
     #[test]
     fn unit_component_encoding_is_non_lossy_and_keeps_systemd_safe_bytes() {
@@ -923,15 +1275,15 @@ mod tests {
     }
 
     #[test]
-    fn different_child_names_can_reuse_a_slot_without_colliding() {
+    fn slot_is_reserved_across_different_child_names() {
+        assert_eq!(unit_slot_for_name("surface1-foot.service"), Some(1));
+        assert_eq!(unit_slot_for_name("surface1-other.service"), Some(1));
+        assert_eq!(unit_slot_for_name("surface1-foo\\x2dbar.service"), Some(1));
+
+        let occupied = HashSet::from([unit_slot_for_name("surface1-foot.service").unwrap()]);
         assert_eq!(
-            unit_slot_for_child("surface1-foot.service", "foot"),
-            Some(1)
-        );
-        assert_eq!(unit_slot_for_child("surface1-foot.service", "other"), None);
-        assert_eq!(
-            unit_slot_for_child("surface1-foo\\x2dbar.service", r"foo\x2dbar"),
-            Some(1)
+            next_candidate_slot(false, 3, &occupied, &HashSet::new()),
+            Some(2)
         );
     }
 
