@@ -1,20 +1,26 @@
 use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{self, BufRead, BufReader};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::process::{Child, Command as ProcessCommand, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 use surf_ace_compositor::control::{
     ControlRequest, RuntimeControlCommand, bind_control_listener, send_request,
     serve_listener_with_runtime_control,
 };
-use surf_ace_compositor::model::{
-    HostRuntimeStartTrigger, MainAppLaunchIntent, OutputRotation, ProcessSpec,
+use surf_ace_compositor::host_sun_schedule_profile::{
+    DesktopColorSchemePreference, discover_desktop_color_scheme, discover_host_sun_schedule_profile,
 };
-use surf_ace_compositor::node_sun_schedule_profiles::{profile_for_node, supported_node_ids};
+use surf_ace_compositor::model::{
+    HostRuntimeStartTrigger, MainAppLaunchIntent, NodeSunScheduleProfile, OutputRotation,
+    ProcessSpec, SunScheduleAppearanceStatus,
+};
 use surf_ace_compositor::output_rotation_memory::{
     OUTPUT_ROTATION_STATE_PATH_ENV, OutputRotationMemory,
 };
@@ -25,7 +31,9 @@ use surf_ace_compositor::runtime::{
 };
 use surf_ace_compositor::screen_capture::ScreenCaptureStore;
 use surf_ace_compositor::state::CompositorState;
-use surf_ace_compositor::sun_schedule::evaluate_sun_schedule;
+use surf_ace_compositor::sun_schedule::{
+    evaluate_sun_schedule, missing_profile_status, unavailable_profile_status,
+};
 
 const RUNTIME_ENV: &str = "SURF_ACE_COMPOSITOR_RUNTIME";
 const HOST_DRM_DEVICE_ENV: &str = "SURF_ACE_COMPOSITOR_HOST_DRM_DEVICE";
@@ -37,6 +45,260 @@ const TEST_HOST_RUNTIME_CAPABLE_ENV: &str = "SURF_ACE_COMPOSITOR_TEST_HOST_RUNTI
 const SHELL_OVERLAY_TOGGLE_SHORTCUT_ENV: &str = "SURF_ACE_COMPOSITOR_SHELL_OVERLAY_TOGGLE_SHORTCUT";
 const SHELL_OVERLAY_APP_ID: &str = "surf-ace-shell-overlay";
 const MAIN_APP_LAUNCH_SHORTHAND_APP_ID: &str = "surf-ace-main-app";
+const GNOME_APPEARANCE_SCHEMA: &str = "org.gnome.desktop.interface";
+const GNOME_APPEARANCE_KEY: &str = "color-scheme";
+const APPEARANCE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const APPEARANCE_MONITOR_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+const MAX_APPEARANCE_TIMER_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[cfg(target_os = "linux")]
+const LINUX_PR_SET_PDEATHSIG: std::os::raw::c_int = 1;
+#[cfg(target_os = "linux")]
+const LINUX_SIGTERM: std::os::raw::c_ulong = 15;
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn prctl(option: std::os::raw::c_int, ...) -> std::os::raw::c_int;
+    fn getppid() -> std::os::raw::c_int;
+}
+
+enum AppearanceSchedulerEvent {
+    PreferenceChanged,
+    MonitorEnded,
+    Stop,
+}
+
+struct GSettingsMonitor {
+    child: Child,
+    reader: Option<JoinHandle<()>>,
+}
+
+impl Drop for GSettingsMonitor {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+struct AppearanceSchedulerHandle {
+    events: Sender<AppearanceSchedulerEvent>,
+    thread: JoinHandle<()>,
+}
+
+#[cfg(target_os = "linux")]
+fn configure_parent_death_signal(command: &mut ProcessCommand) {
+    use std::os::unix::process::CommandExt;
+
+    let expected_parent_pid = std::process::id() as std::os::raw::c_int;
+    // The monitor must not outlive the compositor if an operator or test runner
+    // terminates the daemon without reaching its normal scheduler shutdown.
+    unsafe {
+        command.pre_exec(move || {
+            if prctl(
+                LINUX_PR_SET_PDEATHSIG,
+                LINUX_SIGTERM,
+                0 as std::os::raw::c_ulong,
+                0 as std::os::raw::c_ulong,
+                0 as std::os::raw::c_ulong,
+            ) == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if getppid() != expected_parent_pid {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "compositor exited before gsettings monitor started",
+                ));
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_parent_death_signal(_command: &mut ProcessCommand) {}
+
+impl AppearanceSchedulerHandle {
+    fn stop(self) {
+        let _ = self.events.send(AppearanceSchedulerEvent::Stop);
+        let _ = self.thread.join();
+    }
+}
+
+fn start_gsettings_monitor(
+    events: Sender<AppearanceSchedulerEvent>,
+) -> io::Result<GSettingsMonitor> {
+    let mut command = ProcessCommand::new("gsettings");
+    command
+        .args(["monitor", GNOME_APPEARANCE_SCHEMA, GNOME_APPEARANCE_KEY])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    configure_parent_death_signal(&mut command);
+    let mut child = command.spawn()?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "gsettings monitor has no stdout",
+            ));
+        }
+    };
+    let reader = thread::spawn(move || {
+        let mut stdout = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match stdout.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if events
+                        .send(AppearanceSchedulerEvent::PreferenceChanged)
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = events.send(AppearanceSchedulerEvent::MonitorEnded);
+    });
+    Ok(GSettingsMonitor {
+        child,
+        reader: Some(reader),
+    })
+}
+
+fn start_appearance_scheduler(
+    shared_state: Arc<Mutex<CompositorState>>,
+    profile: Option<NodeSunScheduleProfile>,
+    discovery_error: Option<String>,
+) -> AppearanceSchedulerHandle {
+    let (events, receiver) = mpsc::channel();
+    let scheduler_events = events.clone();
+    let thread = thread::spawn(move || {
+        run_appearance_scheduler(
+            shared_state,
+            profile,
+            discovery_error,
+            receiver,
+            scheduler_events,
+        )
+    });
+    AppearanceSchedulerHandle { events, thread }
+}
+
+fn run_appearance_scheduler(
+    shared_state: Arc<Mutex<CompositorState>>,
+    profile: Option<NodeSunScheduleProfile>,
+    discovery_error: Option<String>,
+    receiver: Receiver<AppearanceSchedulerEvent>,
+    events: Sender<AppearanceSchedulerEvent>,
+) {
+    let mut monitor = start_gsettings_monitor(events.clone()).ok();
+    let mut retry_monitor_at = Instant::now() + APPEARANCE_MONITOR_RETRY_INTERVAL;
+    let mut next_transition = apply_current_appearance_inputs(
+        &shared_state,
+        profile.as_ref(),
+        discovery_error.as_deref(),
+    );
+
+    loop {
+        let now = current_unix_seconds();
+        let until_transition = next_transition
+            .map(|at| Duration::from_secs(at.saturating_sub(now).max(0) as u64))
+            .unwrap_or(MAX_APPEARANCE_TIMER_INTERVAL)
+            .min(MAX_APPEARANCE_TIMER_INTERVAL);
+        let timeout = if monitor.is_some() {
+            until_transition
+        } else {
+            until_transition.min(APPEARANCE_POLL_INTERVAL)
+        };
+
+        match receiver.recv_timeout(timeout) {
+            Ok(AppearanceSchedulerEvent::Stop) | Err(RecvTimeoutError::Disconnected) => break,
+            Ok(AppearanceSchedulerEvent::PreferenceChanged) => {
+                next_transition = apply_current_appearance_inputs(
+                    &shared_state,
+                    profile.as_ref(),
+                    discovery_error.as_deref(),
+                );
+            }
+            Ok(AppearanceSchedulerEvent::MonitorEnded) => {
+                monitor.take();
+                retry_monitor_at = Instant::now() + APPEARANCE_MONITOR_RETRY_INTERVAL;
+                next_transition = apply_current_appearance_inputs(
+                    &shared_state,
+                    profile.as_ref(),
+                    discovery_error.as_deref(),
+                );
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let now = current_unix_seconds();
+                let transition_due = next_transition.is_some_and(|at| at <= now);
+                if transition_due || monitor.is_none() {
+                    next_transition = apply_current_appearance_inputs(
+                        &shared_state,
+                        profile.as_ref(),
+                        discovery_error.as_deref(),
+                    );
+                }
+                if monitor.is_none() && Instant::now() >= retry_monitor_at {
+                    monitor = start_gsettings_monitor(events.clone()).ok();
+                    retry_monitor_at = Instant::now() + APPEARANCE_MONITOR_RETRY_INTERVAL;
+                }
+            }
+        }
+    }
+    drop(monitor);
+}
+
+fn schedule_status_for_startup(
+    profile: Option<&NodeSunScheduleProfile>,
+    discovery_error: Option<&str>,
+    evaluated_at_unix_seconds: i64,
+) -> SunScheduleAppearanceStatus {
+    match (profile, discovery_error) {
+        (Some(profile), _) => evaluate_sun_schedule(profile.clone(), evaluated_at_unix_seconds),
+        (None, Some(error)) => unavailable_profile_status(evaluated_at_unix_seconds, error),
+        (None, None) => missing_profile_status(evaluated_at_unix_seconds),
+    }
+}
+
+fn apply_current_appearance_inputs(
+    shared_state: &Arc<Mutex<CompositorState>>,
+    profile: Option<&NodeSunScheduleProfile>,
+    discovery_error: Option<&str>,
+) -> Option<i64> {
+    let evaluated_at = current_unix_seconds();
+    let solar_status = schedule_status_for_startup(profile, discovery_error, evaluated_at);
+    let next_transition = solar_status.next_transition_unix_seconds;
+    let preference: DesktopColorSchemePreference = discover_desktop_color_scheme();
+    let mut state = match shared_state.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    apply_appearance_inputs(&mut state, solar_status, preference);
+    next_transition
+}
+
+fn apply_appearance_inputs(
+    state: &mut CompositorState,
+    solar_status: SunScheduleAppearanceStatus,
+    preference: DesktopColorSchemePreference,
+) {
+    state.set_runtime_sun_schedule_appearance(solar_status);
+    state.set_runtime_desktop_color_scheme(
+        preference.status_appearance(),
+        preference.status_source(),
+    );
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "surf-ace-compositor")]
@@ -364,13 +626,14 @@ fn run_server(
                 std::process::exit(2);
             }
         };
-    let sun_schedule_profile = match resolve_sun_schedule_node_profile(sun_schedule_node) {
-        Ok(profile) => profile,
-        Err(err) => {
-            eprintln!("invalid sun schedule node: {err}");
-            std::process::exit(2);
-        }
-    };
+    let (sun_schedule_profile, sun_schedule_discovery_error) =
+        match discover_host_sun_schedule_profile(sun_schedule_node) {
+            Ok(profile) => (Some(profile), None),
+            Err(error) => {
+                eprintln!("sun schedule host discovery failed: {error}");
+                (None, Some(error))
+            }
+        };
     let mut state = match CompositorState::new_with_root4_config(
         launch_plan.host_mode_active,
         Box::new(LocalProcessController::default()),
@@ -401,16 +664,25 @@ fn run_server(
                 std::process::exit(2);
             }
         }
-        if let Some(profile) = sun_schedule_profile {
+        if let Some(profile) = &sun_schedule_profile {
             state.configure_sun_schedule_profile(profile.clone());
-            let status = evaluate_sun_schedule(profile, current_unix_seconds());
-            state.set_runtime_sun_schedule_appearance(status);
         }
+        let status = schedule_status_for_startup(
+            sun_schedule_profile.as_ref(),
+            sun_schedule_discovery_error.as_deref(),
+            current_unix_seconds(),
+        );
+        state.set_runtime_sun_schedule_appearance(status);
+        let preference = discover_desktop_color_scheme();
+        state.set_runtime_desktop_color_scheme(
+            preference.status_appearance(),
+            preference.status_source(),
+        );
     }
     apply_runtime_selection_status(&shared_state, &launch_plan);
     let screen_capture = ScreenCaptureStore::default();
 
-    match launch_plan.selected_runtime.as_str() {
+    let appearance_scheduler = match launch_plan.selected_runtime.as_str() {
         "none" => {
             let listener = match bind_control_listener(&socket_path) {
                 Ok(listener) => listener,
@@ -419,13 +691,23 @@ fn run_server(
                     std::process::exit(1);
                 }
             };
+            let appearance_scheduler = start_appearance_scheduler(
+                shared_state.clone(),
+                sun_schedule_profile.clone(),
+                sun_schedule_discovery_error.clone(),
+            );
             persist_startup_output_rotation_if_explicit(&shared_state, output_rotation);
-            if let Err(err) =
-                serve_listener_with_runtime_control(listener, shared_state, None, screen_capture)
-            {
+            if let Err(err) = serve_listener_with_runtime_control(
+                listener,
+                shared_state.clone(),
+                None,
+                screen_capture,
+            ) {
+                appearance_scheduler.stop();
                 eprintln!("control server failed: {err}");
                 std::process::exit(1);
             }
+            appearance_scheduler
         }
         "winit" => {
             let listener = match bind_control_listener(&socket_path) {
@@ -435,6 +717,11 @@ fn run_server(
                     std::process::exit(1);
                 }
             };
+            let appearance_scheduler = start_appearance_scheduler(
+                shared_state.clone(),
+                sun_schedule_profile.clone(),
+                sun_schedule_discovery_error.clone(),
+            );
             persist_startup_output_rotation_if_explicit(&shared_state, output_rotation);
             let control_state = shared_state.clone();
             let control_screen_capture = screen_capture.clone();
@@ -449,10 +736,12 @@ fn run_server(
                 }
             });
 
-            if let Err(err) = run_winit(shared_state) {
+            if let Err(err) = run_winit(shared_state.clone()) {
+                appearance_scheduler.stop();
                 eprintln!("winit runtime failed: {err}");
                 std::process::exit(1);
             }
+            appearance_scheduler
         }
         "host" => {
             let auto_selected_host = runtime == "auto";
@@ -463,6 +752,11 @@ fn run_server(
                     std::process::exit(1);
                 }
             };
+            let appearance_scheduler = start_appearance_scheduler(
+                shared_state.clone(),
+                sun_schedule_profile.clone(),
+                sun_schedule_discovery_error.clone(),
+            );
             persist_startup_output_rotation_if_explicit(&shared_state, output_rotation);
             let (runtime_control_tx, runtime_control_rx) = mpsc::channel::<RuntimeControlCommand>();
             if let Some(path) = config_path.map(Path::to_path_buf) {
@@ -494,6 +788,7 @@ fn run_server(
                 .send(RuntimeControlCommand::StartHostRuntime)
                 .is_err()
             {
+                appearance_scheduler.stop();
                 eprintln!("failed to queue initial host runtime start");
                 std::process::exit(1);
             }
@@ -546,15 +841,19 @@ fn run_server(
             }
 
             if control_thread.join().is_err() {
+                appearance_scheduler.stop();
                 eprintln!("control server thread terminated unexpectedly");
                 std::process::exit(1);
             }
+            appearance_scheduler
         }
         _ => {
             eprintln!("unsupported runtime mode: {}", launch_plan.selected_runtime);
             std::process::exit(2);
         }
     };
+
+    appearance_scheduler.stop();
 }
 
 fn spawn_root4_config_watcher(path: PathBuf, runtime_control: mpsc::Sender<RuntimeControlCommand>) {
@@ -1016,24 +1315,6 @@ fn run_capture(socket_path: PathBuf, output_path: &str) {
     );
 }
 
-fn resolve_sun_schedule_node_profile(
-    sun_schedule_node: Option<&str>,
-) -> Result<Option<surf_ace_compositor::model::NodeSunScheduleProfile>, String> {
-    let Some(node_id) = sun_schedule_node else {
-        return Ok(None);
-    };
-    let node_id = node_id.trim();
-    if node_id.is_empty() {
-        return Ok(None);
-    }
-    profile_for_node(node_id).map(Some).ok_or_else(|| {
-        format!(
-            "unsupported node '{node_id}'; supported nodes: {}",
-            supported_node_ids().join(", ")
-        )
-    })
-}
-
 fn current_unix_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1074,9 +1355,10 @@ fn parse_output_rotation(value: &str) -> Result<OutputRotation, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, parse_main_app_launch_intent, parse_main_app_launch_shorthand,
-        resolve_main_app_launch_intent, resolve_root4_config_scale, resolve_runtime_launch_plan,
-        resolve_startup_output_rotation, spawn_root4_config_watcher,
+        Cli, Command, apply_appearance_inputs, parse_main_app_launch_intent,
+        parse_main_app_launch_shorthand, resolve_main_app_launch_intent,
+        resolve_root4_config_scale, resolve_runtime_launch_plan, resolve_startup_output_rotation,
+        spawn_root4_config_watcher,
     };
     use clap::Parser;
     use std::fs;
@@ -1085,11 +1367,16 @@ mod tests {
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
     use surf_ace_compositor::control::RuntimeControlCommand;
+    use surf_ace_compositor::host_sun_schedule_profile::DesktopColorSchemePreference;
     use surf_ace_compositor::model::{
-        MainAppLaunchIntent, MainAppLaunchState, MainAppSurfaceBinding, OutputRotation,
+        EnvironmentAppearance, EnvironmentAppearanceSource, MainAppLaunchIntent,
+        MainAppLaunchState, MainAppSurfaceBinding, NodeSunScheduleProfile, OutputRotation,
         RuntimeSelectionMode,
     };
     use surf_ace_compositor::output_rotation_memory::OutputRotationMemory;
+    use surf_ace_compositor::process_manager::LocalProcessController;
+    use surf_ace_compositor::state::CompositorState;
+    use surf_ace_compositor::sun_schedule::evaluate_sun_schedule;
 
     fn temp_rotation_path() -> PathBuf {
         let unique = SystemTime::now()
@@ -1230,21 +1517,74 @@ mod tests {
     }
 
     #[test]
-    fn resolves_owned_sun_schedule_node_profiles() {
-        let racter = super::resolve_sun_schedule_node_profile(Some("racter"))
-            .expect("racter should resolve")
-            .expect("racter should have a profile");
-        assert_eq!(racter.timezone, "America/Los_Angeles");
+    fn startup_profile_discovery_failure_is_reported_and_fails_closed() {
+        let status = super::schedule_status_for_startup(
+            None,
+            Some("/etc/localtime does not resolve under /usr/share/zoneinfo"),
+            1_718_992_800,
+        );
 
-        let shrdlu = super::resolve_sun_schedule_node_profile(Some("shrdlu"))
-            .expect("shrdlu should resolve")
-            .expect("shrdlu should have a profile");
-        assert_eq!(shrdlu.timezone, "America/New_York");
+        assert_eq!(
+            status.appearance,
+            surf_ace_compositor::model::EnvironmentAppearance::Unknown
+        );
+        assert_eq!(
+            status.reason,
+            surf_ace_compositor::model::SunScheduleAppearanceReason::InvalidProfile
+        );
+        assert!(
+            status
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("/etc/localtime"))
+        );
+    }
 
-        let error = super::resolve_sun_schedule_node_profile(Some("unknown-node"))
-            .expect_err("unknown node should fail");
-        assert!(error.contains("racter"));
-        assert!(error.contains("shrdlu"));
+    #[test]
+    fn automatic_appearance_inputs_never_report_manual_source() {
+        let profile = NodeSunScheduleProfile {
+            node_id: "racter".to_string(),
+            timezone: "America/Los_Angeles".to_string(),
+            latitude: 37.7749,
+            longitude: -122.4194,
+            node_id_source: None,
+            timezone_source: None,
+            coordinates_source: None,
+            override_source: None,
+        };
+        let mut state = CompositorState::new(true, Box::<LocalProcessController>::default());
+
+        apply_appearance_inputs(
+            &mut state,
+            evaluate_sun_schedule(profile.clone(), 1_718_992_800),
+            DesktopColorSchemePreference::default(),
+        );
+        let solar = state.status_snapshot().runtime;
+        assert_eq!(solar.appearance, EnvironmentAppearance::Light);
+        assert_eq!(
+            solar.appearance_source,
+            EnvironmentAppearanceSource::SunSchedule
+        );
+
+        apply_appearance_inputs(
+            &mut state,
+            evaluate_sun_schedule(profile, 1_718_992_800),
+            DesktopColorSchemePreference {
+                appearance: Some(EnvironmentAppearance::Dark),
+                source_available: true,
+            },
+        );
+        let desktop = state.status_snapshot().runtime;
+        assert_eq!(desktop.appearance, EnvironmentAppearance::Dark);
+        assert_eq!(
+            desktop.appearance_source,
+            EnvironmentAppearanceSource::DesktopPreference
+        );
+        assert_ne!(solar.appearance_source, EnvironmentAppearanceSource::Manual);
+        assert_ne!(
+            desktop.appearance_source,
+            EnvironmentAppearanceSource::Manual
+        );
     }
 
     #[test]

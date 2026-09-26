@@ -512,6 +512,7 @@ pub enum EnvironmentAppearance {
 #[serde(rename_all = "snake_case")]
 pub enum EnvironmentAppearanceSource {
     Manual,
+    DesktopPreference,
     SunSchedule,
     #[default]
     Unknown,
@@ -524,6 +525,14 @@ pub struct NodeSunScheduleProfile {
     pub timezone: String,
     pub latitude: f64,
     pub longitude: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinates_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -615,6 +624,10 @@ pub struct RuntimeStatus {
     pub appearance: EnvironmentAppearance,
     #[serde(default)]
     pub appearance_source: EnvironmentAppearanceSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_color_scheme: Option<EnvironmentAppearance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_color_scheme_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sun_schedule: Option<SunScheduleAppearanceStatus>,
     pub runtime_selection_mode: RuntimeSelectionMode,
@@ -713,6 +726,8 @@ impl Default for RuntimeStatus {
             phase: RuntimePhase::Inactive,
             appearance: EnvironmentAppearance::Unknown,
             appearance_source: EnvironmentAppearanceSource::Unknown,
+            desktop_color_scheme: None,
+            desktop_color_scheme_source: None,
             sun_schedule: None,
             runtime_selection_mode: RuntimeSelectionMode::Automatic,
             runtime_operator_action_needed: false,

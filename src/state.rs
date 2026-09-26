@@ -131,6 +131,7 @@ pub struct CompositorState {
     overlay_role_policy: OverlayRolePolicy,
     runtime: RuntimeStatus,
     configured_sun_schedule_profile: Option<NodeSunScheduleProfile>,
+    manual_appearance_override: Option<EnvironmentAppearance>,
     process_controller: Box<dyn ProcessController>,
     output_rotation_memory: Option<OutputRotationMemory>,
     launch_token_counter: u64,
@@ -226,6 +227,7 @@ impl CompositorState {
             overlay_role_policy: OverlayRolePolicy::default(),
             runtime: RuntimeStatus::default(),
             configured_sun_schedule_profile: None,
+            manual_appearance_override: None,
             process_controller,
             output_rotation_memory: None,
             launch_token_counter: 0,
@@ -931,16 +933,61 @@ impl CompositorState {
         self.configured_sun_schedule_profile.clone()
     }
 
+    pub fn runtime_sun_schedule_profile(&self) -> Option<NodeSunScheduleProfile> {
+        self.runtime
+            .sun_schedule
+            .as_ref()
+            .and_then(|status| status.profile.clone())
+    }
+
     pub fn set_runtime_appearance(&mut self, appearance: EnvironmentAppearance) {
-        self.runtime.appearance = appearance;
-        self.runtime.appearance_source = EnvironmentAppearanceSource::Manual;
-        self.runtime.sun_schedule = None;
+        self.manual_appearance_override = match appearance {
+            EnvironmentAppearance::Light | EnvironmentAppearance::Dark => Some(appearance),
+            EnvironmentAppearance::Unknown => None,
+        };
+        self.recompute_runtime_appearance();
+    }
+
+    pub fn set_runtime_desktop_color_scheme(
+        &mut self,
+        appearance: Option<EnvironmentAppearance>,
+        source: Option<String>,
+    ) {
+        self.runtime.desktop_color_scheme = appearance;
+        self.runtime.desktop_color_scheme_source = source;
+        self.recompute_runtime_appearance();
     }
 
     pub fn set_runtime_sun_schedule_appearance(&mut self, status: SunScheduleAppearanceStatus) {
-        self.runtime.appearance = status.appearance;
-        self.runtime.appearance_source = EnvironmentAppearanceSource::SunSchedule;
         self.runtime.sun_schedule = Some(status);
+        self.recompute_runtime_appearance();
+    }
+
+    fn recompute_runtime_appearance(&mut self) {
+        let (appearance, source) = if let Some(appearance) = self.manual_appearance_override {
+            (appearance, EnvironmentAppearanceSource::Manual)
+        } else if let Some(
+            appearance @ (EnvironmentAppearance::Light | EnvironmentAppearance::Dark),
+        ) = self.runtime.desktop_color_scheme
+        {
+            (appearance, EnvironmentAppearanceSource::DesktopPreference)
+        } else if let Some(
+            appearance @ (EnvironmentAppearance::Light | EnvironmentAppearance::Dark),
+        ) = self
+            .runtime
+            .sun_schedule
+            .as_ref()
+            .map(|status| status.appearance)
+        {
+            (appearance, EnvironmentAppearanceSource::SunSchedule)
+        } else {
+            (
+                EnvironmentAppearance::Unknown,
+                EnvironmentAppearanceSource::Unknown,
+            )
+        };
+        self.runtime.appearance = appearance;
+        self.runtime.appearance_source = source;
     }
 
     pub fn set_overlay_region_debug_borders(&mut self, enabled: bool) {

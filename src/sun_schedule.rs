@@ -27,6 +27,23 @@ pub fn missing_profile_status(evaluated_at_unix_seconds: i64) -> SunScheduleAppe
     }
 }
 
+pub fn unavailable_profile_status(
+    evaluated_at_unix_seconds: i64,
+    error: impl Into<String>,
+) -> SunScheduleAppearanceStatus {
+    SunScheduleAppearanceStatus {
+        profile: None,
+        evaluated_at_unix_seconds,
+        local_date: None,
+        sunrise_unix_seconds: None,
+        sunset_unix_seconds: None,
+        next_transition_unix_seconds: None,
+        appearance: EnvironmentAppearance::Unknown,
+        reason: SunScheduleAppearanceReason::InvalidProfile,
+        error: Some(error.into()),
+    }
+}
+
 pub fn evaluate_sun_schedule(
     profile: NodeSunScheduleProfile,
     evaluated_at_unix_seconds: i64,
@@ -272,6 +289,10 @@ mod tests {
             timezone: "America/Los_Angeles".to_string(),
             latitude: 37.7749,
             longitude: -122.4194,
+            node_id_source: None,
+            timezone_source: None,
+            coordinates_source: None,
+            override_source: None,
         }
     }
 
@@ -281,6 +302,10 @@ mod tests {
             timezone: "America/New_York".to_string(),
             latitude: 40.7128,
             longitude: -74.0060,
+            node_id_source: None,
+            timezone_source: None,
+            coordinates_source: None,
+            override_source: None,
         }
     }
 
@@ -325,11 +350,69 @@ mod tests {
     }
 
     #[test]
+    fn sunrise_utc_tracks_the_host_timezones_daylight_saving_transition() {
+        use chrono::Timelike;
+
+        let before_dst = Utc
+            .with_ymd_and_hms(2024, 3, 9, 12, 0, 0)
+            .single()
+            .expect("UTC timestamp should be valid")
+            .timestamp();
+        let after_dst = Utc
+            .with_ymd_and_hms(2024, 3, 10, 12, 0, 0)
+            .single()
+            .expect("UTC timestamp should be valid")
+            .timestamp();
+
+        let before = evaluate_sun_schedule(racter_profile(), before_dst);
+        let after = evaluate_sun_schedule(racter_profile(), after_dst);
+
+        let timezone = "America/Los_Angeles".parse::<Tz>().unwrap();
+        let before_sunrise = Utc
+            .timestamp_opt(before.sunrise_unix_seconds.unwrap(), 0)
+            .single()
+            .expect("sunrise should be a valid UTC timestamp")
+            .with_timezone(&timezone);
+        let after_sunrise = Utc
+            .timestamp_opt(after.sunrise_unix_seconds.unwrap(), 0)
+            .single()
+            .expect("sunrise should be a valid UTC timestamp")
+            .with_timezone(&timezone);
+        let utc_spacing =
+            after.sunrise_unix_seconds.unwrap() - before.sunrise_unix_seconds.unwrap();
+        let local_clock_shift = i64::from(after_sunrise.num_seconds_from_midnight())
+            - i64::from(before_sunrise.num_seconds_from_midnight());
+        assert!(
+            (86_000..=86_500).contains(&utc_spacing),
+            "astronomical sunrise should remain about one day apart in UTC, got {utc_spacing} seconds"
+        );
+        assert!(
+            (3_000..=4_200).contains(&local_clock_shift),
+            "DST should move the local sunrise clock forward about one hour, got {local_clock_shift} seconds"
+        );
+        assert_eq!(before.local_date.as_deref(), Some("2024-03-09"));
+        assert_eq!(after.local_date.as_deref(), Some("2024-03-10"));
+    }
+
+    #[test]
     fn missing_profile_fails_closed_to_unknown() {
         let status = missing_profile_status(1_718_992_800);
 
         assert_eq!(status.appearance, EnvironmentAppearance::Unknown);
         assert_eq!(status.reason, SunScheduleAppearanceReason::MissingProfile);
+        assert!(status.profile.is_none());
+    }
+
+    #[test]
+    fn unavailable_host_profile_retains_discovery_error_and_fails_closed() {
+        let status = unavailable_profile_status(1_718_992_800, "host timezone was unavailable");
+
+        assert_eq!(status.appearance, EnvironmentAppearance::Unknown);
+        assert_eq!(status.reason, SunScheduleAppearanceReason::InvalidProfile);
+        assert_eq!(
+            status.error.as_deref(),
+            Some("host timezone was unavailable")
+        );
         assert!(status.profile.is_none());
     }
 
