@@ -30,4 +30,4 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
       - run: cargo build --locked --all-targets
-      - run: cargo test --locked --all-targets
+      - run: cargo test --locked --all-targets -- --test-threads=1
