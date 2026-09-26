@@ -12972,9 +12972,10 @@ mod tests {
                 "pointer focus after native role destruction must reach the main surface; observed={observed_pointer_events:?}"
             );
             match events_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok(NativeGrabClientEvent::Enter(surface_id)
-                    | NativeGrabClientEvent::Motion(Some(surface_id)))
-                    if surface_id == main_surface_id => saw_main_pointer_focus = true,
+                Ok(
+                    NativeGrabClientEvent::Enter(surface_id)
+                    | NativeGrabClientEvent::Motion(Some(surface_id)),
+                ) if surface_id == main_surface_id => saw_main_pointer_focus = true,
                 Ok(NativeGrabClientEvent::Leave(surface_id)) => {
                     observed_pointer_events.push(format!("Leave({surface_id})"));
                 }
