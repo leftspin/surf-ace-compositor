@@ -1352,14 +1352,14 @@ fn parse_output_rotation(value: &str) -> Result<OutputRotation, String> {
     }
 }
 
-    #[cfg(test)]
-    mod tests {
-        use super::{
-            Cli, Command, apply_appearance_inputs, parse_main_app_launch_intent,
-            parse_main_app_launch_shorthand, resolve_main_app_launch_intent,
-            resolve_root4_config_scale, resolve_runtime_launch_plan,
-            resolve_startup_output_rotation, spawn_root4_config_watcher,
-        };
+#[cfg(test)]
+mod tests {
+    use super::{
+        Cli, Command, apply_appearance_inputs, parse_main_app_launch_intent,
+        parse_main_app_launch_shorthand, resolve_main_app_launch_intent,
+        resolve_root4_config_scale, resolve_runtime_launch_plan, resolve_startup_output_rotation,
+        spawn_root4_config_watcher,
+    };
     use clap::Parser;
     use std::fs;
     use std::path::{Path, PathBuf};
