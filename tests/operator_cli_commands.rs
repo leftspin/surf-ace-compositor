@@ -329,19 +329,42 @@ fn serve_with_sun_schedule_node_publishes_profile_status_on_startup() {
 
     let status = send_control_request(&socket_path, json!({ "type": "get_status" }));
 
+    let runtime = &status["status"]["runtime"];
+    let profile = &runtime["sun_schedule"]["profile"];
+    assert_eq!(profile["nodeId"], json!("racter"));
+    assert_eq!(profile["nodeIdSource"], json!("deployment override"));
+    assert_eq!(profile["timezoneSource"], json!("/etc/localtime"));
     assert_eq!(
-        status["status"]["runtime"]["appearance_source"],
-        json!("sun_schedule")
+        profile["coordinatesSource"],
+        json!("/usr/share/zoneinfo/zone1970.tab")
     );
     assert_eq!(
-        status["status"]["runtime"]["sun_schedule"]["profile"],
-        json!({
-            "nodeId": "racter",
-            "timezone": "America/Los_Angeles",
-            "latitude": 37.7749,
-            "longitude": -122.4194
-        })
+        profile["overrideSource"],
+        json!("--sun-schedule-node or SURF_ACE_COMPOSITOR_SUN_SCHEDULE_NODE")
     );
+    assert!(
+        profile["timezone"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    let latitude = profile["latitude"]
+        .as_f64()
+        .expect("latitude should be numeric");
+    let longitude = profile["longitude"]
+        .as_f64()
+        .expect("longitude should be numeric");
+    assert!(latitude.is_finite() && (-90.0..=90.0).contains(&latitude));
+    assert!(longitude.is_finite() && (-180.0..=180.0).contains(&longitude));
+
+    let expected_source = match (
+        runtime["desktop_color_scheme"].as_str(),
+        runtime["sun_schedule"]["appearance"].as_str(),
+    ) {
+        (Some("light" | "dark"), _) => "desktop_preference",
+        (_, Some("light" | "dark")) => "sun_schedule",
+        _ => "unknown",
+    };
+    assert_eq!(runtime["appearance_source"], json!(expected_source));
     assert!(
         status["status"]["runtime"]["sun_schedule"]["sunriseUnixSeconds"].is_number(),
         "status should expose evaluated sunrise"

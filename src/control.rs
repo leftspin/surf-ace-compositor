@@ -485,6 +485,17 @@ fn handle_request_with_capture(
             );
         }
         ControlRequest::SetAppearance { appearance } => {
+            if appearance == EnvironmentAppearance::Unknown {
+                let profile = state
+                    .configured_sun_schedule_profile()
+                    .or_else(|| state.runtime_sun_schedule_profile());
+                let now = current_unix_seconds();
+                let status = match profile {
+                    Some(profile) => evaluate_sun_schedule(profile, now),
+                    None => missing_profile_status(now),
+                };
+                state.set_runtime_sun_schedule_appearance(status);
+            }
             state.set_runtime_appearance(appearance);
             Ok(Some(state.status_snapshot()))
         }
@@ -1003,6 +1014,164 @@ mod tests {
     }
 
     #[test]
+    fn appearance_precedence_is_manual_then_desktop_then_solar_then_unknown() {
+        let profile = NodeSunScheduleProfile {
+            node_id: "racter".to_string(),
+            timezone: "America/Los_Angeles".to_string(),
+            latitude: 37.7749,
+            longitude: -122.4194,
+            node_id_source: None,
+            timezone_source: None,
+            coordinates_source: None,
+            override_source: None,
+        };
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.configure_sun_schedule_profile(profile.clone());
+        state.set_runtime_sun_schedule_appearance(evaluate_sun_schedule(
+            profile.clone(),
+            1_719_030_600,
+        ));
+        state.set_runtime_desktop_color_scheme(
+            Some(EnvironmentAppearance::Light),
+            Some("gsettings org.gnome.desktop.interface color-scheme".to_string()),
+        );
+
+        let desktop_status = state.status_snapshot().runtime;
+        assert_eq!(desktop_status.appearance, EnvironmentAppearance::Light);
+        assert_eq!(
+            desktop_status.appearance_source,
+            crate::model::EnvironmentAppearanceSource::DesktopPreference
+        );
+        assert_eq!(
+            desktop_status.sun_schedule.as_ref().unwrap().appearance,
+            EnvironmentAppearance::Dark
+        );
+
+        state.set_runtime_sun_schedule_appearance(evaluate_sun_schedule(
+            profile.clone(),
+            1_718_992_800,
+        ));
+        state.set_runtime_desktop_color_scheme(
+            Some(EnvironmentAppearance::Dark),
+            Some("gsettings org.gnome.desktop.interface color-scheme".to_string()),
+        );
+        let dark_preference = state.status_snapshot().runtime;
+        assert_eq!(dark_preference.appearance, EnvironmentAppearance::Dark);
+        assert_eq!(
+            dark_preference.appearance_source,
+            crate::model::EnvironmentAppearanceSource::DesktopPreference
+        );
+        assert_eq!(
+            dark_preference.sun_schedule.as_ref().unwrap().appearance,
+            EnvironmentAppearance::Light
+        );
+
+        let manual = handle_request(
+            &mut state,
+            ControlRequest::SetAppearance {
+                appearance: EnvironmentAppearance::Light,
+            },
+            None,
+        );
+        assert!(manual.ok);
+        assert_eq!(
+            manual.status.as_ref().unwrap().runtime.appearance,
+            EnvironmentAppearance::Light
+        );
+        assert_eq!(
+            manual.status.unwrap().runtime.appearance_source,
+            crate::model::EnvironmentAppearanceSource::Manual
+        );
+
+        state.set_runtime_sun_schedule_appearance(evaluate_sun_schedule(
+            profile.clone(),
+            1_719_030_600,
+        ));
+        let manual_status = state.status_snapshot().runtime;
+        assert_eq!(manual_status.appearance, EnvironmentAppearance::Light);
+        assert_eq!(
+            manual_status.sun_schedule.as_ref().unwrap().appearance,
+            EnvironmentAppearance::Dark
+        );
+
+        let cleared = handle_request(
+            &mut state,
+            ControlRequest::SetAppearance {
+                appearance: EnvironmentAppearance::Unknown,
+            },
+            None,
+        );
+        assert!(cleared.ok);
+        let cleared_status = cleared.status.unwrap().runtime;
+        assert_eq!(cleared_status.appearance, EnvironmentAppearance::Dark);
+        assert_eq!(
+            cleared_status.appearance_source,
+            crate::model::EnvironmentAppearanceSource::DesktopPreference
+        );
+
+        state.set_runtime_desktop_color_scheme(
+            Some(EnvironmentAppearance::Unknown),
+            Some("gsettings org.gnome.desktop.interface color-scheme".to_string()),
+        );
+        state.set_runtime_sun_schedule_appearance(evaluate_sun_schedule(profile, 1_718_992_800));
+        let no_preference = state.status_snapshot().runtime;
+        assert_eq!(no_preference.appearance, EnvironmentAppearance::Light);
+        assert_eq!(
+            no_preference.appearance_source,
+            crate::model::EnvironmentAppearanceSource::SunSchedule
+        );
+
+        state.set_runtime_sun_schedule_appearance(crate::sun_schedule::unavailable_profile_status(
+            1_718_992_800,
+            "timezone unavailable",
+        ));
+        let unavailable = state.status_snapshot().runtime;
+        assert_eq!(unavailable.appearance, EnvironmentAppearance::Unknown);
+        assert_eq!(
+            unavailable.appearance_source,
+            crate::model::EnvironmentAppearanceSource::Unknown
+        );
+    }
+
+    #[test]
+    fn gnome_default_tracks_the_solar_boundary_without_an_explicit_preference() {
+        let profile = NodeSunScheduleProfile {
+            node_id: "racter".to_string(),
+            timezone: "America/Los_Angeles".to_string(),
+            latitude: 37.7749,
+            longitude: -122.4194,
+            node_id_source: None,
+            timezone_source: None,
+            coordinates_source: None,
+            override_source: None,
+        };
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.set_runtime_desktop_color_scheme(
+            Some(EnvironmentAppearance::Unknown),
+            Some("gsettings org.gnome.desktop.interface color-scheme".to_string()),
+        );
+
+        state.set_runtime_sun_schedule_appearance(evaluate_sun_schedule(
+            profile.clone(),
+            1_719_030_600,
+        ));
+        let dark_period = state.status_snapshot().runtime;
+        assert_eq!(dark_period.appearance, EnvironmentAppearance::Dark);
+        assert_eq!(
+            dark_period.appearance_source,
+            crate::model::EnvironmentAppearanceSource::SunSchedule
+        );
+
+        state.set_runtime_sun_schedule_appearance(evaluate_sun_schedule(profile, 1_718_992_800));
+        let daylight = state.status_snapshot().runtime;
+        assert_eq!(daylight.appearance, EnvironmentAppearance::Light);
+        assert_eq!(
+            daylight.appearance_source,
+            crate::model::EnvironmentAppearanceSource::SunSchedule
+        );
+    }
+
+    #[test]
     fn sun_schedule_control_sets_appearance_and_exposes_calculation_status() {
         let mut state = CompositorState::new(true, Box::new(NoopProcessController));
 
@@ -1014,6 +1183,10 @@ mod tests {
                     timezone: "America/Los_Angeles".to_string(),
                     latitude: 37.7749,
                     longitude: -122.4194,
+                    node_id_source: None,
+                    timezone_source: None,
+                    coordinates_source: None,
+                    override_source: None,
                 }),
                 evaluated_at_unix_seconds: Some(1_718_992_800),
             },
@@ -1071,6 +1244,10 @@ mod tests {
             timezone: "America/New_York".to_string(),
             latitude: 40.7128,
             longitude: -74.0060,
+            node_id_source: None,
+            timezone_source: None,
+            coordinates_source: None,
+            override_source: None,
         });
 
         let response = handle_request(

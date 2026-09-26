@@ -1,6 +1,6 @@
 pub mod control;
+pub mod host_sun_schedule_profile;
 pub mod model;
-pub mod node_sun_schedule_profiles;
 pub mod output_rotation_memory;
 pub mod output_rotation_model;
 pub mod overlay_role_policy;
