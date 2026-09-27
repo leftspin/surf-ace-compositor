@@ -13755,7 +13755,7 @@ mod tests {
 
     #[test]
     fn mapped_popup_in_unfocused_native_pane_waits_for_pane_focus_and_clicks_locally() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_resize(1280, 720);
         let pane_id = PaneId::new("surface:dialog-pane");
         state

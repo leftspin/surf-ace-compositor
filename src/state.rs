@@ -4801,6 +4801,7 @@ mod tests {
         let mut state = CompositorState::new(true, Box::new(process));
         let pane_id = PaneId::new("pane-stop-failure");
         let request = |content_id: &str, binding_id: &str| NativePaneHostRequest {
+            window_group: None,
             id: pane_id.clone(),
             content_id: Some(content_id.to_string()),
             binding_id: Some(binding_id.to_string()),
