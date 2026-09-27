@@ -475,8 +475,10 @@ fn handle_request_with_capture(
     screen_capture: &ScreenCaptureStore,
 ) -> ControlResponse {
     let result = match request {
-        ControlRequest::GetStatus => Ok(Some(state.status_snapshot())),
-        ControlRequest::GetHostMode => Ok(Some(state.status_snapshot())),
+        ControlRequest::GetStatus | ControlRequest::GetHostMode => {
+            state.poll_processes();
+            Ok(Some(state.status_snapshot()))
+        }
         ControlRequest::MainAppBind { evidence } => {
             let diagnostics = main_app_binding_diagnostics(state, &evidence);
             return ControlResponse::runtime_app_binding(
@@ -708,7 +710,7 @@ fn main_app_binding_diagnostics(
     .to_string();
     let process_lineage_status = match expected.as_ref().map(|expectation| expectation.pid) {
         Some(expected_pid)
-            if evidence.process.pid == expected_pid || evidence.process.ppid == expected_pid =>
+            if crate::runtime::pid_matches_or_descends_from(evidence.process.pid, expected_pid) =>
         {
             "matched"
         }
@@ -820,7 +822,7 @@ mod tests {
         RuntimeDmabufFormatStatus, RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource,
         SurfaceBindingEvidence, SurfaceBindingEvidenceOutcome,
     };
-    use crate::process_manager::{ProcessController, ProcessExit};
+    use crate::process_manager::{ProcessController, ProcessControllerEvent, ProcessRequestId};
     use crate::screen_capture::ScreenCaptureStore;
     use crate::state::CompositorState;
     use crate::sun_schedule::unavailable_profile_status;
@@ -831,23 +833,35 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[derive(Default)]
-    struct NoopProcessController;
+    struct NoopProcessController {
+        next_request_id: ProcessRequestId,
+        events: Vec<ProcessControllerEvent>,
+    }
 
     impl ProcessController for NoopProcessController {
         fn spawn(
             &mut self,
             _spec: &ProcessSpec,
             _extra_env: &BTreeMap<String, String>,
-        ) -> Result<u32, String> {
-            Ok(42)
+        ) -> Result<ProcessRequestId, String> {
+            self.next_request_id += 1;
+            self.events.push(ProcessControllerEvent::SpawnStarted {
+                request_id: self.next_request_id,
+                pid: 42,
+            });
+            Ok(self.next_request_id)
         }
 
-        fn terminate(&mut self, _pid: u32) -> Result<(), String> {
+        fn terminate(&mut self, pid: u32) -> Result<(), String> {
+            self.events.push(ProcessControllerEvent::Terminated {
+                pid,
+                result: Ok(()),
+            });
             Ok(())
         }
 
-        fn reap_exited(&mut self) -> Vec<ProcessExit> {
-            Vec::new()
+        fn poll_events(&mut self) -> Vec<ProcessControllerEvent> {
+            std::mem::take(&mut self.events)
         }
     }
 
@@ -885,7 +899,7 @@ mod tests {
 
     #[test]
     fn main_app_bind_returns_explicit_trusted_runtime_diagnostics() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state
             .select_main_app_launch_intent(MainAppLaunchIntent {
                 process: ProcessSpec {
@@ -971,7 +985,7 @@ mod tests {
 
     #[test]
     fn get_status_exposes_unknown_appearance_by_default() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
 
         let response = handle_request(&mut state, ControlRequest::GetStatus, None);
 
@@ -989,7 +1003,7 @@ mod tests {
 
     #[test]
     fn set_appearance_updates_runtime_status_without_styling_policy() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
 
         let response = handle_request(
             &mut state,
@@ -1026,7 +1040,7 @@ mod tests {
             coordinates_source: None,
             override_source: None,
         };
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.configure_sun_schedule_profile(profile.clone());
         state.set_runtime_sun_schedule_appearance(evaluate_sun_schedule(
             profile.clone(),
@@ -1146,7 +1160,7 @@ mod tests {
             coordinates_source: None,
             override_source: None,
         };
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.set_runtime_sun_schedule_appearance(evaluate_sun_schedule(profile, 1_719_030_600));
         state.set_runtime_desktop_color_scheme(
             Some(EnvironmentAppearance::Unknown),
@@ -1194,7 +1208,7 @@ mod tests {
             coordinates_source: None,
             override_source: None,
         };
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.configure_sun_schedule_profile(profile.clone());
         let stale_at = current_unix_seconds().saturating_sub(86_400);
         state.set_runtime_sun_schedule_appearance(evaluate_sun_schedule(profile.clone(), stale_at));
@@ -1241,7 +1255,7 @@ mod tests {
 
     #[test]
     fn clearing_manual_without_profile_or_preference_preserves_unknown_and_discovery_error() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         let discovery_failure =
             unavailable_profile_status(1_719_030_600, "failed to resolve /etc/localtime");
         state.set_runtime_sun_schedule_appearance(discovery_failure.clone());
@@ -1279,7 +1293,7 @@ mod tests {
 
     #[test]
     fn manual_appearance_override_does_not_survive_fresh_state() {
-        let mut running = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut running = CompositorState::new(true, Box::new(NoopProcessController::default()));
         let set = handle_request(
             &mut running,
             ControlRequest::SetAppearance {
@@ -1293,7 +1307,7 @@ mod tests {
             crate::model::EnvironmentAppearanceSource::Manual
         );
 
-        let restarted = CompositorState::new(true, Box::new(NoopProcessController));
+        let restarted = CompositorState::new(true, Box::new(NoopProcessController::default()));
         let runtime = restarted.status_snapshot().runtime;
         assert_eq!(runtime.appearance, EnvironmentAppearance::Unknown);
         assert_eq!(
@@ -1314,7 +1328,7 @@ mod tests {
             coordinates_source: None,
             override_source: None,
         };
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.set_runtime_desktop_color_scheme(
             Some(EnvironmentAppearance::Unknown),
             Some("gsettings org.gnome.desktop.interface color-scheme".to_string()),
@@ -1342,7 +1356,7 @@ mod tests {
 
     #[test]
     fn sun_schedule_control_sets_appearance_and_exposes_calculation_status() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
 
         let response = handle_request(
             &mut state,
@@ -1383,7 +1397,7 @@ mod tests {
 
     #[test]
     fn sun_schedule_control_without_profile_fails_closed_to_unknown() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
 
         let response = handle_request(
             &mut state,
@@ -1407,7 +1421,7 @@ mod tests {
 
     #[test]
     fn sun_schedule_control_without_inline_profile_uses_configured_node_profile() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.configure_sun_schedule_profile(NodeSunScheduleProfile {
             node_id: "shrdlu".to_string(),
             timezone: "America/New_York".to_string(),
@@ -1441,7 +1455,7 @@ mod tests {
 
     #[test]
     fn apply_native_pane_host_plan_uses_provider_pane_geometry_and_process_intent() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
 
         let response = handle_request(
             &mut state,
@@ -1514,7 +1528,7 @@ mod tests {
 
     #[test]
     fn native_pane_host_migrates_missing_geometry_coordinate_space_and_status_exports_it() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_running(
             RuntimeBackend::HostDrm,
             Some("wayland-77".to_string()),
@@ -1557,7 +1571,7 @@ mod tests {
 
     #[test]
     fn native_pane_host_rejects_physical_shaped_geometry_after_rotation() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_running(
             RuntimeBackend::HostDrm,
             Some("wayland-77".to_string()),
@@ -1599,7 +1613,7 @@ mod tests {
 
     #[test]
     fn overlay_regions_control_set_status_and_clear_are_data_only() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_running(
             RuntimeBackend::HostDrm,
             Some("wayland-77".to_string()),
@@ -1710,7 +1724,7 @@ mod tests {
 
     #[test]
     fn overlay_regions_debug_borders_control_updates_runtime_status_only() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
 
         let response = handle_request(
             &mut state,
@@ -1742,7 +1756,7 @@ mod tests {
 
     #[test]
     fn overlay_regions_control_accepts_native_pane_kind_from_product_path() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_running(
             RuntimeBackend::HostDrm,
             Some("wayland-77".to_string()),
@@ -1824,7 +1838,7 @@ mod tests {
 
     #[test]
     fn overlay_regions_status_exposes_current_topology_epoch_before_first_set() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state
             .apply_provider_snapshot(vec![ProviderPaneSnapshot {
                 id: PaneId::new("pane-a"),
@@ -1852,7 +1866,7 @@ mod tests {
 
     #[test]
     fn overlay_regions_first_set_accepts_epoch_reported_by_empty_status() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_running(
             RuntimeBackend::HostDrm,
             Some("wayland-77".to_string()),
@@ -1932,7 +1946,7 @@ mod tests {
 
     #[test]
     fn overlay_regions_control_rejects_invalid_regions_without_mutation() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state
             .apply_provider_snapshot(vec![ProviderPaneSnapshot {
                 id: PaneId::new("pane-a"),
@@ -1997,7 +2011,7 @@ mod tests {
 
     #[test]
     fn overlay_regions_control_rejects_unknown_pane_without_mutation() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         let before = state.status_snapshot().overlay_regions;
         let topology_epoch = state.topology_epoch().to_string();
 
@@ -2035,7 +2049,7 @@ mod tests {
 
     #[test]
     fn launch_native_pane_hosts_starts_recorded_panes_without_layout_authority() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         let plan_response = handle_request(
             &mut state,
             ControlRequest::ApplyNativePaneHostPlan {
@@ -2085,7 +2099,7 @@ mod tests {
 
     #[test]
     fn bind_native_pane_host_surface_reconciles_launched_pid_and_reports_evidence() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_running(
             RuntimeBackend::HostDrm,
             Some("wayland-77".into()),
@@ -2185,7 +2199,7 @@ mod tests {
 
     #[test]
     fn native_pane_host_update_and_release_are_idempotent_hosting_controls() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_running(
             RuntimeBackend::HostDrm,
             Some("wayland-77".into()),
@@ -2285,7 +2299,7 @@ mod tests {
 
     #[test]
     fn native_pane_release_preserves_provider_owned_pane_record() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_running(
             RuntimeBackend::HostDrm,
             Some("wayland-77".into()),
@@ -2362,7 +2376,7 @@ mod tests {
 
     #[test]
     fn start_host_runtime_control_is_rejected_outside_host_mode_without_queue_or_mutation() {
-        let mut state = CompositorState::new(false, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(false, Box::new(NoopProcessController::default()));
         let before = state.status_snapshot().runtime;
         let (tx, rx) = std::sync::mpsc::channel::<RuntimeControlCommand>();
 
@@ -2378,7 +2392,7 @@ mod tests {
 
     #[test]
     fn start_host_runtime_queues_command_and_marks_starting() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_failed("previous failure");
         let (tx, rx) = std::sync::mpsc::channel::<RuntimeControlCommand>();
 
@@ -2417,7 +2431,7 @@ mod tests {
 
     #[test]
     fn capture_screen_returns_error_when_no_frame_is_available() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_resize(1, 1);
         let screen_capture = ScreenCaptureStore::default();
         let output_path = std::env::temp_dir().join("surf-ace-no-frame-capture.png");
@@ -2440,7 +2454,7 @@ mod tests {
 
     #[test]
     fn capture_screen_writes_png_to_requested_path() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_resize(1, 1);
         let screen_capture = ScreenCaptureStore::default();
         screen_capture.update_root4_scanout_xrgb8888(
@@ -2485,7 +2499,7 @@ mod tests {
 
     #[test]
     fn capture_pane_uses_committed_pane_rect_and_frame_generation() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_resize(4, 4);
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
@@ -2569,7 +2583,7 @@ mod tests {
 
     #[test]
     fn start_host_runtime_restarts_from_host_backend_failed_state() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_host_runtime_start_requested(HostRuntimeStartTrigger::Bootstrap);
         state.mark_runtime_failed("host failure");
         let before = state.status_snapshot().runtime;
@@ -2624,7 +2638,7 @@ mod tests {
 
     #[test]
     fn start_host_runtime_queues_command_from_inactive_host_mode() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         let (tx, rx) = std::sync::mpsc::channel::<RuntimeControlCommand>();
 
         let response = handle_request(&mut state, ControlRequest::StartHostRuntime, Some(&tx));
@@ -2675,7 +2689,7 @@ mod tests {
 
     #[test]
     fn start_host_runtime_restarts_when_host_runtime_is_stopped() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_running(
             RuntimeBackend::HostDrm,
             Some("wayland-77".to_string()),
@@ -2721,7 +2735,7 @@ mod tests {
 
     #[test]
     fn start_host_runtime_is_rejected_when_already_active() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_starting(RuntimeBackend::HostDrm);
         let (tx, _rx) = std::sync::mpsc::channel::<RuntimeControlCommand>();
         let response = handle_request(&mut state, ControlRequest::StartHostRuntime, Some(&tx));
@@ -2734,7 +2748,7 @@ mod tests {
 
     #[test]
     fn start_host_runtime_is_rejected_when_host_runtime_starting_without_mutation() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_host_runtime_start_requested(HostRuntimeStartTrigger::Bootstrap);
         let before = state.status_snapshot().runtime;
         let (tx, rx) = std::sync::mpsc::channel::<RuntimeControlCommand>();
@@ -2763,7 +2777,7 @@ mod tests {
 
     #[test]
     fn start_host_runtime_is_rejected_while_retry_is_already_queued() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_failed("previous failure");
         state.mark_host_runtime_start_requested(HostRuntimeStartTrigger::ControlRetry);
         let before = state.status_snapshot().runtime;
@@ -2781,7 +2795,7 @@ mod tests {
 
     #[test]
     fn start_host_runtime_is_rejected_when_preflight_ready() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_host_preflight_ready(Some("wayland-77".to_string()));
         let before = state.status_snapshot().runtime;
         let (tx, rx) = std::sync::mpsc::channel::<RuntimeControlCommand>();
@@ -2809,7 +2823,7 @@ mod tests {
 
     #[test]
     fn start_host_runtime_is_rejected_when_host_runtime_running_without_mutation() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_host_runtime_start_requested(HostRuntimeStartTrigger::Bootstrap);
         state.mark_runtime_running(
             RuntimeBackend::HostDrm,
@@ -2844,7 +2858,7 @@ mod tests {
 
     #[test]
     fn start_host_runtime_is_rejected_while_non_host_runtime_is_active() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_running(
             RuntimeBackend::Winit,
             Some("wayland-77".to_string()),
@@ -2870,7 +2884,7 @@ mod tests {
 
     #[test]
     fn start_host_runtime_is_rejected_when_non_host_runtime_failed_without_mutation() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_running(
             RuntimeBackend::Winit,
             Some("wayland-77".to_string()),
@@ -2905,7 +2919,7 @@ mod tests {
 
     #[test]
     fn start_host_runtime_is_rejected_when_non_host_runtime_stopped_without_mutation() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_running(
             RuntimeBackend::Winit,
             Some("wayland-77".to_string()),
@@ -2940,7 +2954,7 @@ mod tests {
 
     #[test]
     fn start_host_runtime_is_rejected_when_runtime_none_is_stopped_without_mutation() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_stopped();
         let before = state.status_snapshot().runtime;
         let (tx, rx) = std::sync::mpsc::channel::<RuntimeControlCommand>();
@@ -2969,7 +2983,7 @@ mod tests {
 
     #[test]
     fn start_host_runtime_restarts_when_runtime_none_is_failed() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_failed("pre-host bootstrap failure");
         let before = state.status_snapshot().runtime;
         let (tx, rx) = std::sync::mpsc::channel::<RuntimeControlCommand>();
@@ -3029,7 +3043,7 @@ mod tests {
 
     #[test]
     fn start_host_runtime_does_not_mark_starting_when_control_channel_unavailable() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_failed("previous failure");
         let before = state.status_snapshot().runtime;
 
@@ -3055,7 +3069,7 @@ mod tests {
 
     #[test]
     fn start_host_runtime_does_not_mark_starting_when_control_send_fails() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_failed("previous failure");
         let before = state.status_snapshot().runtime;
         let (tx, rx) = std::sync::mpsc::channel::<RuntimeControlCommand>();
@@ -3083,7 +3097,7 @@ mod tests {
 
     #[test]
     fn get_status_preserves_host_present_runtime_truth_fields_for_live_bringup() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_running(
             RuntimeBackend::HostDrm,
             Some("wayland-77".to_string()),

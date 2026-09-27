@@ -558,6 +558,8 @@ pub fn run_winit(shared_state: Arc<Mutex<CompositorState>>) -> Result<(), Runtim
                         let mut state = lock_state(&data.shared_state);
                         state.mark_runtime_redraw();
                         state.poll_processes();
+                        drop(state);
+                        data.wayland_state.promote_pending_toplevels();
                         backend.window().request_redraw();
                     }
                     Err(err) => {
@@ -1754,6 +1756,7 @@ fn process_claimed_drm_event_source(
         }
         state.poll_processes();
         drop(state);
+        data.wayland_state.promote_pending_toplevels();
         data.queue_pinned_presentation_tick()?;
     }
     Ok(())
@@ -6826,7 +6829,7 @@ fn toplevel_identity(surface: &ToplevelSurface) -> (Option<String>, Option<Strin
     })
 }
 
-fn pid_matches_or_descends_from(pid: u32, expected_ancestor: u32) -> bool {
+pub(crate) fn pid_matches_or_descends_from(pid: u32, expected_ancestor: u32) -> bool {
     if pid == expected_ancestor {
         return true;
     }
@@ -8138,6 +8141,21 @@ impl RuntimeWaylandState {
                 pane_id,
                 launch_pid,
             };
+        }
+
+        let client_pid = self.client_pid_for_toplevel(surface);
+        let pending_child_work = {
+            let state = lock_state(&self.shared_state);
+            state.runtime_has_pending_child_launches()
+                || client_pid.is_some_and(|client_pid| {
+                    state
+                        .runtime_pending_child_stop_pids()
+                        .into_iter()
+                        .any(|launch_pid| pid_matches_or_descends_from(client_pid, launch_pid))
+                })
+        };
+        if pending_child_work {
+            return SurfaceClassification::PendingIdentity;
         }
 
         let (app_id, title) = toplevel_identity(surface);
@@ -10601,7 +10619,9 @@ mod tests {
         OverlayCaptureCapability, OverlayRect, OverlayRegionStatus, PaneGeometry,
         PaneGeometryCoordinateSpace, PaneId, ProcessSpec, RuntimeFocusTarget,
     };
-    use crate::process_manager::{ProcessController, ProcessExit};
+    use crate::process_manager::{
+        ProcessController, ProcessControllerEvent, ProcessRequestId,
+    };
     use crate::screen_capture::ScreenCaptureStore;
     use crate::state::CompositorState;
     use smithay::input::keyboard::{Keysym, ModifiersState, keysyms};
@@ -11046,23 +11066,35 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct NoopProcessController;
+    struct NoopProcessController {
+        next_request_id: ProcessRequestId,
+        events: Vec<ProcessControllerEvent>,
+    }
 
     impl ProcessController for NoopProcessController {
         fn spawn(
             &mut self,
             _spec: &ProcessSpec,
             _extra_env: &std::collections::BTreeMap<String, String>,
-        ) -> Result<u32, String> {
-            Ok(1)
+        ) -> Result<ProcessRequestId, String> {
+            self.next_request_id += 1;
+            self.events.push(ProcessControllerEvent::SpawnStarted {
+                request_id: self.next_request_id,
+                pid: 1,
+            });
+            Ok(self.next_request_id)
         }
 
-        fn terminate(&mut self, _pid: u32) -> Result<(), String> {
+        fn terminate(&mut self, pid: u32) -> Result<(), String> {
+            self.events.push(ProcessControllerEvent::Terminated {
+                pid,
+                result: Ok(()),
+            });
             Ok(())
         }
 
-        fn reap_exited(&mut self) -> Vec<ProcessExit> {
-            Vec::new()
+        fn poll_events(&mut self) -> Vec<ProcessControllerEvent> {
+            std::mem::take(&mut self.events)
         }
     }
 
@@ -11071,7 +11103,7 @@ mod tests {
         EventLoop<'static, HostRuntimeLoopData>,
         ScreenCaptureStore,
     ) {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_resize(3840, 2160);
         let shared_state = Arc::new(Mutex::new(state));
         let display: Display<RuntimeWaylandState> = Display::new().unwrap();
@@ -11255,7 +11287,7 @@ mod tests {
         let mut display_handle = display.handle();
         let shared_state = Arc::new(Mutex::new(CompositorState::new(
             false,
-            Box::new(NoopProcessController),
+            Box::new(NoopProcessController::default()),
         )));
         let mut wayland_state = RuntimeWaylandState::new(display_handle.clone(), shared_state)
             .expect("fixture Wayland state must initialize");
@@ -11602,7 +11634,7 @@ mod tests {
 
     #[test]
     fn production_consumer_staging_rolls_back_every_ordered_position() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_resize(3840, 2160);
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
@@ -12544,7 +12576,7 @@ mod tests {
 
     #[test]
     fn production_transaction_stage_survives_stale_completion_and_activates_exact_token() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_resize(3840, 2160);
         let active = state.root_geometry_snapshot().unwrap();
         let prepared = state
@@ -12628,7 +12660,7 @@ mod tests {
 
     #[test]
     fn staged_rotation_topology_matches_the_committed_fractional_native_geometry() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_resize(3840, 2160);
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
@@ -12666,7 +12698,7 @@ mod tests {
 
     #[test]
     fn staged_generation_is_private_until_the_presentation_operation() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_resize(3840, 2160);
         let active = state.root_geometry_snapshot().unwrap();
         let prepared = state
@@ -12691,7 +12723,7 @@ mod tests {
 
     #[test]
     fn production_staged_operation_rejects_surface_tree_material_interleaving() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_resize(3840, 2160);
         let committed = state
             .prepare_root4_display_scale_from_config(
@@ -12790,6 +12822,34 @@ mod tests {
     }
 
     #[test]
+    fn process_lineage_match_accepts_multi_level_descendant() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+        use std::process::Stdio;
+
+        let script = "sh -c 'sleep 30 & echo $!; wait' & wait";
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdout(Stdio::piped())
+            .process_group(0);
+        let mut launch = command.spawn().expect("nested process tree should start");
+        let stdout = launch.stdout.take().expect("stdout should be piped");
+        let mut line = String::new();
+        std::io::BufReader::new(stdout)
+            .read_line(&mut line)
+            .expect("grandchild pid should be written");
+        let descendant = line.trim().parse::<u32>().expect("pid should be numeric");
+        assert!(pid_matches_or_descends_from(descendant, launch.id()));
+        let group = rustix::process::Pid::from_raw(launch.id() as i32)
+            .expect("spawned launch pid is positive");
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        let _ = launch.wait();
+    }
+
+    #[test]
     fn allocated_gbm_bo_export_policy_preserves_explicit_modifiers() {
         assert!(
             !GBM_BUFFER_FROM_BO_PRESERVE_EXPLICIT_MODIFIER,
@@ -12873,7 +12933,7 @@ mod tests {
     fn missing_native_focus_owner_returns_to_main_surface_not_overlay() {
         let shared_state = Arc::new(Mutex::new(CompositorState::new(
             true,
-            Box::new(NoopProcessController),
+            Box::new(NoopProcessController::default()),
         )));
         lock_state(&shared_state).mark_runtime_resize(1920, 1080);
         let mut display: Display<RuntimeWaylandState> = Display::new().unwrap();
@@ -12950,7 +13010,7 @@ mod tests {
 
     #[test]
     fn destroying_native_toplevel_cancels_held_pointer_grab_and_returns_input_to_main() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_resize(1920, 1080);
         let pane_id = PaneId::new("native-grab-owner");
         state
@@ -13637,7 +13697,7 @@ mod tests {
     fn runtime_overlay_policy_rect_maps_directly_to_atomic_overlay_layout() {
         let shared_state = Arc::new(Mutex::new(CompositorState::new(
             true,
-            Box::new(NoopProcessController),
+            Box::new(NoopProcessController::default()),
         )));
         {
             let mut state = match shared_state.lock() {
@@ -13671,7 +13731,7 @@ mod tests {
     fn runtime_overlay_policy_clamps_left_edge_on_small_outputs() {
         let shared_state = Arc::new(Mutex::new(CompositorState::new(
             true,
-            Box::new(NoopProcessController),
+            Box::new(NoopProcessController::default()),
         )));
         {
             let mut state = match shared_state.lock() {
@@ -13703,7 +13763,7 @@ mod tests {
     fn runtime_overlay_policy_tiny_output_stays_non_empty_and_in_bounds() {
         let shared_state = Arc::new(Mutex::new(CompositorState::new(
             true,
-            Box::new(NoopProcessController),
+            Box::new(NoopProcessController::default()),
         )));
         {
             let mut state = match shared_state.lock() {
@@ -13739,7 +13799,7 @@ mod tests {
     fn runtime_output_size_swaps_for_quarter_turn_rotation() {
         let shared_state = Arc::new(Mutex::new(CompositorState::new(
             true,
-            Box::new(NoopProcessController),
+            Box::new(NoopProcessController::default()),
         )));
         {
             let mut state = match shared_state.lock() {
@@ -13762,7 +13822,7 @@ mod tests {
     fn runtime_pointer_input_maps_physical_deg90_events_to_logical_surface() {
         let shared_state = Arc::new(Mutex::new(CompositorState::new(
             true,
-            Box::new(NoopProcessController),
+            Box::new(NoopProcessController::default()),
         )));
         {
             let mut state = match shared_state.lock() {
@@ -13795,7 +13855,7 @@ mod tests {
     fn runtime_output_size_keeps_upright_dimensions_without_quarter_turn_rotation() {
         let shared_state = Arc::new(Mutex::new(CompositorState::new(
             true,
-            Box::new(NoopProcessController),
+            Box::new(NoopProcessController::default()),
         )));
         {
             let mut state = match shared_state.lock() {
@@ -13842,7 +13902,7 @@ mod tests {
     fn runtime_output_global_preserves_raw_physical_mode_across_root_rotation() {
         let shared_state = Arc::new(Mutex::new(CompositorState::new(
             true,
-            Box::new(NoopProcessController),
+            Box::new(NoopProcessController::default()),
         )));
         {
             let mut state = match shared_state.lock() {
@@ -13868,7 +13928,7 @@ mod tests {
     fn sync_output_state_picks_up_rotation_changes_before_client_bind() {
         let shared_state = Arc::new(Mutex::new(CompositorState::new(
             true,
-            Box::new(NoopProcessController),
+            Box::new(NoopProcessController::default()),
         )));
         {
             let mut state = match shared_state.lock() {
@@ -13908,7 +13968,7 @@ mod tests {
     fn sync_output_rotation_reconfigure_if_needed_preserves_physical_mode_size() {
         let shared_state = Arc::new(Mutex::new(CompositorState::new(
             true,
-            Box::new(NoopProcessController),
+            Box::new(NoopProcessController::default()),
         )));
         {
             let mut state = match shared_state.lock() {
@@ -13953,7 +14013,7 @@ mod tests {
     fn quarter_turn_render_output_size_uses_portrait_logical_dimensions_before_transform() {
         let shared_state = Arc::new(Mutex::new(CompositorState::new(
             true,
-            Box::new(NoopProcessController),
+            Box::new(NoopProcessController::default()),
         )));
         {
             let mut state = match shared_state.lock() {

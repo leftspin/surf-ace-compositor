@@ -14,7 +14,7 @@ use crate::model::{
 use crate::output_rotation_memory::OutputRotationMemory;
 use crate::output_rotation_model::OutputRotationModel;
 use crate::overlay_role_policy::{OverlayRolePolicy, OverlayRolePolicyError};
-use crate::process_manager::ProcessController;
+use crate::process_manager::{ProcessController, ProcessControllerEvent, ProcessRequestId};
 use crate::root_geometry::{
     CommittedRootGeometry, LogicalRect, RootGeometryAuthority, RootGeometryError,
     RootGeometrySnapshot,
@@ -85,6 +85,37 @@ struct OverlayRegionSnapshot {
     regions: Vec<OverlayRegionStatus>,
 }
 
+#[derive(Debug, Clone)]
+enum PendingProcessLaunch {
+    MainApp {
+        intent: MainAppLaunchIntent,
+        launch_token: String,
+    },
+    NativePane {
+        pane_id: PaneId,
+        mode: PaneRenderMode,
+        content_id: Option<String>,
+        binding_id: Option<String>,
+        revision: u64,
+        launch_token: String,
+    },
+    ShellOverlay {
+        process: ProcessSpec,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum PendingProcessStop {
+    MainApp,
+    NativePane {
+        pane_id: PaneId,
+    },
+    ShellOverlay,
+    StaleLaunch {
+        launch: Option<PendingProcessLaunch>,
+    },
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum StateError {
     #[error("pane not found: {0:?}")]
@@ -133,6 +164,12 @@ pub struct CompositorState {
     configured_sun_schedule_profile: Option<NodeSunScheduleProfile>,
     manual_appearance_override: Option<EnvironmentAppearance>,
     process_controller: Box<dyn ProcessController>,
+    pending_process_launches: HashMap<ProcessRequestId, PendingProcessLaunch>,
+    cancelled_process_launches: HashMap<ProcessRequestId, PendingProcessLaunch>,
+    pending_process_stops: HashMap<u32, PendingProcessStop>,
+    pending_main_app_launch: Option<ProcessRequestId>,
+    pending_native_pane_launches: HashMap<PaneId, ProcessRequestId>,
+    pending_shell_overlay_launch: Option<ProcessRequestId>,
     output_rotation_memory: Option<OutputRotationMemory>,
     launch_token_counter: u64,
 }
@@ -154,6 +191,445 @@ impl CompositorState {
             self.launch_token_counter,
             hasher.finish()
         )
+    }
+
+    fn request_process_spawn(
+        &mut self,
+        pending: PendingProcessLaunch,
+        process: &ProcessSpec,
+        extra_env: &BTreeMap<String, String>,
+    ) -> Result<ProcessRequestId, String> {
+        let request_id = self.process_controller.spawn(process, extra_env)?;
+        self.pending_process_launches
+            .insert(request_id, pending.clone());
+        match &pending {
+            PendingProcessLaunch::MainApp { .. } => {
+                self.pending_main_app_launch = Some(request_id);
+            }
+            PendingProcessLaunch::NativePane { pane_id, .. } => {
+                self.pending_native_pane_launches
+                    .insert(pane_id.clone(), request_id);
+            }
+            PendingProcessLaunch::ShellOverlay { .. } => {
+                self.pending_shell_overlay_launch = Some(request_id);
+            }
+        }
+        self.poll_processes();
+        Ok(request_id)
+    }
+
+    fn clear_pending_launch_index(
+        &mut self,
+        request_id: ProcessRequestId,
+        pending: &PendingProcessLaunch,
+    ) {
+        match pending {
+            PendingProcessLaunch::MainApp { .. } => {
+                if self.pending_main_app_launch == Some(request_id) {
+                    self.pending_main_app_launch = None;
+                }
+            }
+            PendingProcessLaunch::NativePane { pane_id, .. } => {
+                if self.pending_native_pane_launches.get(pane_id) == Some(&request_id) {
+                    self.pending_native_pane_launches.remove(pane_id);
+                }
+            }
+            PendingProcessLaunch::ShellOverlay { .. } => {
+                if self.pending_shell_overlay_launch == Some(request_id) {
+                    self.pending_shell_overlay_launch = None;
+                }
+            }
+        }
+    }
+
+    fn cancel_pending_process_launch(&mut self, request_id: ProcessRequestId) {
+        if let Some(pending) = self.pending_process_launches.remove(&request_id) {
+            self.clear_pending_launch_index(request_id, &pending);
+            self.cancelled_process_launches.insert(request_id, pending);
+        }
+    }
+
+    fn request_process_termination(
+        &mut self,
+        pid: u32,
+        pending: PendingProcessStop,
+    ) -> Result<(), String> {
+        if self.pending_process_stops.contains_key(&pid) {
+            return Ok(());
+        }
+        if let Err(reason) = self.process_controller.terminate(pid) {
+            self.pending_process_stops.insert(pid, pending.clone());
+            self.apply_process_termination_failure(pid, pending, reason.clone());
+            return Err(reason);
+        }
+        self.pending_process_stops.insert(pid, pending);
+        Ok(())
+    }
+
+    fn has_pending_stop_for(&self, target: impl Fn(&PendingProcessStop) -> bool) -> bool {
+        self.pending_process_stops.values().any(target)
+    }
+
+    fn has_cancelled_launch_for(&self, target: impl Fn(&PendingProcessLaunch) -> bool) -> bool {
+        self.cancelled_process_launches.values().any(target)
+    }
+
+    fn pending_main_app_stop(&self) -> bool {
+        self.has_pending_stop_for(|pending| {
+            matches!(pending, PendingProcessStop::MainApp)
+                || matches!(
+                    pending,
+                    PendingProcessStop::StaleLaunch {
+                        launch: Some(PendingProcessLaunch::MainApp { .. })
+                    }
+                )
+        }) || self.has_cancelled_launch_for(|pending| {
+            matches!(pending, PendingProcessLaunch::MainApp { .. })
+        })
+    }
+
+    fn pending_native_pane_stop(&self, pane_id: &PaneId) -> bool {
+        self.has_pending_stop_for(|pending| {
+            matches!(pending, PendingProcessStop::NativePane { pane_id: pending_id } if pending_id == pane_id)
+                || matches!(pending, PendingProcessStop::StaleLaunch { launch: Some(PendingProcessLaunch::NativePane { pane_id: pending_id, .. }) } if pending_id == pane_id)
+        }) || self.has_cancelled_launch_for(|pending| {
+            matches!(pending, PendingProcessLaunch::NativePane { pane_id: pending_id, .. } if pending_id == pane_id)
+        })
+    }
+
+    fn pending_shell_overlay_stop(&self) -> bool {
+        self.has_pending_stop_for(|pending| {
+            matches!(pending, PendingProcessStop::ShellOverlay)
+                || matches!(
+                    pending,
+                    PendingProcessStop::StaleLaunch {
+                        launch: Some(PendingProcessLaunch::ShellOverlay { .. })
+                    }
+                )
+        }) || self.has_cancelled_launch_for(|pending| {
+            matches!(pending, PendingProcessLaunch::ShellOverlay { .. })
+        })
+    }
+
+    fn pending_process_launch_is_current(
+        &self,
+        request_id: ProcessRequestId,
+        pending: &PendingProcessLaunch,
+    ) -> bool {
+        match pending {
+            PendingProcessLaunch::MainApp { intent, .. } => {
+                self.pending_main_app_launch == Some(request_id)
+                    && self.runtime.main_app_launch_intent.as_ref() == Some(intent)
+                    && matches!(self.runtime.phase, RuntimePhase::Running)
+            }
+            PendingProcessLaunch::NativePane {
+                pane_id,
+                mode,
+                content_id,
+                binding_id,
+                revision,
+                launch_token,
+            } => {
+                self.pending_native_pane_launches.get(pane_id) == Some(&request_id)
+                    && self.panes.get(pane_id).is_some_and(|pane| {
+                        pane.render_mode == *mode
+                            && pane.native_host_content_id == *content_id
+                            && pane.native_host_binding_id == *binding_id
+                            && pane.native_host_revision == *revision
+                            && pane.external_native_launch_token.as_ref() == Some(launch_token)
+                    })
+            }
+            PendingProcessLaunch::ShellOverlay { process } => {
+                self.pending_shell_overlay_launch == Some(request_id)
+                    && self.shell_overlay_process.as_ref() == Some(process)
+            }
+        }
+    }
+
+    fn apply_process_controller_event(&mut self, event: ProcessControllerEvent) {
+        match event {
+            ProcessControllerEvent::SpawnStarted { request_id, pid } => {
+                if let Some(pending) = self.cancelled_process_launches.remove(&request_id) {
+                    let stop = PendingProcessStop::StaleLaunch {
+                        launch: Some(pending),
+                    };
+                    if let Err(reason) = self.request_process_termination(pid, stop) {
+                        self.runtime.last_error =
+                            Some(format!("child_stop_failure app_pid={pid} reason={reason}"));
+                    }
+                    return;
+                }
+                let Some(pending) = self.pending_process_launches.remove(&request_id) else {
+                    if let Err(reason) = self.request_process_termination(
+                        pid,
+                        PendingProcessStop::StaleLaunch { launch: None },
+                    ) {
+                        self.runtime.last_error =
+                            Some(format!("child_stop_failure app_pid={pid} reason={reason}"));
+                    }
+                    return;
+                };
+                let is_current = self.pending_process_launch_is_current(request_id, &pending);
+                self.clear_pending_launch_index(request_id, &pending);
+                if !is_current {
+                    if let Err(reason) = self.request_process_termination(
+                        pid,
+                        PendingProcessStop::StaleLaunch {
+                            launch: Some(pending),
+                        },
+                    ) {
+                        self.runtime.last_error =
+                            Some(format!("child_stop_failure app_pid={pid} reason={reason}"));
+                    }
+                    return;
+                }
+                match pending {
+                    PendingProcessLaunch::MainApp { launch_token, .. } => {
+                        self.runtime.main_app_launch_state = MainAppLaunchState::Launching { pid };
+                        self.runtime.main_app_surface_id = None;
+                        self.runtime.main_app_binding_evidence = None;
+                        self.runtime.main_app_launch_token = Some(launch_token);
+                    }
+                    PendingProcessLaunch::NativePane {
+                        pane_id,
+                        launch_token,
+                        ..
+                    } => {
+                        if let Some(pane) = self.panes.get_mut(&pane_id) {
+                            pane.external_native_state =
+                                ExternalNativeLifecycleState::Launching { pid };
+                            pane.external_native_surface_id = None;
+                            pane.external_native_binding_evidence = None;
+                            pane.external_native_launch_token = Some(launch_token);
+                            pane.native_pane_window_group = None;
+                        }
+                    }
+                    PendingProcessLaunch::ShellOverlay { .. } => {
+                        self.shell_overlay_lifecycle =
+                            ExternalNativeLifecycleState::Launching { pid };
+                        self.shell_overlay_focus_on_attach = true;
+                    }
+                }
+            }
+            ProcessControllerEvent::SpawnFailed { request_id, reason } => {
+                if let Some(pending) = self.cancelled_process_launches.remove(&request_id) {
+                    self.retry_after_cancelled_launch(&pending);
+                    return;
+                }
+                let Some(pending) = self.pending_process_launches.remove(&request_id) else {
+                    return;
+                };
+                let is_current = self.pending_process_launch_is_current(request_id, &pending);
+                self.clear_pending_launch_index(request_id, &pending);
+                if !is_current {
+                    return;
+                }
+                match pending {
+                    PendingProcessLaunch::MainApp { .. } => {
+                        self.runtime.main_app_launch_state = MainAppLaunchState::Failed { reason };
+                        self.runtime.main_app_surface_id = None;
+                        self.runtime.main_app_binding_evidence = None;
+                        self.runtime.main_app_launch_token = None;
+                    }
+                    PendingProcessLaunch::NativePane { pane_id, .. } => {
+                        if let Some(pane) = self.panes.get_mut(&pane_id) {
+                            pane.external_native_state =
+                                ExternalNativeLifecycleState::Failed { reason };
+                            pane.external_native_launch_token = None;
+                            pane.native_pane_window_group = None;
+                        }
+                    }
+                    PendingProcessLaunch::ShellOverlay { .. } => {
+                        self.shell_overlay_lifecycle =
+                            ExternalNativeLifecycleState::Failed { reason };
+                        self.shell_overlay_focus_on_attach = false;
+                    }
+                }
+            }
+            ProcessControllerEvent::Terminated { pid, result } => match result {
+                Ok(()) => {
+                    if let Some(pending) = self.pending_process_stops.remove(&pid) {
+                        self.apply_process_termination_success(pid, pending);
+                    }
+                }
+                Err(reason) => {
+                    if let Some(pending) = self.pending_process_stops.get(&pid).cloned() {
+                        if self.process_pid_has_exited(pid) {
+                            self.pending_process_stops.remove(&pid);
+                            self.apply_process_termination_success(pid, pending);
+                        } else {
+                            self.apply_process_termination_failure(pid, pending, reason);
+                        }
+                    } else {
+                        self.record_process_termination_failure(pid, reason);
+                    }
+                }
+            },
+            ProcessControllerEvent::Exited(exit) => {
+                self.record_process_exit(exit.pid, exit.exit_code);
+            }
+        }
+    }
+
+    fn process_pid_has_exited(&self, pid: u32) -> bool {
+        matches!(self.runtime.main_app_launch_state, MainAppLaunchState::Exited { pid: exited, .. } if exited == pid)
+            || matches!(self.shell_overlay_lifecycle, ExternalNativeLifecycleState::Exited { pid: exited, .. } if exited == pid)
+            || self.panes.values().any(|pane| {
+                matches!(pane.external_native_state, ExternalNativeLifecycleState::Exited { pid: exited, .. } if exited == pid)
+            })
+    }
+
+    fn apply_process_termination_success(&mut self, pid: u32, pending: PendingProcessStop) {
+        match pending {
+            PendingProcessStop::MainApp => {
+                if main_app_pid(&self.runtime.main_app_launch_state) == Some(pid)
+                    || matches!(
+                        self.runtime.main_app_launch_state,
+                        MainAppLaunchState::WaitingForRuntime
+                    )
+                {
+                    self.runtime.main_app_launch_state =
+                        if self.runtime.main_app_launch_intent.is_some() {
+                            MainAppLaunchState::WaitingForRuntime
+                        } else {
+                            MainAppLaunchState::NotRequested
+                        };
+                    self.runtime.main_app_surface_id = None;
+                    self.runtime.main_app_binding_evidence = None;
+                    self.runtime.main_app_launch_token = None;
+                }
+                self.launch_configured_main_app_if_runtime_ready();
+            }
+            PendingProcessStop::NativePane { pane_id } => {
+                let mut should_launch = false;
+                if let Some(pane) = self.panes.get_mut(&pane_id) {
+                    if external_native_pid(&pane.external_native_state) == Some(pid) {
+                        pane.external_native_state = ExternalNativeLifecycleState::Absent;
+                        pane.external_native_surface_id = None;
+                        pane.external_native_binding_evidence = None;
+                        pane.external_native_launch_token = None;
+                        pane.native_pane_window_group = None;
+                    }
+                    should_launch =
+                        matches!(pane.render_mode, PaneRenderMode::ExternalNative { .. });
+                }
+                if should_launch {
+                    let _ = self.launch_native_pane_hosts(vec![pane_id]);
+                }
+            }
+            PendingProcessStop::ShellOverlay => {
+                if external_native_pid(&self.shell_overlay_lifecycle) == Some(pid) {
+                    self.shell_overlay_lifecycle = ExternalNativeLifecycleState::Absent;
+                    self.shell_overlay_focus_on_attach = false;
+                }
+                if self.active_overlay_pane_id().as_ref() == Some(&shell_overlay_pane_id()) {
+                    let _ = self.open_shell_overlay();
+                }
+            }
+            PendingProcessStop::StaleLaunch { launch } => {
+                if let Some(launch) = launch {
+                    self.retry_after_cancelled_launch(&launch);
+                }
+            }
+        }
+    }
+
+    fn apply_process_termination_failure(
+        &mut self,
+        pid: u32,
+        pending: PendingProcessStop,
+        reason: String,
+    ) {
+        let failure = format!("child_stop_failure app_pid={pid} reason={reason}");
+        match pending {
+            PendingProcessStop::MainApp => {
+                self.runtime.main_app_launch_state = MainAppLaunchState::Failed {
+                    reason: failure.clone(),
+                };
+                self.runtime.main_app_surface_id = None;
+                self.runtime.main_app_binding_evidence = None;
+                self.runtime.main_app_launch_token = None;
+                self.runtime.last_error = Some(failure);
+            }
+            PendingProcessStop::NativePane { pane_id } => {
+                if let Some(pane) = self.panes.get_mut(&pane_id) {
+                    pane.external_native_state = ExternalNativeLifecycleState::Failed {
+                        reason: failure.clone(),
+                    };
+                    pane.external_native_surface_id = None;
+                    pane.external_native_binding_evidence = None;
+                    pane.external_native_launch_token = None;
+                    pane.native_pane_window_group = None;
+                }
+                self.runtime.last_error = Some(failure);
+            }
+            PendingProcessStop::ShellOverlay => {
+                self.shell_overlay_lifecycle = ExternalNativeLifecycleState::Failed {
+                    reason: failure.clone(),
+                };
+                self.shell_overlay_focus_on_attach = false;
+                self.runtime.last_error = Some(failure);
+            }
+            PendingProcessStop::StaleLaunch { .. } => {
+                self.runtime.last_error = Some(failure);
+            }
+        }
+    }
+
+    fn retry_after_cancelled_launch(&mut self, pending: &PendingProcessLaunch) {
+        match pending {
+            PendingProcessLaunch::MainApp { .. } => {
+                self.launch_configured_main_app_if_runtime_ready();
+            }
+            PendingProcessLaunch::NativePane { pane_id, .. } => {
+                if self.panes.get(pane_id).is_some_and(|pane| {
+                    matches!(pane.render_mode, PaneRenderMode::ExternalNative { .. })
+                }) {
+                    let _ = self.launch_native_pane_hosts(vec![pane_id.clone()]);
+                }
+            }
+            PendingProcessLaunch::ShellOverlay { .. } => {
+                if self.active_overlay_pane_id().as_ref() == Some(&shell_overlay_pane_id()) {
+                    let _ = self.open_shell_overlay();
+                }
+            }
+        }
+    }
+
+    fn record_process_termination_failure(&mut self, pid: u32, reason: String) {
+        let failure = format!("child_stop_failure app_pid={pid} reason={reason}");
+        if matches!(
+            self.runtime.main_app_launch_state,
+            MainAppLaunchState::Launching { pid: current }
+                | MainAppLaunchState::Attached { pid: current }
+                if current == pid
+        ) {
+            self.runtime.main_app_launch_state = MainAppLaunchState::Failed {
+                reason: failure.clone(),
+            };
+            self.runtime.main_app_surface_id = None;
+            self.runtime.main_app_binding_evidence = None;
+            self.runtime.main_app_launch_token = None;
+        } else if running_pid(&self.shell_overlay_lifecycle) == Some(pid) {
+            self.shell_overlay_lifecycle = ExternalNativeLifecycleState::Failed {
+                reason: failure.clone(),
+            };
+            self.shell_overlay_focus_on_attach = false;
+        } else if let Some(pane) = self
+            .panes
+            .values_mut()
+            .find(|pane| running_pid(&pane.external_native_state) == Some(pid))
+        {
+            pane.external_native_state = ExternalNativeLifecycleState::Failed {
+                reason: failure.clone(),
+            };
+            pane.external_native_surface_id = None;
+            pane.external_native_binding_evidence = None;
+            pane.external_native_launch_token = None;
+            pane.native_pane_window_group = None;
+        } else {
+            self.runtime.last_error = Some(failure);
+        }
     }
 
     fn clear_runtime_session_status(&mut self) {
@@ -229,6 +705,12 @@ impl CompositorState {
             configured_sun_schedule_profile: None,
             manual_appearance_override: None,
             process_controller,
+            pending_process_launches: HashMap::new(),
+            cancelled_process_launches: HashMap::new(),
+            pending_process_stops: HashMap::new(),
+            pending_main_app_launch: None,
+            pending_native_pane_launches: HashMap::new(),
+            pending_shell_overlay_launch: None,
             output_rotation_memory: None,
             launch_token_counter: 0,
         })
@@ -471,13 +953,16 @@ impl CompositorState {
             .validate()
             .map_err(|err| StateError::InvalidMainAppLaunchIntent(err.to_string()))?;
 
-        self.terminate_running_main_app_process();
-        self.runtime.main_app_surface_id = None;
-        self.runtime.main_app_binding_evidence = None;
-        self.runtime.main_app_launch_token = None;
+        let stop_queued = self.terminate_running_main_app_process();
         self.runtime.main_app_launch_intent = Some(intent);
-        self.runtime.main_app_launch_state = MainAppLaunchState::WaitingForRuntime;
+        if stop_queued && !self.pending_main_app_stop() {
+            self.runtime.main_app_surface_id = None;
+            self.runtime.main_app_binding_evidence = None;
+            self.runtime.main_app_launch_token = None;
+            self.runtime.main_app_launch_state = MainAppLaunchState::WaitingForRuntime;
+        }
         self.launch_configured_main_app_if_runtime_ready();
+        self.poll_processes();
         Ok(())
     }
 
@@ -498,6 +983,7 @@ impl CompositorState {
         self.runtime.runtime_operator_action_reason = None;
         self.clear_runtime_session_status();
         self.clear_host_runtime_route_status();
+        self.poll_processes();
     }
 
     pub fn mark_host_runtime_start_requested(&mut self, trigger: HostRuntimeStartTrigger) {
@@ -511,6 +997,7 @@ impl CompositorState {
         self.runtime.runtime_operator_action_reason = None;
         self.clear_runtime_session_status();
         self.clear_host_runtime_route_status();
+        self.poll_processes();
     }
 
     pub fn mark_runtime_host_preflight_ready(&mut self, wayland_socket: Option<String>) {
@@ -1011,9 +1498,24 @@ impl CompositorState {
             .map(|expectation| (expectation.pid, expectation.binding))
     }
 
+    pub fn runtime_has_pending_child_launches(&self) -> bool {
+        !self.pending_process_launches.is_empty() || !self.cancelled_process_launches.is_empty()
+    }
+
+    pub fn runtime_pending_child_stop_pids(&self) -> Vec<u32> {
+        self.pending_process_stops.keys().copied().collect()
+    }
+
+    pub fn runtime_has_pending_child_process_work(&self) -> bool {
+        self.runtime_has_pending_child_launches() || !self.pending_process_stops.is_empty()
+    }
+
     pub fn runtime_expected_main_app_binding_with_token(
         &self,
     ) -> Option<MainAppBindingExpectation> {
+        if self.pending_main_app_stop() {
+            return None;
+        }
         let binding = self
             .runtime
             .main_app_launch_intent
@@ -1048,6 +1550,9 @@ impl CompositorState {
             .iter()
             .filter_map(|(pane_id, pane)| {
                 if !matches!(pane.render_mode, PaneRenderMode::ExternalNative { .. }) {
+                    return None;
+                }
+                if self.pending_native_pane_stop(pane_id) {
                     return None;
                 }
                 match pane.external_native_state {
@@ -1163,6 +1668,7 @@ impl CompositorState {
             .then(|| format!("host runtime failed; explicit recovery required: {error}"));
         self.clear_runtime_session_status();
         self.clear_host_runtime_route_status();
+        self.poll_processes();
     }
 
     pub fn mark_runtime_stopped(&mut self) {
@@ -1171,6 +1677,7 @@ impl CompositorState {
         self.runtime.host_start_request_pending = false;
         self.clear_runtime_session_status();
         self.clear_host_runtime_route_status();
+        self.poll_processes();
     }
 
     pub fn apply_provider_snapshot(
@@ -1218,16 +1725,32 @@ impl CompositorState {
             incoming.insert(pane.id, runtime);
         }
 
-        for (old_id, old_state) in &self.panes {
-            if incoming.contains_key(old_id) {
-                continue;
+        let removed_panes: Vec<_> = self
+            .panes
+            .iter()
+            .filter(|(pane_id, _)| !incoming.contains_key(*pane_id))
+            .map(|(pane_id, pane)| {
+                (
+                    pane_id.clone(),
+                    running_pid(&pane.external_native_state),
+                    self.pending_native_pane_launches.get(pane_id).copied(),
+                )
+            })
+            .collect();
+        for (old_id, old_pid, pending_request_id) in removed_panes {
+            if let Some(request_id) = pending_request_id {
+                self.cancel_pending_process_launch(request_id);
             }
-            if let Some(pid) = running_pid(&old_state.external_native_state) {
-                self.process_controller
-                    .terminate(pid)
-                    .map_err(StateError::Process)?;
+            if let Some(pid) = old_pid {
+                self.request_process_termination(
+                    pid,
+                    PendingProcessStop::NativePane {
+                        pane_id: old_id.clone(),
+                    },
+                )
+                .map_err(StateError::Process)?;
             }
-            self.overlay_role_policy.release_if_matches(old_id);
+            self.overlay_role_policy.release_if_matches(&old_id);
         }
 
         self.panes = incoming;
@@ -1235,6 +1758,7 @@ impl CompositorState {
             self.panes.contains_key(pane_id) || is_shell_overlay_pane_id(pane_id)
         });
         self.prune_stale_overlay_regions();
+        self.poll_processes();
         self.refresh_root4_viewports();
         Ok(())
     }
@@ -1258,7 +1782,8 @@ impl CompositorState {
             pane.external_native_state,
             ExternalNativeLifecycleState::Launching { .. }
                 | ExternalNativeLifecycleState::Attached { .. }
-        ) {
+        ) || self.pending_native_pane_launches.contains_key(pane_id)
+        {
             return Err(StateError::AlreadyExternalNative(pane_id.clone()));
         }
 
@@ -1273,34 +1798,46 @@ impl CompositorState {
             extra_env.insert("WAYLAND_DISPLAY".to_string(), wayland_socket);
             apply_wayland_toolkit_defaults(&process, &mut extra_env);
         }
-
-        match self.process_controller.spawn(&process, &extra_env) {
-            Ok(pid) => {
-                let pane = self
-                    .panes
-                    .get_mut(pane_id)
-                    .ok_or_else(|| StateError::PaneNotFound(pane_id.clone()))?;
-                pane.render_mode = PaneRenderMode::ExternalNative {
-                    target,
-                    process: process.clone(),
-                };
-                pane.external_native_state = ExternalNativeLifecycleState::Launching { pid };
-                pane.external_native_launch_token = Some(launch_token);
-                Ok(())
-            }
+        let mode = PaneRenderMode::ExternalNative {
+            target,
+            process: process.clone(),
+        };
+        let (content_id, binding_id, revision) = {
+            let pane = self
+                .panes
+                .get(pane_id)
+                .ok_or_else(|| StateError::PaneNotFound(pane_id.clone()))?;
+            (
+                pane.native_host_content_id.clone(),
+                pane.native_host_binding_id.clone(),
+                pane.native_host_revision,
+            )
+        };
+        if let Some(pane) = self.panes.get_mut(pane_id) {
+            pane.render_mode = mode.clone();
+            pane.external_native_state = ExternalNativeLifecycleState::Absent;
+            pane.external_native_launch_token = Some(launch_token.clone());
+            pane.external_native_surface_id = None;
+            pane.external_native_binding_evidence = None;
+            pane.native_pane_window_group = None;
+        }
+        let pending = PendingProcessLaunch::NativePane {
+            pane_id: pane_id.clone(),
+            mode,
+            content_id,
+            binding_id,
+            revision,
+            launch_token,
+        };
+        match self.request_process_spawn(pending, &process, &extra_env) {
+            Ok(_) => Ok(()),
             Err(err) => {
-                let pane = self
-                    .panes
-                    .get_mut(pane_id)
-                    .ok_or_else(|| StateError::PaneNotFound(pane_id.clone()))?;
-                pane.render_mode = PaneRenderMode::ExternalNative {
-                    target,
-                    process: process.clone(),
-                };
-                pane.external_native_state = ExternalNativeLifecycleState::Failed {
-                    reason: err.clone(),
-                };
-                pane.external_native_launch_token = None;
+                if let Some(pane) = self.panes.get_mut(pane_id) {
+                    pane.external_native_state = ExternalNativeLifecycleState::Failed {
+                        reason: err.clone(),
+                    };
+                    pane.external_native_launch_token = None;
+                }
                 Err(StateError::Process(err))
             }
         }
@@ -1319,6 +1856,39 @@ impl CompositorState {
 
         self.bump_topology_epoch();
         for request in requests {
+            let next_mode = PaneRenderMode::ExternalNative {
+                target: request.target.clone(),
+                process: request.process.clone(),
+            };
+            let (host_identity_changed, old_pid) = self
+                .panes
+                .get(&request.id)
+                .map(|pane| {
+                    (
+                        pane.render_mode != next_mode
+                            || pane.native_host_content_id != request.content_id
+                            || pane.native_host_binding_id != request.binding_id
+                            || pane.native_host_launch_token != request.launch_token,
+                        running_pid(&pane.external_native_state),
+                    )
+                })
+                .unwrap_or((false, None));
+            if host_identity_changed {
+                if let Some(request_id) =
+                    self.pending_native_pane_launches.get(&request.id).copied()
+                {
+                    self.cancel_pending_process_launch(request_id);
+                }
+                if let Some(pid) = old_pid {
+                    self.request_process_termination(
+                        pid,
+                        PendingProcessStop::NativePane {
+                            pane_id: request.id.clone(),
+                        },
+                    )
+                    .map_err(StateError::Process)?;
+                }
+            }
             let pane = self
                 .panes
                 .entry(request.id)
@@ -1336,22 +1906,11 @@ impl CompositorState {
                     external_native_launch_token: None,
                     native_pane_window_group: None,
                 });
-            let next_mode = PaneRenderMode::ExternalNative {
-                target: request.target,
-                process: request.process,
-            };
             pane.geometry = request.geometry;
-            let host_identity_changed = pane.render_mode != next_mode
-                || pane.native_host_content_id != request.content_id
-                || pane.native_host_binding_id != request.binding_id
-                || pane.native_host_launch_token != request.launch_token;
             if host_identity_changed {
-                if let Some(pid) = running_pid(&pane.external_native_state) {
-                    self.process_controller
-                        .terminate(pid)
-                        .map_err(StateError::Process)?;
+                if old_pid.is_none() {
+                    pane.external_native_state = ExternalNativeLifecycleState::Absent;
                 }
-                pane.external_native_state = ExternalNativeLifecycleState::Absent;
                 pane.external_native_surface_id = None;
                 pane.external_native_binding_evidence = None;
                 pane.external_native_launch_token = None;
@@ -1365,6 +1924,7 @@ impl CompositorState {
         }
 
         self.prune_stale_overlay_regions();
+        self.poll_processes();
         self.refresh_root4_viewports();
         Ok(())
     }
@@ -1399,7 +1959,8 @@ impl CompositorState {
                     ExternalNativeLifecycleState::Absent
                         | ExternalNativeLifecycleState::Failed { .. }
                         | ExternalNativeLifecycleState::Exited { .. }
-                );
+                ) && !self.pending_native_pane_launches.contains_key(&pane_id);
+                let should_launch = should_launch && !self.pending_native_pane_stop(&pane_id);
                 (process.clone(), should_launch)
             };
 
@@ -1444,18 +2005,34 @@ impl CompositorState {
                 apply_wayland_toolkit_defaults(&process, &mut extra_env);
             }
 
-            match self.process_controller.spawn(&process, &extra_env) {
-                Ok(pid) => {
-                    let pane = self
-                        .panes
-                        .get_mut(&pane_id)
-                        .ok_or_else(|| StateError::PaneNotFound(pane_id.clone()))?;
-                    pane.external_native_state = ExternalNativeLifecycleState::Launching { pid };
-                    pane.external_native_surface_id = None;
-                    pane.external_native_binding_evidence = None;
-                    pane.external_native_launch_token = Some(launch_token);
-                    pane.native_pane_window_group = None;
-                }
+            let (mode, native_host_content_id, native_host_binding_id, native_host_revision) = {
+                let pane = self
+                    .panes
+                    .get(&pane_id)
+                    .ok_or_else(|| StateError::PaneNotFound(pane_id.clone()))?;
+                (
+                    pane.render_mode.clone(),
+                    pane.native_host_content_id.clone(),
+                    pane.native_host_binding_id.clone(),
+                    pane.native_host_revision,
+                )
+            };
+            if let Some(pane) = self.panes.get_mut(&pane_id) {
+                pane.external_native_launch_token = Some(launch_token.clone());
+                pane.external_native_surface_id = None;
+                pane.external_native_binding_evidence = None;
+                pane.native_pane_window_group = None;
+            }
+            let pending = PendingProcessLaunch::NativePane {
+                pane_id: pane_id.clone(),
+                mode,
+                content_id: native_host_content_id,
+                binding_id: native_host_binding_id,
+                revision: native_host_revision,
+                launch_token,
+            };
+            match self.request_process_spawn(pending, &process, &extra_env) {
+                Ok(_) => {}
                 Err(err) => {
                     let pane = self
                         .panes
@@ -1630,19 +2207,32 @@ impl CompositorState {
     }
 
     pub fn switch_pane_to_surf_ace(&mut self, pane_id: &PaneId) -> Result<(), StateError> {
+        if let Some(request_id) = self.pending_native_pane_launches.get(pane_id).copied() {
+            self.cancel_pending_process_launch(request_id);
+        }
+        let pid = self
+            .panes
+            .get(pane_id)
+            .ok_or_else(|| StateError::PaneNotFound(pane_id.clone()))
+            .map(|pane| running_pid(&pane.external_native_state))?;
+        if let Some(pid) = pid {
+            self.request_process_termination(
+                pid,
+                PendingProcessStop::NativePane {
+                    pane_id: pane_id.clone(),
+                },
+            )
+            .map_err(StateError::Process)?;
+        }
+
         let pane = self
             .panes
             .get_mut(pane_id)
             .ok_or_else(|| StateError::PaneNotFound(pane_id.clone()))?;
-
-        if let Some(pid) = running_pid(&pane.external_native_state) {
-            self.process_controller
-                .terminate(pid)
-                .map_err(StateError::Process)?;
-        }
-
         pane.render_mode = PaneRenderMode::SurfAceRendered;
-        pane.external_native_state = ExternalNativeLifecycleState::Absent;
+        if pid.is_none() {
+            pane.external_native_state = ExternalNativeLifecycleState::Absent;
+        }
         pane.native_host_content_id = None;
         pane.native_host_binding_id = None;
         pane.native_host_revision = 0;
@@ -1652,6 +2242,7 @@ impl CompositorState {
         pane.native_pane_window_group = None;
         self.overlay_role_policy.release_if_matches(pane_id);
         self.prune_stale_overlay_regions();
+        self.poll_processes();
         Ok(())
     }
 
@@ -1685,6 +2276,9 @@ impl CompositorState {
     }
 
     pub fn toggle_shell_overlay(&mut self) -> Result<(), StateError> {
+        if self.pending_shell_overlay_launch.is_some() {
+            return self.dismiss_shell_overlay();
+        }
         match self.shell_overlay_lifecycle {
             ExternalNativeLifecycleState::Launching { .. }
             | ExternalNativeLifecycleState::Attached { .. } => self.dismiss_shell_overlay(),
@@ -1701,6 +2295,9 @@ impl CompositorState {
     pub fn runtime_expected_overlay_binding(&self) -> Option<(PaneId, u32)> {
         let pane_id = self.active_overlay_pane_id()?;
         if is_shell_overlay_pane_id(&pane_id) {
+            if self.pending_shell_overlay_stop() {
+                return None;
+            }
             return match self.shell_overlay_lifecycle {
                 ExternalNativeLifecycleState::Launching { pid }
                 | ExternalNativeLifecycleState::Attached { pid } => Some((pane_id, pid)),
@@ -1711,6 +2308,9 @@ impl CompositorState {
         }
         let pane = self.panes.get(&pane_id)?;
         if !matches!(pane.render_mode, PaneRenderMode::ExternalNative { .. }) {
+            return None;
+        }
+        if self.pending_native_pane_stop(&pane_id) {
             return None;
         }
         match pane.external_native_state {
@@ -1808,8 +2408,8 @@ impl CompositorState {
     }
 
     pub fn poll_processes(&mut self) {
-        for process_exit in self.process_controller.reap_exited() {
-            self.record_process_exit(process_exit.pid, process_exit.exit_code);
+        for event in self.process_controller.poll_events() {
+            self.apply_process_controller_event(event);
         }
     }
 
@@ -2075,6 +2675,10 @@ impl CompositorState {
         })?;
         let pane_id = shell_overlay_pane_id();
         self.overlay_role_policy.reserve_for(&pane_id)?;
+        if self.pending_shell_overlay_stop() {
+            self.shell_overlay_focus_on_attach = true;
+            return Ok(());
+        }
 
         let mut extra_env = BTreeMap::new();
         extra_env.insert("SURF_ACE_COMPOSITOR_HOST_MODE".to_string(), "1".to_string());
@@ -2083,9 +2687,11 @@ impl CompositorState {
             extra_env.insert("WAYLAND_DISPLAY".to_string(), wayland_socket);
         }
 
-        match self.process_controller.spawn(&process, &extra_env) {
-            Ok(pid) => {
-                self.shell_overlay_lifecycle = ExternalNativeLifecycleState::Launching { pid };
+        let pending = PendingProcessLaunch::ShellOverlay {
+            process: process.clone(),
+        };
+        match self.request_process_spawn(pending, &process, &extra_env) {
+            Ok(_) => {
                 self.shell_overlay_focus_on_attach = true;
                 Ok(())
             }
@@ -2100,13 +2706,16 @@ impl CompositorState {
     }
 
     fn dismiss_shell_overlay(&mut self) -> Result<(), StateError> {
+        if let Some(request_id) = self.pending_shell_overlay_launch {
+            self.cancel_pending_process_launch(request_id);
+        }
         if let Some(pid) = running_pid(&self.shell_overlay_lifecycle) {
-            self.process_controller
-                .terminate(pid)
+            self.request_process_termination(pid, PendingProcessStop::ShellOverlay)
                 .map_err(StateError::Process)?;
+        } else if !self.pending_shell_overlay_stop() {
+            self.shell_overlay_lifecycle = ExternalNativeLifecycleState::Absent;
         }
 
-        self.shell_overlay_lifecycle = ExternalNativeLifecycleState::Absent;
         self.shell_overlay_focus_on_attach = false;
         self.overlay_role_policy
             .release_if_matches(&shell_overlay_pane_id());
@@ -2114,6 +2723,7 @@ impl CompositorState {
             .runtime
             .main_app_surface_id
             .map(|_| RuntimeFocusTarget::MainApp);
+        self.poll_processes();
         Ok(())
     }
 
@@ -2138,7 +2748,9 @@ impl CompositorState {
         if matches!(
             self.runtime.main_app_launch_state,
             MainAppLaunchState::Launching { .. } | MainAppLaunchState::Attached { .. }
-        ) {
+        ) || self.pending_main_app_launch.is_some()
+            || self.pending_main_app_stop()
+        {
             return;
         }
 
@@ -2153,13 +2765,12 @@ impl CompositorState {
             extra_env.insert("WAYLAND_DISPLAY".to_string(), wayland_socket);
         }
 
-        match self.process_controller.spawn(&intent.process, &extra_env) {
-            Ok(pid) => {
-                self.runtime.main_app_launch_state = MainAppLaunchState::Launching { pid };
-                self.runtime.main_app_surface_id = None;
-                self.runtime.main_app_binding_evidence = None;
-                self.runtime.main_app_launch_token = Some(launch_token);
-            }
+        let pending = PendingProcessLaunch::MainApp {
+            intent: intent.clone(),
+            launch_token,
+        };
+        match self.request_process_spawn(pending, &intent.process, &extra_env) {
+            Ok(_) => {}
             Err(err) => {
                 self.runtime.main_app_launch_state = MainAppLaunchState::Failed {
                     reason: err.clone(),
@@ -2173,17 +2784,22 @@ impl CompositorState {
 
     fn prepare_main_app_for_runtime_reset(&mut self) {
         self.terminate_running_main_app_process();
-        self.runtime.main_app_surface_id = None;
-        self.runtime.main_app_binding_evidence = None;
-        self.runtime.main_app_launch_token = None;
-        self.runtime.main_app_launch_state = if self.runtime.main_app_launch_intent.is_some() {
-            MainAppLaunchState::WaitingForRuntime
-        } else {
-            MainAppLaunchState::NotRequested
-        };
+        if !self.pending_main_app_stop() {
+            self.runtime.main_app_surface_id = None;
+            self.runtime.main_app_binding_evidence = None;
+            self.runtime.main_app_launch_token = None;
+            self.runtime.main_app_launch_state = if self.runtime.main_app_launch_intent.is_some() {
+                MainAppLaunchState::WaitingForRuntime
+            } else {
+                MainAppLaunchState::NotRequested
+            };
+        }
     }
 
-    fn terminate_running_main_app_process(&mut self) {
+    fn terminate_running_main_app_process(&mut self) -> bool {
+        if let Some(request_id) = self.pending_main_app_launch {
+            self.cancel_pending_process_launch(request_id);
+        }
         let pid = match self.runtime.main_app_launch_state {
             MainAppLaunchState::Launching { pid } | MainAppLaunchState::Attached { pid } => {
                 Some(pid)
@@ -2195,8 +2811,11 @@ impl CompositorState {
         };
 
         if let Some(pid) = pid {
-            let _ = self.process_controller.terminate(pid);
+            return self
+                .request_process_termination(pid, PendingProcessStop::MainApp)
+                .is_ok();
         }
+        true
     }
 
     fn prune_stale_overlay_regions(&mut self) {
@@ -2516,6 +3135,26 @@ fn running_pid(state: &ExternalNativeLifecycleState) -> Option<u32> {
     }
 }
 
+fn external_native_pid(state: &ExternalNativeLifecycleState) -> Option<u32> {
+    match state {
+        ExternalNativeLifecycleState::Launching { pid }
+        | ExternalNativeLifecycleState::Attached { pid }
+        | ExternalNativeLifecycleState::Exited { pid, .. } => Some(*pid),
+        ExternalNativeLifecycleState::Absent | ExternalNativeLifecycleState::Failed { .. } => None,
+    }
+}
+
+fn main_app_pid(state: &MainAppLaunchState) -> Option<u32> {
+    match state {
+        MainAppLaunchState::Launching { pid }
+        | MainAppLaunchState::Attached { pid }
+        | MainAppLaunchState::Exited { pid, .. } => Some(*pid),
+        MainAppLaunchState::NotRequested
+        | MainAppLaunchState::WaitingForRuntime
+        | MainAppLaunchState::Failed { .. } => None,
+    }
+}
+
 fn shell_overlay_pane_id() -> PaneId {
     PaneId::new(SHELL_OVERLAY_PANE_ID)
 }
@@ -2532,7 +3171,9 @@ mod tests {
         OverlayCaptureCapability, PaneGeometry, ProviderPaneSnapshot, SurfaceBindingEvidence,
         SurfaceBindingEvidenceOutcome,
     };
-    use crate::process_manager::{ProcessController, ProcessExit};
+    use crate::process_manager::{
+        ProcessController, ProcessControllerEvent, ProcessExit, ProcessRequestId,
+    };
     use std::collections::{BTreeMap, HashSet};
     use std::sync::{Arc, Mutex};
 
@@ -2543,11 +3184,13 @@ mod tests {
 
     #[derive(Default)]
     struct FakeProcessControllerInner {
+        next_request_id: ProcessRequestId,
         next_pid: u32,
         running: HashSet<u32>,
         terminated: Vec<u32>,
-        queued_exits: Vec<ProcessExit>,
+        queued_events: Vec<ProcessControllerEvent>,
         fail_spawn: bool,
+        fail_terminate: bool,
         spawned_env: Vec<BTreeMap<String, String>>,
     }
 
@@ -2555,6 +3198,10 @@ mod tests {
         fn with_fail_spawn(self, value: bool) -> Self {
             self.inner.lock().expect("lock").fail_spawn = value;
             self
+        }
+
+        fn set_fail_terminate(&self, value: bool) {
+            self.inner.lock().expect("lock").fail_terminate = value;
         }
 
         fn terminated(&self) -> Vec<u32> {
@@ -2565,8 +3212,11 @@ mod tests {
             self.inner
                 .lock()
                 .expect("lock")
-                .queued_exits
-                .push(ProcessExit { pid, exit_code });
+                .queued_events
+                .push(ProcessControllerEvent::Exited(ProcessExit {
+                    pid,
+                    exit_code,
+                }));
         }
 
         fn spawned_env(&self) -> Vec<BTreeMap<String, String>> {
@@ -2579,31 +3229,50 @@ mod tests {
             &mut self,
             _spec: &ProcessSpec,
             extra_env: &BTreeMap<String, String>,
-        ) -> Result<u32, String> {
+        ) -> Result<ProcessRequestId, String> {
             let mut inner = self.inner.lock().expect("lock");
             if inner.fail_spawn {
                 return Err("spawn failed".to_string());
             }
             inner.spawned_env.push(extra_env.clone());
+            inner.next_request_id += 1;
+            let request_id = inner.next_request_id;
             inner.next_pid += 1;
             let pid = inner.next_pid;
             inner.running.insert(pid);
-            Ok(pid)
+            inner
+                .queued_events
+                .push(ProcessControllerEvent::SpawnStarted { request_id, pid });
+            Ok(request_id)
         }
 
         fn terminate(&mut self, pid: u32) -> Result<(), String> {
             let mut inner = self.inner.lock().expect("lock");
-            if inner.running.remove(&pid) {
+            if inner.running.contains(&pid) && inner.fail_terminate {
+                inner
+                    .queued_events
+                    .push(ProcessControllerEvent::Terminated {
+                        pid,
+                        result: Err("systemctl_user_stop_failed".to_string()),
+                    });
+                Ok(())
+            } else if inner.running.remove(&pid) {
                 inner.terminated.push(pid);
+                inner
+                    .queued_events
+                    .push(ProcessControllerEvent::Terminated {
+                        pid,
+                        result: Ok(()),
+                    });
                 Ok(())
             } else {
                 Err(format!("unknown pid: {pid}"))
             }
         }
 
-        fn reap_exited(&mut self) -> Vec<ProcessExit> {
+        fn poll_events(&mut self) -> Vec<ProcessControllerEvent> {
             let mut inner = self.inner.lock().expect("lock");
-            std::mem::take(&mut inner.queued_exits)
+            std::mem::take(&mut inner.queued_events)
         }
     }
 
@@ -3031,6 +3700,9 @@ mod tests {
         state
             .launch_native_pane_hosts(Vec::new())
             .expect("empty launch set should launch all planned native panes");
+        state
+            .launch_native_pane_hosts(Vec::new())
+            .expect("repeated same-identity request should stay idempotent");
 
         let status = state.status_snapshot();
         assert_eq!(
@@ -3677,6 +4349,90 @@ mod tests {
                 .active_overlay_pane
                 .is_none()
         );
+    }
+
+    #[test]
+    fn failed_child_stop_keeps_replacement_from_starting_in_same_pane_slot() {
+        let process = FakeProcessController::default();
+        let process_view = process.clone();
+        let mut state = CompositorState::new(true, Box::new(process));
+        let pane_id = PaneId::new("pane-stop-failure");
+        let request = |content_id: &str, binding_id: &str| NativePaneHostRequest {
+            id: pane_id.clone(),
+            content_id: Some(content_id.to_string()),
+            binding_id: Some(binding_id.to_string()),
+            launch_token: None,
+            revision: 1,
+            geometry: PaneGeometry {
+                x: 0.0,
+                y: 0.0,
+                width: 640.0,
+                height: 480.0,
+                coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+            },
+            target: NativeTargetClass::Terminal,
+            process: terminal_process(),
+        };
+
+        state
+            .apply_native_pane_host_plan(vec![request("content-old", "binding-old")])
+            .expect("initial host plan should apply");
+        state
+            .launch_native_pane_hosts(vec![pane_id.clone()])
+            .expect("initial child should launch");
+        process_view.set_fail_terminate(true);
+
+        state
+            .apply_native_pane_host_plan(vec![request("content-new", "binding-new")])
+            .expect("replacement host plan should apply and report async stop failure");
+        state
+            .launch_native_pane_hosts(vec![pane_id.clone()])
+            .expect("a failed old stop fences the replacement launch");
+
+        let status = state.status_snapshot();
+        assert_eq!(process_view.spawned_env().len(), 1);
+        assert_eq!(
+            status.panes[0].external_native_state,
+            ExternalNativeLifecycleState::Failed {
+                reason: format!("child_stop_failure app_pid=1 reason=systemctl_user_stop_failed")
+            }
+        );
+        assert_eq!(
+            status.runtime.last_error.as_deref(),
+            Some("child_stop_failure app_pid=1 reason=systemctl_user_stop_failed")
+        );
+        assert!(state.runtime_has_pending_child_process_work());
+    }
+
+    #[test]
+    fn already_exited_child_is_not_reported_as_a_stop_failure() {
+        let process = FakeProcessController::default();
+        let process_view = process.clone();
+        let mut state = CompositorState::new(true, Box::new(process));
+        let pane_id = PaneId::new("pane-exit-before-stop");
+        state
+            .apply_provider_snapshot(vec![pane("pane-exit-before-stop", 0, 0, 640, 480)])
+            .expect("provider pane should be accepted");
+        state
+            .switch_pane_to_external_native(
+                &pane_id,
+                NativeTargetClass::Terminal,
+                terminal_process(),
+            )
+            .expect("native child should start");
+
+        process_view.queue_exit(1, Some(7));
+        process_view.set_fail_terminate(true);
+        state
+            .switch_pane_to_surf_ace(&pane_id)
+            .expect("a child that already exited needs no successful stop");
+
+        assert_eq!(
+            state.status_snapshot().panes[0].external_native_state,
+            ExternalNativeLifecycleState::Absent
+        );
+        assert_eq!(state.status_snapshot().runtime.last_error, None);
+        assert!(!state.pending_process_stops.contains_key(&1));
     }
 
     #[test]
