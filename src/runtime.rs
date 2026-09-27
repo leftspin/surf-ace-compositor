@@ -1995,7 +1995,10 @@ fn handle_drm_event_transaction_failure(
     data.discard_staged_root_geometry(
         crate::root_geometry::RootGeometryError::DisplayScaleApplyFailed,
     );
-    eprintln!("root4 geometry transaction rejected: {}", failure.error_ref());
+    eprintln!(
+        "root4 geometry transaction rejected: {}",
+        failure.error_ref()
+    );
     Some(PostAction::Continue)
 }
 
@@ -12627,8 +12630,7 @@ mod tests {
             &mut runtime,
             &super::HostPresentFailure::transaction(super::RuntimeError::HostOutputClaim {
                 path: "/dev/null".to_string(),
-                error: "root4 surface material changed during the pinned presentation"
-                    .to_string(),
+                error: "root4 surface material changed during the pinned presentation".to_string(),
             }),
         );
         assert!(matches!(
@@ -12666,12 +12668,11 @@ mod tests {
     #[test]
     fn drm_transaction_failure_handler_leaves_other_failure_classes_for_existing_paths() {
         let (mut runtime, _event_loop, _capture) = test_host_runtime_loop();
-        let reclaimable = super::HostPresentFailure::reclaimable(
-            super::RuntimeError::HostOutputClaim {
+        let reclaimable =
+            super::HostPresentFailure::reclaimable(super::RuntimeError::HostOutputClaim {
                 path: "/dev/null".to_string(),
                 error: "event stream lost".to_string(),
-            },
-        );
+            });
         assert!(super::handle_drm_event_transaction_failure(&mut runtime, &reclaimable).is_none());
         let fatal = super::HostPresentFailure::fatal(super::RuntimeError::Loop(
             "unexpected event processing failure".to_string(),
