@@ -1895,6 +1895,9 @@ fn bind_claimed_drm_event_source(
                     return Ok(PostAction::Remove);
                 }
                 if let Err(failure) = process_claimed_drm_event_source(data) {
+                    if let Some(action) = handle_drm_event_transaction_failure(data, &failure) {
+                        return Ok(action);
+                    }
                     if failure.is_reclaimable() {
                         let transaction_has_queued_flip = data
                             .wayland_state
@@ -1979,6 +1982,24 @@ fn bind_claimed_drm_event_source(
         device_id: Some(device_id),
     };
     Ok(())
+}
+
+fn handle_drm_event_transaction_failure(
+    data: &mut HostRuntimeLoopData,
+    failure: &HostPresentFailure,
+) -> Option<PostAction> {
+    if !failure.is_transaction() {
+        return None;
+    }
+
+    data.discard_staged_root_geometry(
+        crate::root_geometry::RootGeometryError::DisplayScaleApplyFailed,
+    );
+    eprintln!(
+        "root4 geometry transaction rejected: {}",
+        failure.error_ref()
+    );
+    Some(PostAction::Continue)
 }
 
 fn invalidate_drm_event_source_for_device(
@@ -12572,6 +12593,91 @@ mod tests {
         assert!(runtime.wayland_state.staged_root_geometry.is_some());
         assert!(runtime.root_geometry_queue.pending.is_empty());
         assert_ne!(staged_generation, active_generation);
+    }
+
+    #[test]
+    fn drm_transaction_failure_discards_stage_and_keeps_event_source_running() {
+        let (mut runtime, _event_loop, capture) = test_host_runtime_loop();
+        let active_generation = lock_state(&runtime.shared_state)
+            .root_geometry_snapshot()
+            .unwrap()
+            .generation;
+        let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+        runtime
+            .root_geometry_queue
+            .push(RuntimeGeometryMutation::Rotation {
+                rotation: OutputRotation::Deg90,
+                response: response_tx,
+            });
+        runtime
+            .root_geometry_queue
+            .push(RuntimeGeometryMutation::Scale {
+                factor: 1.25,
+                source: crate::root_geometry::DisplayScaleSource::Config,
+            });
+        runtime.stage_next_root_geometry_mutation();
+        let staged_generation = runtime
+            .wayland_state
+            .staged_root_geometry
+            .as_ref()
+            .unwrap()
+            .committed
+            .snapshot
+            .generation;
+        stage_capture_for_pending_geometry(&runtime);
+
+        let action = super::handle_drm_event_transaction_failure(
+            &mut runtime,
+            &super::HostPresentFailure::transaction(super::RuntimeError::HostOutputClaim {
+                path: "/dev/null".to_string(),
+                error: "root4 surface material changed during the pinned presentation".to_string(),
+            }),
+        );
+        assert!(matches!(
+            action,
+            Some(smithay::reexports::calloop::PostAction::Continue)
+        ));
+        assert!(runtime.wayland_state.staged_root_geometry.is_none());
+        assert_eq!(capture.root4_generations_for_test(), (None, None));
+        assert_eq!(
+            response_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("the queued rotation response must be completed"),
+            Err(crate::root_geometry::RootGeometryError::DisplayScaleApplyFailed)
+        );
+        assert_eq!(
+            lock_state(&runtime.shared_state)
+                .root_geometry_snapshot()
+                .unwrap()
+                .generation,
+            active_generation,
+            "a rejected transaction must retain the committed generation"
+        );
+        assert_committed_root_geometry_generation(
+            &lock_state(&runtime.shared_state),
+            active_generation,
+        );
+
+        runtime.stage_next_root_geometry_mutation();
+        assert_eq!(runtime.pending_geometry_mutation, Some((2, "scale")));
+        assert!(runtime.wayland_state.staged_root_geometry.is_some());
+        assert!(runtime.root_geometry_queue.pending.is_empty());
+        assert_ne!(staged_generation, active_generation);
+    }
+
+    #[test]
+    fn drm_transaction_failure_handler_leaves_other_failure_classes_for_existing_paths() {
+        let (mut runtime, _event_loop, _capture) = test_host_runtime_loop();
+        let reclaimable =
+            super::HostPresentFailure::reclaimable(super::RuntimeError::HostOutputClaim {
+                path: "/dev/null".to_string(),
+                error: "event stream lost".to_string(),
+            });
+        assert!(super::handle_drm_event_transaction_failure(&mut runtime, &reclaimable).is_none());
+        let fatal = super::HostPresentFailure::fatal(super::RuntimeError::Loop(
+            "unexpected event processing failure".to_string(),
+        ));
+        assert!(super::handle_drm_event_transaction_failure(&mut runtime, &fatal).is_none());
     }
 
     #[test]
