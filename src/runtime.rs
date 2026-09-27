@@ -7873,6 +7873,10 @@ impl RuntimeWaylandState {
         )
     }
 
+    fn native_pane_surface_is_visible(&self, pane_id: &PaneId, mapped: bool) -> bool {
+        mapped && self.native_pane_is_keyboard_focused(pane_id)
+    }
+
     fn native_pane_accessory_rect(
         &self,
         pane_id: &PaneId,
@@ -7944,25 +7948,27 @@ impl RuntimeWaylandState {
             .filter(|accessory| &accessory.pane_id == pane_id)
         {
             let id = surface_id(accessory.surface.wl_surface()).to_string();
-            if !members.iter().any(|member| member.id == id) {
-                let bounds = self
-                    .native_pane_accessory_rect(pane_id, &accessory.surface)
-                    .map(|rect| crate::model::PaneGeometry {
-                        x: rect.loc.x as f64,
-                        y: rect.loc.y as f64,
-                        width: rect.size.w as f64,
-                        height: rect.size.h as f64,
-                        coordinate_space:
-                            crate::model::PaneGeometryCoordinateSpace::CompositorLogical,
-                    });
-                members.push(crate::model::NativePaneWindowGroupMemberStatus {
-                    id: id.clone(),
-                    role: "secondary".to_string(),
-                    bounds,
-                    focused: false,
-                    lifecycle: if accessory.mapped { "live" } else { "unmapped" }.to_string(),
-                    clipped_to_pane: Some(false),
+            let bounds = self
+                .native_pane_accessory_rect(pane_id, &accessory.surface)
+                .map(|rect| crate::model::PaneGeometry {
+                    x: rect.loc.x as f64,
+                    y: rect.loc.y as f64,
+                    width: rect.size.w as f64,
+                    height: rect.size.h as f64,
+                    coordinate_space: crate::model::PaneGeometryCoordinateSpace::CompositorLogical,
                 });
+            let status = crate::model::NativePaneWindowGroupMemberStatus {
+                id: id.clone(),
+                role: "secondary".to_string(),
+                bounds,
+                focused: false,
+                lifecycle: if accessory.mapped { "live" } else { "unmapped" }.to_string(),
+                clipped_to_pane: Some(false),
+            };
+            if let Some(member) = members.iter_mut().find(|member| member.id == id) {
+                *member = status;
+            } else {
+                members.push(status);
             }
         }
         for popup in self
@@ -7971,15 +7977,18 @@ impl RuntimeWaylandState {
             .filter(|popup| popup.owner_role == RuntimeSurfaceRole::NativePane(pane_id.clone()))
         {
             let id = surface_id(popup.surface.wl_surface()).to_string();
-            if !members.iter().any(|member| member.id == id) {
-                members.push(crate::model::NativePaneWindowGroupMemberStatus {
-                    id: id.clone(),
-                    role: "popup".to_string(),
-                    bounds: None,
-                    focused: false,
-                    lifecycle: if popup.mapped { "live" } else { "unmapped" }.to_string(),
-                    clipped_to_pane: Some(false),
-                });
+            let status = crate::model::NativePaneWindowGroupMemberStatus {
+                id: id.clone(),
+                role: "popup".to_string(),
+                bounds: None,
+                focused: false,
+                lifecycle: if popup.mapped { "live" } else { "unmapped" }.to_string(),
+                clipped_to_pane: Some(false),
+            };
+            if let Some(member) = members.iter_mut().find(|member| member.id == id) {
+                *member = status;
+            } else {
+                members.push(status);
             }
         }
         for member in &mut members {
@@ -8620,7 +8629,7 @@ impl RuntimeWaylandState {
             let RuntimeSurfaceRole::NativePane(pane_id) = &popup.owner_role else {
                 continue;
             };
-            if !popup.mapped || !self.native_pane_is_keyboard_focused(pane_id) {
+            if !self.native_pane_surface_is_visible(pane_id, popup.mapped) {
                 continue;
             }
             let local = self.popup_geometry_local(&popup.surface);
@@ -8658,7 +8667,7 @@ impl RuntimeWaylandState {
         }
 
         for accessory in self.native_pane_accessories.iter().rev() {
-            if !accessory.mapped || !self.native_pane_is_keyboard_focused(&accessory.pane_id) {
+            if !self.native_pane_surface_is_visible(&accessory.pane_id, accessory.mapped) {
                 continue;
             }
             let Some(rect) =
@@ -9392,7 +9401,7 @@ impl RuntimeWaylandState {
         }
 
         for accessory in &self.native_pane_accessories {
-            if !accessory.mapped || !self.native_pane_is_keyboard_focused(&accessory.pane_id) {
+            if !self.native_pane_surface_is_visible(&accessory.pane_id, accessory.mapped) {
                 continue;
             }
             let Some(rect) =
@@ -9453,7 +9462,7 @@ impl RuntimeWaylandState {
             let RuntimeSurfaceRole::NativePane(ref pane_id) = popup.owner_role else {
                 continue;
             };
-            if !popup.mapped || !self.native_pane_is_keyboard_focused(pane_id) {
+            if !self.native_pane_surface_is_visible(pane_id, popup.mapped) {
                 continue;
             }
             let pane_origin = pinned_status
@@ -9927,9 +9936,14 @@ impl RuntimeWaylandState {
                 let popup = self.popups.remove(index);
                 self.popups.push(popup);
             }
-            self.note_native_pane_surface_focus(surface, true);
-            if let Some(keyboard) = self.seat.get_keyboard() {
-                keyboard.set_focus(self, Some(surface.clone()), 0.into());
+            // Mapping records a pane-group member, but it does not activate
+            // an accessory whose pane is currently blurred. Such a dialog stays
+            // hidden until the user focuses its owning pane.
+            if self.native_pane_is_keyboard_focused(&pane_id) {
+                self.note_native_pane_surface_focus(surface, true);
+                if let Some(keyboard) = self.seat.get_keyboard() {
+                    keyboard.set_focus(self, Some(surface.clone()), 0.into());
+                }
             }
         } else if self
             .native_pane_focused_surfaces
@@ -10012,7 +10026,7 @@ impl RuntimeWaylandState {
         }
 
         for accessory in &self.native_pane_accessories {
-            if !accessory.mapped || !self.native_pane_is_keyboard_focused(&accessory.pane_id) {
+            if !self.native_pane_surface_is_visible(&accessory.pane_id, accessory.mapped) {
                 continue;
             }
             if !self
@@ -11327,6 +11341,7 @@ mod tests {
         parse_shell_overlay_toggle_shortcut, pid_matches_or_descends_from,
         render_output_size_before_transform, scene_texture_transform, screen_capture_src_flipped,
         render_elements_to_texture,
+        same_surface,
         composite_scene_texture_to_physical_scanout,
         select_atomic_plane_zpos_values, select_preferred_scanout_format, select_primary_path,
         remap_damage_to_materialized_destination, source_rect_from_bbox_and_geometry,
@@ -13736,6 +13751,216 @@ mod tests {
                 pane_id: PaneId::new("pane-a")
             }
         );
+    }
+
+    #[test]
+    fn mapped_popup_in_unfocused_native_pane_waits_for_pane_focus_and_clicks_locally() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController));
+        state.mark_runtime_resize(1280, 720);
+        let pane_id = PaneId::new("surface:dialog-pane");
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
+                id: pane_id.clone(),
+                content_id: Some("dialog-pane-content".to_string()),
+                binding_id: Some("dialog-pane-binding".to_string()),
+                launch_token: None,
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 100.0,
+                    y: 20.0,
+                    width: 480.0,
+                    height: 320.0,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+                target: NativeTargetClass::Terminal,
+                process: ProcessSpec {
+                    command: "dialog-pane-fixture".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: Default::default(),
+                },
+            }])
+            .expect("native pane plan should apply");
+        state
+            .launch_native_pane_hosts(vec![pane_id.clone()])
+            .expect("fake pane process should launch");
+        state.set_runtime_focus_target(Some(RuntimeFocusTarget::MainApp));
+        let shared_state = Arc::new(Mutex::new(state));
+
+        let mut display: Display<RuntimeWaylandState> = Display::new().unwrap();
+        let mut display_handle = display.handle();
+        let mut wayland =
+            RuntimeWaylandState::new(display_handle.clone(), Arc::clone(&shared_state)).unwrap();
+        let (server_socket, client_socket) = UnixStream::pair().unwrap();
+        let server_client = display_handle
+            .insert_client(
+                server_socket,
+                Arc::new(super::RuntimeClientState::default()),
+            )
+            .unwrap();
+        let (surface_ids, release_client) = spawn_real_shm_surface_tree(client_socket);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        while !wayland.native_pane_toplevels.contains_key(&pane_id) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture must offer its native pane surface"
+            );
+            display.dispatch_clients(&mut wayland).unwrap();
+            if !wayland.native_pane_toplevels.contains_key(&pane_id)
+                && !wayland.pending_toplevels.is_empty()
+            {
+                let native = wayland.pending_toplevels.remove(0);
+                wayland.assign_native_pane_role(native, pane_id.clone(), 1);
+            }
+            display.flush_clients().unwrap();
+            std::thread::yield_now();
+        }
+        lock_state(&shared_state).set_runtime_focus_target(Some(RuntimeFocusTarget::MainApp));
+
+        let (_root_id, _child_id, popup_id) = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture must create and map its native-pane popup"
+            );
+            display.dispatch_clients(&mut wayland).unwrap();
+            display.flush_clients().unwrap();
+            if let Ok(ids) = surface_ids.try_recv() {
+                break ids;
+            }
+            std::thread::yield_now();
+        };
+        let popup: smithay::reexports::wayland_server::protocol::wl_surface::WlSurface =
+            server_client
+                .object_from_protocol_id(&display_handle, popup_id)
+                .expect("server must recover the real popup surface");
+        while !wayland.popups.iter().any(|candidate| {
+            candidate.mapped && same_surface(candidate.surface.wl_surface(), &popup)
+        }) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native popup commit must reach the production map handler"
+            );
+            display.dispatch_clients(&mut wayland).unwrap();
+            display.flush_clients().unwrap();
+            std::thread::yield_now();
+        }
+
+        let popup_window_id = popup_id.to_string();
+        let hidden_status = lock_state(&shared_state).status_snapshot();
+        assert_eq!(
+            hidden_status.runtime.active_focus_target,
+            Some(RuntimeFocusTarget::MainApp),
+            "mapping in an unfocused native pane must preserve the current Surf Ace focus"
+        );
+        let hidden_group = hidden_status
+            .native_pane_window_groups
+            .iter()
+            .find(|group| group.pane_id == pane_id)
+            .expect("native pane group should remain in status");
+        assert_eq!(hidden_group.pane_focused, Some(false));
+        assert_eq!(hidden_group.focused_window_id, None);
+        assert!(
+            !wayland.native_pane_surface_is_visible(&pane_id, true),
+            "a mapped member in a blurred pane must not enter rendering or input paths"
+        );
+        let popup_member = hidden_group
+            .members
+            .iter()
+            .find(|member| member.id == popup_window_id)
+            .expect("mapped popup should remain a remembered group member");
+        assert_eq!(popup_member.role, "popup");
+        assert_eq!(popup_member.lifecycle, "live");
+        assert!(!popup_member.focused);
+
+        let popup = wayland
+            .popups
+            .iter()
+            .find(|candidate| same_surface(candidate.surface.wl_surface(), &popup))
+            .expect("mapped popup should still be registered")
+            .surface
+            .clone();
+        let local_popup = wayland.popup_geometry_local(&popup);
+        let pane_origin = wayland
+            .native_pane_rect(&pane_id)
+            .expect("unfocused pane should retain its geometry")
+            .loc;
+        let popup_center = (
+            pane_origin.x as f64
+                + local_popup.loc.x as f64
+                + local_popup.size.w.max(1) as f64 / 2.0,
+            pane_origin.y as f64
+                + local_popup.loc.y as f64
+                + local_popup.size.h.max(1) as f64 / 2.0,
+        )
+            .into();
+        let (_, hidden_input_status) = wayland.input_operation_snapshot();
+        assert!(
+            !wayland
+                .surface_under_point_for_capture(
+                    popup_center,
+                    OverlayCaptureCapability::PointerButton,
+                    &hidden_input_status,
+                )
+                .is_some_and(|(surface, _)| same_surface(&surface, popup.wl_surface())),
+            "unfocused pane popup must not receive pointer input"
+        );
+
+        lock_state(&shared_state).set_runtime_focus_target(Some(RuntimeFocusTarget::NativePane {
+            pane_id: pane_id.clone(),
+        }));
+        wayland.apply_focus_route();
+        let (_, visible_input_status) = wayland.input_operation_snapshot();
+        assert!(
+            wayland
+                .surface_under_point_for_capture(
+                    popup_center,
+                    OverlayCaptureCapability::PointerButton,
+                    &visible_input_status,
+                )
+                .is_some_and(|(surface, _)| same_surface(&surface, popup.wl_surface())),
+            "mapped popup should become hit-testable only after its pane is focused"
+        );
+        wayland.forward_pointer_motion(popup_center, 10);
+        wayland.forward_pointer_button(0x110, ButtonState::Pressed, 11);
+        let keyboard_focus = wayland
+            .seat
+            .get_keyboard()
+            .expect("compositor seat should expose its keyboard")
+            .current_focus();
+        assert!(
+            keyboard_focus
+                .as_ref()
+                .is_some_and(|focused| same_surface(focused, popup.wl_surface())),
+            "typing after the physical click must reach the clicked popup"
+        );
+
+        let focused_status = lock_state(&shared_state).status_snapshot();
+        assert_eq!(
+            focused_status.runtime.active_focus_target,
+            Some(RuntimeFocusTarget::NativePane {
+                pane_id: pane_id.clone(),
+            })
+        );
+        let focused_group = focused_status
+            .native_pane_window_groups
+            .iter()
+            .find(|group| group.pane_id == pane_id)
+            .expect("focused pane group should remain in status");
+        assert_eq!(focused_group.pane_focused, Some(true));
+        assert_eq!(
+            focused_group.focused_window_id.as_deref(),
+            Some(popup_window_id.as_str())
+        );
+        assert!(
+            focused_group
+                .members
+                .iter()
+                .any(|member| member.id == popup_window_id && member.focused),
+            "physical accessory click should focus the popup within its own pane group"
+        );
+        release_client.send(()).unwrap();
     }
 
     #[test]
