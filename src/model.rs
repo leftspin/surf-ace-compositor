@@ -378,6 +378,12 @@ pub struct NativePaneHostRequest {
     pub id: PaneId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_id: Option<String>,
+    #[serde(
+        rename = "windowGroup",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub window_group: Option<NativePaneWindowGroupRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding_id: Option<String>,
     #[serde(
@@ -391,6 +397,53 @@ pub struct NativePaneHostRequest {
     pub geometry: PaneGeometry,
     pub target: NativeTargetClass,
     pub process: ProcessSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativePaneLaunchIdentity {
+    pub launch_token: String,
+    pub pane_id: PaneId,
+    pub pane_instance_id: String,
+    pub surface_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativePaneAccessoryVisibility {
+    FocusedPaneOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativePanePrimaryVisibility {
+    Always,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativePaneSameLaunchSecondaryToplevels {
+    Accept,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativePaneWindowGroupPolicy {
+    pub accessory_visibility: NativePaneAccessoryVisibility,
+    pub clip_to_pane: bool,
+    pub constrain_to_pane: bool,
+    pub deny_foreign_toplevels: bool,
+    pub primary_visibility: NativePanePrimaryVisibility,
+    pub same_launch_secondary_toplevels: NativePaneSameLaunchSecondaryToplevels,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativePaneWindowGroupRequest {
+    pub launch_identity: NativePaneLaunchIdentity,
+    pub policy: NativePaneWindowGroupPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -435,6 +488,12 @@ pub struct NativePaneWindowGroupStatus {
     pub primary_window_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focused_window_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_pane_id: Option<PaneId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_focused: Option<bool>,
+    #[serde(default)]
+    pub surface_focus_revision: u64,
     pub accepted_secondary_count: u32,
     pub denied_toplevel_count: u32,
     pub denied_reasons: Vec<String>,
@@ -497,6 +556,32 @@ pub enum RuntimeFocusTarget {
     MainApp,
     OverlayNative,
     NativePane { pane_id: PaneId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct NativePanePresentationGeneration {
+    pub surface_id: String,
+    pub surface_epoch: String,
+    pub topology_epoch: u64,
+    pub geometry_revision: u64,
+    pub focus_revision: u64,
+    #[serde(default)]
+    pub pane_instances: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct NativePaneFocusGeneration {
+    pub surface_id: String,
+    pub surface_epoch: String,
+    pub topology_epoch: u64,
+    pub geometry_revision: u64,
+    pub focus_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_pane_id: Option<PaneId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_pane_instance_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -710,6 +795,8 @@ pub struct RuntimeStatus {
     pub overlay_bound_pane_id: Option<PaneId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_focus_target: Option<RuntimeFocusTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_focus_generation: Option<NativePaneFocusGeneration>,
     #[serde(default)]
     pub overlay_region_debug_borders: bool,
     pub denied_toplevel_count: u64,
@@ -779,6 +866,7 @@ impl Default for RuntimeStatus {
             overlay_surface_id: None,
             overlay_bound_pane_id: None,
             active_focus_target: None,
+            active_focus_generation: None,
             overlay_region_debug_borders: false,
             denied_toplevel_count: 0,
             last_error: None,
@@ -935,6 +1023,65 @@ mod tests {
         assert_eq!(request.target, NativeTargetClass::NativeApp);
         assert_eq!(request.process.command, "/usr/bin/kolourpaint");
         assert_eq!(request.launch_token.as_deref(), Some("provider-token"));
+    }
+
+    #[test]
+    fn native_pane_host_request_parses_the_existing_launch_group_policy_shape() {
+        let request = serde_json::from_str::<NativePaneHostRequest>(
+            r#"{
+                "id":"surf-ace-pane:v1:7:surface-a:3:7",
+                "content_id":"target-7",
+                "binding_id":"7:target-7",
+                "launchToken":"launch-token-7",
+                "revision":1,
+                "geometry":{
+                    "x":0,
+                    "y":0,
+                    "width":640,
+                    "height":480,
+                    "coordinateSpace":"compositor_logical"
+                },
+                "windowGroup":{
+                    "launchIdentity":{
+                        "launchToken":"launch-token-7",
+                        "paneId":"surf-ace-pane:v1:7:surface-a:3:7",
+                        "paneInstanceId":"pane-instance-7",
+                        "surfaceId":"surface-a",
+                        "targetId":"target-7"
+                    },
+                    "policy":{
+                        "accessoryVisibility":"focused_pane_only",
+                        "clipToPane":false,
+                        "constrainToPane":false,
+                        "denyForeignToplevels":true,
+                        "primaryVisibility":"always",
+                        "sameLaunchSecondaryToplevels":"accept"
+                    }
+                },
+                "target":"terminal",
+                "process":{"command":"foot","args":[]}
+            }"#,
+        )
+        .expect("the existing Surf Ace windowGroup request must deserialize");
+        let group = request
+            .window_group
+            .expect("the launch-group policy must survive deserialization");
+        assert_eq!(group.launch_identity.pane_id, request.id);
+        assert_eq!(group.launch_identity.surface_id, "surface-a");
+        assert_eq!(group.launch_identity.pane_instance_id, "pane-instance-7");
+        assert_eq!(group.launch_identity.launch_token, "launch-token-7");
+        assert!(!group.policy.clip_to_pane);
+        assert!(!group.policy.constrain_to_pane);
+        assert!(group.policy.deny_foreign_toplevels);
+        let serialized = serde_json::to_value(group).expect("group policy should serialize");
+        assert_eq!(
+            serialized["policy"]["accessoryVisibility"],
+            "focused_pane_only"
+        );
+        assert_eq!(
+            serialized["policy"]["sameLaunchSecondaryToplevels"],
+            "accept"
+        );
     }
 
     #[test]

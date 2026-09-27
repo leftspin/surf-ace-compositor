@@ -1,8 +1,9 @@
 use crate::model::{
     EnvironmentAppearance, EnvironmentAppearanceSource, ExternalNativeEventContract,
     ExternalNativeLifecycleState, HostRuntimeStartTrigger, MainAppLaunchIntent, MainAppLaunchState,
-    MainAppSurfaceBinding, NativePaneHostRequest, NativePaneHostStatus,
-    NativePaneWindowGroupMemberStatus, NativePaneWindowGroupStatus, NativeTargetClass,
+    MainAppSurfaceBinding, NativePaneFocusGeneration, NativePaneHostRequest, NativePaneHostStatus,
+    NativePanePresentationGeneration, NativePaneWindowGroupMemberStatus,
+    NativePaneWindowGroupRequest, NativePaneWindowGroupStatus, NativeTargetClass,
     NodeSunScheduleProfile, OutputRotation, OverlayCoordinateSpace, OverlayRect,
     OverlayRegionRequest, OverlayRegionStatus, OverlayRegionUpdateReason, OverlayRegionsStatus,
     PaneGeometry, PaneGeometryCoordinateSpace, PaneId, PaneRenderMode, PaneStatus, ProcessSpec,
@@ -160,6 +161,8 @@ pub struct CompositorState {
     topology_epoch_counter: u64,
     topology_epoch: String,
     overlay_role_policy: OverlayRolePolicy,
+    native_pane_presentation_generations: BTreeMap<String, NativePanePresentationGeneration>,
+    native_pane_window_group_requests: BTreeMap<PaneId, NativePaneWindowGroupRequest>,
     runtime: RuntimeStatus,
     configured_sun_schedule_profile: Option<NodeSunScheduleProfile>,
     manual_appearance_override: Option<EnvironmentAppearance>,
@@ -641,6 +644,8 @@ impl CompositorState {
         self.runtime.overlay_surface_id = None;
         self.runtime.overlay_bound_pane_id = None;
         self.runtime.active_focus_target = None;
+        self.runtime.active_focus_generation = None;
+        self.native_pane_presentation_generations.clear();
     }
 
     fn clear_host_runtime_route_status(&mut self) {
@@ -701,6 +706,8 @@ impl CompositorState {
             topology_epoch_counter: 0,
             topology_epoch: "topology-0".to_string(),
             overlay_role_policy: OverlayRolePolicy::default(),
+            native_pane_presentation_generations: BTreeMap::new(),
+            native_pane_window_group_requests: BTreeMap::new(),
             runtime: RuntimeStatus::default(),
             configured_sun_schedule_profile: None,
             manual_appearance_override: None,
@@ -1408,6 +1415,252 @@ impl CompositorState {
         self.runtime.active_focus_target = target;
     }
 
+    pub fn clear_runtime_focus_generation(&mut self) {
+        self.runtime.active_focus_generation = None;
+    }
+
+    pub fn validate_native_pane_host_group_requests(
+        &self,
+        requests: &[NativePaneHostRequest],
+        generation: Option<&NativePanePresentationGeneration>,
+    ) -> Result<(), String> {
+        for request in requests {
+            let Some(group) = request.window_group.as_ref() else {
+                continue;
+            };
+            let identity = &group.launch_identity;
+            let policy = &group.policy;
+            if identity.pane_id != request.id
+                || identity.launch_token.is_empty()
+                || request.launch_token.as_deref() != Some(identity.launch_token.as_str())
+                || identity.pane_instance_id.is_empty()
+                || identity.surface_id.is_empty()
+                || identity.target_id.as_deref() != request.content_id.as_deref()
+                || policy.accessory_visibility
+                    != crate::model::NativePaneAccessoryVisibility::FocusedPaneOnly
+                || policy.clip_to_pane
+                || policy.constrain_to_pane
+                || !policy.deny_foreign_toplevels
+                || policy.primary_visibility != crate::model::NativePanePrimaryVisibility::Always
+                || policy.same_launch_secondary_toplevels
+                    != crate::model::NativePaneSameLaunchSecondaryToplevels::Accept
+            {
+                return Err(format!(
+                    "native pane {} window group launch identity or policy is invalid",
+                    request.id.0
+                ));
+            }
+            let Some(generation) = generation else {
+                return Err(format!(
+                    "native pane {} window group requires a presentation generation",
+                    request.id.0
+                ));
+            };
+            if identity.surface_id != generation.surface_id
+                || generation.pane_instances.get(&request.id.0) != Some(&identity.pane_instance_id)
+            {
+                return Err(format!(
+                    "native pane {} window group does not match the current pane instance",
+                    request.id.0
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn native_pane_window_group_request(
+        &self,
+        pane_id: &PaneId,
+    ) -> Option<&NativePaneWindowGroupRequest> {
+        self.native_pane_window_group_requests.get(pane_id)
+    }
+
+    pub fn validate_native_pane_presentation_generation(
+        &self,
+        generation: &NativePanePresentationGeneration,
+    ) -> Result<(), String> {
+        if generation.surface_id.is_empty() || generation.surface_epoch.is_empty() {
+            return Err(
+                "native pane presentation generation is missing its surface identity".to_string(),
+            );
+        }
+        if let Some(current) = self
+            .native_pane_presentation_generations
+            .get(&generation.surface_id)
+        {
+            if current.surface_epoch == generation.surface_epoch
+                && (generation.topology_epoch < current.topology_epoch
+                    || (generation.topology_epoch == current.topology_epoch
+                        && generation.geometry_revision < current.geometry_revision)
+                    || (generation.topology_epoch == current.topology_epoch
+                        && generation.geometry_revision == current.geometry_revision
+                        && generation.focus_revision < current.focus_revision))
+            {
+                return Err("stale native pane presentation generation".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn record_native_pane_presentation_generation(
+        &mut self,
+        generation: NativePanePresentationGeneration,
+    ) -> Result<(), String> {
+        self.validate_native_pane_presentation_generation(&generation)?;
+        let mut merged = generation.clone();
+        if let Some(current) = self
+            .native_pane_presentation_generations
+            .get(&generation.surface_id)
+        {
+            for (pane_id, pane_instance_id) in &current.pane_instances {
+                merged
+                    .pane_instances
+                    .entry(pane_id.clone())
+                    .or_insert_with(|| pane_instance_id.clone());
+            }
+        }
+        self.native_pane_presentation_generations
+            .insert(generation.surface_id.clone(), merged);
+        Ok(())
+    }
+
+    pub fn set_runtime_focus_target_guarded(
+        &mut self,
+        target: Option<RuntimeFocusTarget>,
+        generation: NativePaneFocusGeneration,
+    ) -> Result<(), String> {
+        let Some(presentation) = self
+            .native_pane_presentation_generations
+            .get_mut(&generation.surface_id)
+        else {
+            return Err("native pane focus generation has no current presentation".to_string());
+        };
+        if presentation.surface_epoch != generation.surface_epoch
+            || presentation.topology_epoch != generation.topology_epoch
+            || presentation.geometry_revision != generation.geometry_revision
+            || generation.focus_revision < presentation.focus_revision
+        {
+            return Err("stale native pane focus generation".to_string());
+        }
+        if let Some(RuntimeFocusTarget::NativePane { pane_id }) = target.as_ref() {
+            if generation.focused_pane_id.as_ref() != Some(pane_id)
+                || generation.focused_pane_instance_id.as_deref()
+                    != presentation
+                        .pane_instances
+                        .get(&pane_id.0)
+                        .map(String::as_str)
+                || !self.panes.contains_key(pane_id)
+            {
+                return Err(
+                    "native pane focus identity does not match the current pane instance"
+                        .to_string(),
+                );
+            }
+        } else if target.is_none()
+            && (generation.focused_pane_id.is_some()
+                || generation.focused_pane_instance_id.is_some())
+        {
+            return Err(
+                "clear native pane focus generation must not name a focused pane".to_string(),
+            );
+        }
+        presentation.focus_revision = generation.focus_revision;
+        self.runtime.active_focus_target = target;
+        self.runtime.active_focus_generation = Some(generation);
+        Ok(())
+    }
+
+    pub fn runtime_focus_native_pane_from_compositor(
+        &mut self,
+        pane_id: &PaneId,
+        advance_focus_revision: bool,
+    ) -> bool {
+        let presentation_id = self.native_pane_presentation_generations.iter().find_map(
+            |(surface_id, presentation)| {
+                presentation
+                    .pane_instances
+                    .contains_key(&pane_id.0)
+                    .then(|| surface_id.clone())
+            },
+        );
+        self.runtime.active_focus_target = Some(RuntimeFocusTarget::NativePane {
+            pane_id: pane_id.clone(),
+        });
+        let Some(surface_id) = presentation_id else {
+            self.runtime.active_focus_generation = None;
+            return false;
+        };
+        let mut generation = {
+            let presentation = &self.native_pane_presentation_generations[&surface_id];
+            NativePaneFocusGeneration {
+                surface_id: presentation.surface_id.clone(),
+                surface_epoch: presentation.surface_epoch.clone(),
+                topology_epoch: presentation.topology_epoch,
+                geometry_revision: presentation.geometry_revision,
+                focus_revision: presentation.focus_revision,
+                focused_pane_id: Some(pane_id.clone()),
+                focused_pane_instance_id: presentation.pane_instances.get(&pane_id.0).cloned(),
+            }
+        };
+        if advance_focus_revision {
+            let presentation = self
+                .native_pane_presentation_generations
+                .get_mut(&surface_id)
+                .expect("presentation was found above");
+            presentation.focus_revision = presentation.focus_revision.saturating_add(1);
+            generation.focus_revision = presentation.focus_revision;
+        }
+        self.runtime.active_focus_generation = Some(generation);
+        true
+    }
+
+    pub fn runtime_set_native_pane_window_group_focus(
+        &mut self,
+        pane_id: &PaneId,
+        focused_window_id: Option<String>,
+        members: Vec<NativePaneWindowGroupMemberStatus>,
+    ) -> bool {
+        let Some(pane) = self.panes.get_mut(pane_id) else {
+            return false;
+        };
+        let Some(group) = pane.native_pane_window_group.as_mut() else {
+            return false;
+        };
+        let accepted_secondary_count = members
+            .iter()
+            .filter(|member| member.role != "primary")
+            .count()
+            .min(u32::MAX as usize) as u32;
+        if group.focused_window_id != focused_window_id
+            || group.members != members
+            || group.accepted_secondary_count != accepted_secondary_count
+        {
+            group.surface_focus_revision = group.surface_focus_revision.saturating_add(1);
+            group.focused_window_id = focused_window_id;
+            group.accepted_secondary_count = accepted_secondary_count;
+            group.members = members;
+        }
+        true
+    }
+
+    pub fn runtime_mark_native_pane_window_group_denied(&mut self, pane_id: &PaneId, reason: &str) {
+        let Some(group) = self
+            .panes
+            .get_mut(pane_id)
+            .and_then(|pane| pane.native_pane_window_group.as_mut())
+        else {
+            return;
+        };
+        group.denied_toplevel_count = group.denied_toplevel_count.saturating_add(1);
+        if !group
+            .denied_reasons
+            .iter()
+            .any(|existing| existing == reason)
+        {
+            group.denied_reasons.push(reason.to_string());
+        }
+    }
+
     pub fn record_runtime_diagnostic(&mut self, diagnostic: impl Into<String>) {
         self.runtime.last_diagnostic = Some(diagnostic.into());
     }
@@ -1856,6 +2109,8 @@ impl CompositorState {
 
         self.bump_topology_epoch();
         for request in requests {
+            let pane_id = request.id.clone();
+            let window_group = request.window_group.clone();
             let next_mode = PaneRenderMode::ExternalNative {
                 target: request.target.clone(),
                 process: request.process.clone(),
@@ -1891,7 +2146,7 @@ impl CompositorState {
             }
             let pane = self
                 .panes
-                .entry(request.id)
+                .entry(pane_id.clone())
                 .or_insert_with(|| PaneRuntimeState {
                     provider_owned: false,
                     geometry: request.geometry,
@@ -1921,6 +2176,12 @@ impl CompositorState {
             pane.native_host_binding_id = request.binding_id;
             pane.native_host_launch_token = request.launch_token;
             pane.native_host_revision = request.revision;
+            if let Some(window_group) = window_group {
+                self.native_pane_window_group_requests
+                    .insert(pane_id, window_group);
+            } else if host_identity_changed {
+                self.native_pane_window_group_requests.remove(&pane_id);
+            }
         }
 
         self.prune_stale_overlay_regions();
@@ -2137,6 +2398,21 @@ impl CompositorState {
         primary_window_id: String,
         surface_id: Option<u32>,
     ) -> bool {
+        let pane_instance_id = self
+            .native_pane_presentation_generations
+            .values()
+            .find_map(|generation| generation.pane_instances.get(&pane_id.0).cloned());
+        let clipping_status = self
+            .native_pane_window_group_requests
+            .get(pane_id)
+            .map(|request| {
+                if request.policy.clip_to_pane {
+                    "clipped"
+                } else {
+                    "unclipped"
+                }
+            })
+            .unwrap_or("clipped");
         let Some(pane) = self.panes.get_mut(pane_id) else {
             return false;
         };
@@ -2151,21 +2427,26 @@ impl CompositorState {
         if surface_id.is_some() && pane.external_native_surface_id != surface_id {
             return false;
         }
-        let focused = matches!(
-            &self.runtime.active_focus_target,
-            Some(RuntimeFocusTarget::NativePane { pane_id: focused_pane }) if focused_pane == pane_id
-        );
+        let focused_pane_id = match &self.runtime.active_focus_target {
+            Some(RuntimeFocusTarget::NativePane { pane_id }) => Some(pane_id.clone()),
+            _ => None,
+        };
+        let focused = focused_pane_id.as_ref() == Some(pane_id);
+        let pane_instance_id = pane_instance_id.or_else(|| pane.native_host_binding_id.clone());
         pane.native_pane_window_group = Some(NativePaneWindowGroupStatus {
             pane_id: pane_id.clone(),
-            pane_instance_id: pane.native_host_binding_id.clone(),
+            pane_instance_id,
             launch_token: pane.external_native_launch_token.clone(),
             primary_window_id: Some(primary_window_id.clone()),
             focused_window_id: focused.then_some(primary_window_id.clone()),
+            focused_pane_id,
+            pane_focused: Some(focused),
+            surface_focus_revision: 0,
             accepted_secondary_count: 0,
             denied_toplevel_count: 0,
             denied_reasons: Vec::new(),
             pane_local_bounds: Some(pane.geometry),
-            clipping_status: "clipped".to_string(),
+            clipping_status: clipping_status.to_string(),
             members: vec![NativePaneWindowGroupMemberStatus {
                 id: primary_window_id,
                 role: "primary".to_string(),
@@ -2240,6 +2521,7 @@ impl CompositorState {
         pane.external_native_binding_evidence = None;
         pane.external_native_launch_token = None;
         pane.native_pane_window_group = None;
+        self.native_pane_window_group_requests.remove(pane_id);
         self.overlay_role_policy.release_if_matches(pane_id);
         self.prune_stale_overlay_regions();
         self.poll_processes();
@@ -2533,11 +2815,22 @@ impl CompositorState {
                     return None;
                 };
                 let mut group = pane.native_pane_window_group.clone()?;
-                let focused = matches!(
-                    &self.runtime.active_focus_target,
-                    Some(RuntimeFocusTarget::NativePane { pane_id: focused_pane }) if focused_pane == pane_id
-                );
-                group.focused_window_id = focused.then(|| group.primary_window_id.clone()).flatten();
+                let focused_pane_id = match &self.runtime.active_focus_target {
+                    Some(RuntimeFocusTarget::NativePane { pane_id }) => Some(pane_id.clone()),
+                    _ => None,
+                };
+                let focused = focused_pane_id.as_ref() == Some(pane_id);
+                group.focused_pane_id = focused_pane_id;
+                group.pane_focused = Some(focused);
+                if focused {
+                    if !group.members.iter().any(|member| {
+                        group.focused_window_id.as_deref() == Some(member.id.as_str())
+                    }) {
+                        group.focused_window_id = group.primary_window_id.clone();
+                    }
+                } else {
+                    group.focused_window_id = None;
+                }
                 for member in &mut group.members {
                     member.focused = group
                         .focused_window_id
@@ -3524,6 +3817,7 @@ mod tests {
         state
             .apply_native_pane_host_plan(vec![
                 NativePaneHostRequest {
+                    window_group: None,
                     id: PaneId::new("left"),
                     content_id: Some("content-left".to_string()),
                     binding_id: Some("binding-left".to_string()),
@@ -3540,6 +3834,7 @@ mod tests {
                     process: terminal_process(),
                 },
                 NativePaneHostRequest {
+                    window_group: None,
                     id: PaneId::new("right"),
                     content_id: Some("content-right".to_string()),
                     binding_id: Some("binding-right".to_string()),
@@ -3614,6 +3909,7 @@ mod tests {
 
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
                 id: PaneId::new("native-pane"),
                 content_id: Some("content-native".to_string()),
                 binding_id: Some("binding-native".to_string()),
@@ -3658,6 +3954,7 @@ mod tests {
         state
             .apply_native_pane_host_plan(vec![
                 NativePaneHostRequest {
+                    window_group: None,
                     id: PaneId::new("left"),
                     content_id: Some("content-left".to_string()),
                     binding_id: Some("binding-left".to_string()),
@@ -3674,6 +3971,7 @@ mod tests {
                     process: terminal_process(),
                 },
                 NativePaneHostRequest {
+                    window_group: None,
                     id: PaneId::new("right"),
                     content_id: Some("content-right".to_string()),
                     binding_id: Some("binding-right".to_string()),
@@ -3799,6 +4097,7 @@ mod tests {
         );
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
                 id: PaneId::new("paint"),
                 content_id: Some("content-paint".to_string()),
                 binding_id: Some("binding-paint".to_string()),
@@ -3880,6 +4179,7 @@ mod tests {
 
         let physical_geometry = state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
                 id: PaneId::new("full"),
                 content_id: None,
                 binding_id: None,
@@ -3907,6 +4207,7 @@ mod tests {
 
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
                 id: PaneId::new("full"),
                 content_id: None,
                 binding_id: None,
@@ -3947,6 +4248,7 @@ mod tests {
         );
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
                 id: PaneId::new("top"),
                 content_id: Some("target-top".to_string()),
                 binding_id: Some("top:target-top".to_string()),
@@ -4040,6 +4342,7 @@ mod tests {
         );
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
                 id: PaneId::new("left"),
                 content_id: Some("content-left".to_string()),
                 binding_id: Some("binding-left".to_string()),
@@ -4128,11 +4431,149 @@ mod tests {
     }
 
     #[test]
+    fn native_pane_focus_generation_rejects_stale_client_intent_and_preserves_member_focus() {
+        let mut state = CompositorState::new(true, Box::new(FakeProcessController::default()));
+        state.mark_runtime_running(
+            RuntimeBackend::HostDrm,
+            Some("wayland-77".to_string()),
+            1280,
+            720,
+        );
+        let pane_id = PaneId::new("surface:7");
+        let instance_id = "pane-instance-7".to_string();
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: pane_id.clone(),
+                content_id: Some("target-7".to_string()),
+                window_group: None,
+                binding_id: Some("binding-7".to_string()),
+                launch_token: Some("launch-7".to_string()),
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 640.0,
+                    height: 720.0,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+                target: NativeTargetClass::Terminal,
+                process: terminal_process(),
+            }])
+            .expect("native pane host plan should apply");
+        let generation = NativePanePresentationGeneration {
+            surface_id: "surface".to_string(),
+            surface_epoch: "surface:epoch-1".to_string(),
+            topology_epoch: 3,
+            geometry_revision: 5,
+            focus_revision: 8,
+            pane_instances: BTreeMap::from([(pane_id.0.clone(), instance_id.clone())]),
+        };
+        state
+            .record_native_pane_presentation_generation(generation.clone())
+            .expect("current presentation generation should record");
+        state
+            .launch_native_pane_hosts(vec![pane_id.clone()])
+            .expect("native pane should launch");
+        let ExternalNativeLifecycleState::Launching { pid } =
+            state.status_snapshot().panes[0].external_native_state
+        else {
+            panic!("native pane should be launching");
+        };
+        assert_eq!(
+            state.runtime_mark_native_pane_surface_attached_for_pid(pid, Some(101), None),
+            Some(pane_id.clone())
+        );
+        assert!(state.runtime_mark_native_pane_window_group_observed(
+            &pane_id,
+            "primary-7".to_string(),
+            Some(101),
+        ));
+
+        let valid_focus = NativePaneFocusGeneration {
+            surface_id: generation.surface_id.clone(),
+            surface_epoch: generation.surface_epoch.clone(),
+            topology_epoch: generation.topology_epoch,
+            geometry_revision: generation.geometry_revision,
+            focus_revision: generation.focus_revision,
+            focused_pane_id: Some(pane_id.clone()),
+            focused_pane_instance_id: Some(instance_id.clone()),
+        };
+        state
+            .set_runtime_focus_target_guarded(
+                Some(RuntimeFocusTarget::NativePane {
+                    pane_id: pane_id.clone(),
+                }),
+                valid_focus.clone(),
+            )
+            .expect("current focus generation should apply");
+        let stale_focus = NativePaneFocusGeneration {
+            focus_revision: valid_focus.focus_revision - 1,
+            ..valid_focus.clone()
+        };
+        assert_eq!(
+            state
+                .set_runtime_focus_target_guarded(Some(RuntimeFocusTarget::MainApp), stale_focus,)
+                .expect_err("older client focus intent must be rejected"),
+            "stale native pane focus generation"
+        );
+        assert_eq!(
+            state.status_snapshot().runtime.active_focus_target,
+            Some(RuntimeFocusTarget::NativePane {
+                pane_id: pane_id.clone(),
+            })
+        );
+
+        let members = vec![
+            NativePaneWindowGroupMemberStatus {
+                id: "primary-7".to_string(),
+                role: "primary".to_string(),
+                bounds: None,
+                focused: false,
+                lifecycle: "live".to_string(),
+                clipped_to_pane: Some(true),
+            },
+            NativePaneWindowGroupMemberStatus {
+                id: "dialog-7".to_string(),
+                role: "secondary".to_string(),
+                bounds: None,
+                focused: true,
+                lifecycle: "live".to_string(),
+                clipped_to_pane: Some(false),
+            },
+        ];
+        assert!(state.runtime_set_native_pane_window_group_focus(
+            &pane_id,
+            Some("dialog-7".to_string()),
+            members,
+        ));
+        let focused_group = state.status_snapshot().native_pane_window_groups.remove(0);
+        assert_eq!(focused_group.focused_window_id.as_deref(), Some("dialog-7"));
+        assert_eq!(focused_group.accepted_secondary_count, 1);
+        assert!(!focused_group.members[0].focused);
+        assert!(focused_group.members[1].focused);
+
+        state.set_runtime_focus_target(Some(RuntimeFocusTarget::MainApp));
+        let blurred_group = state.status_snapshot().native_pane_window_groups.remove(0);
+        assert_eq!(blurred_group.focused_window_id, None);
+        assert!(blurred_group.members.iter().all(|member| !member.focused));
+        state.set_runtime_focus_target(Some(RuntimeFocusTarget::NativePane {
+            pane_id: pane_id.clone(),
+        }));
+        let restored_group = state.status_snapshot().native_pane_window_groups.remove(0);
+        assert_eq!(
+            restored_group.focused_window_id.as_deref(),
+            Some("dialog-7")
+        );
+        assert!(restored_group.members[1].focused);
+    }
+
+    #[test]
     fn native_pane_surface_tracks_descendant_client_pid() {
         let process = FakeProcessController::default();
         let mut state = CompositorState::new(true, Box::new(process));
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
                 id: PaneId::new("surface:2"),
                 content_id: Some("ct_top".to_string()),
                 binding_id: Some("surface:2:ct_top".to_string()),
@@ -4184,6 +4625,7 @@ mod tests {
         let mut state = CompositorState::new(true, Box::new(process));
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
                 id: PaneId::new("surface:2"),
                 content_id: Some("ct_top".to_string()),
                 binding_id: Some("surface:2:ct_top:7".to_string()),
@@ -4254,6 +4696,7 @@ mod tests {
         let mut state = CompositorState::new(true, Box::new(process));
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
                 id: PaneId::new("surface:2"),
                 content_id: Some("ct_top".to_string()),
                 binding_id: Some("surface:2:ct_top".to_string()),
@@ -4358,6 +4801,7 @@ mod tests {
         let mut state = CompositorState::new(true, Box::new(process));
         let pane_id = PaneId::new("pane-stop-failure");
         let request = |content_id: &str, binding_id: &str| NativePaneHostRequest {
+            window_group: None,
             id: pane_id.clone(),
             content_id: Some(content_id.to_string()),
             binding_id: Some(binding_id.to_string()),
@@ -4447,6 +4891,7 @@ mod tests {
         );
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
                 id: PaneId::new("p-1"),
                 content_id: Some("content-1".to_string()),
                 binding_id: Some("p-1:content-1".to_string()),
@@ -4596,6 +5041,7 @@ mod tests {
         state.set_output_rotation(OutputRotation::Deg90);
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
                 id: PaneId::new("full"),
                 content_id: None,
                 binding_id: None,
@@ -4927,6 +5373,7 @@ mod tests {
         state
             .apply_native_pane_host_plan(vec![
                 NativePaneHostRequest {
+                    window_group: None,
                     id: PaneId::new("left"),
                     content_id: None,
                     binding_id: None,
@@ -4943,6 +5390,7 @@ mod tests {
                     process: terminal_process(),
                 },
                 NativePaneHostRequest {
+                    window_group: None,
                     id: PaneId::new("right"),
                     content_id: None,
                     binding_id: None,
@@ -5048,6 +5496,7 @@ mod tests {
         state
             .apply_native_pane_host_plan(vec![
                 NativePaneHostRequest {
+                    window_group: None,
                     id: PaneId::new("1"),
                     content_id: Some("target_top_full_41".to_string()),
                     binding_id: Some("1:target_top_full_41".to_string()),
@@ -5064,6 +5513,7 @@ mod tests {
                     process: terminal_process(),
                 },
                 NativePaneHostRequest {
+                    window_group: None,
                     id: PaneId::new("top-proof"),
                     content_id: Some("target-top-proof".to_string()),
                     binding_id: Some("top-proof:target".to_string()),
@@ -5174,6 +5624,7 @@ mod tests {
             .expect("provider snapshot should apply");
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
                 id: PaneId::new("1"),
                 content_id: Some("target_top_full_41".to_string()),
                 binding_id: Some("1:target_top_full_41".to_string()),
@@ -5221,6 +5672,7 @@ mod tests {
 
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
                 id: PaneId::new("top-proof"),
                 content_id: Some("target-top-proof".to_string()),
                 binding_id: Some("top-proof:target".to_string()),
@@ -5262,6 +5714,7 @@ mod tests {
             .expect("provider snapshot should apply");
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
                 id: PaneId::new("1"),
                 content_id: Some("target_top_full_41".to_string()),
                 binding_id: Some("1:target_top_full_41".to_string()),

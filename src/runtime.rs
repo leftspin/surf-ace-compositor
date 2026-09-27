@@ -6055,6 +6055,9 @@ struct RuntimeWaylandState {
     main_toplevel: Option<ToplevelSurface>,
     overlay_toplevel: Option<ToplevelSurface>,
     native_pane_toplevels: HashMap<PaneId, ToplevelSurface>,
+    native_pane_accessories: Vec<ManagedNativePaneToplevel>,
+    native_pane_focused_surfaces: HashMap<PaneId, String>,
+    native_pane_focus_history: HashMap<PaneId, Vec<String>>,
     pending_toplevels: Vec<ToplevelSurface>,
     popups: Vec<ManagedPopup>,
     pressed_pointer_buttons: HashSet<u32>,
@@ -6352,6 +6355,7 @@ enum RenderElementSource {
     Main,
     MainPopup,
     NativePane,
+    NativePaneAccessory,
     NativePanePopup,
     OverlayRegionDebug,
     Overlay,
@@ -6704,6 +6708,9 @@ impl RenderElementCapture {
             RenderElementSource::Main => self.counts.main += added,
             RenderElementSource::MainPopup => self.counts.main_popups += added,
             RenderElementSource::NativePane => self.counts.native_panes += added,
+            RenderElementSource::NativePaneAccessory => {
+                self.counts.native_pane_accessories += added
+            }
             RenderElementSource::NativePanePopup => self.counts.native_pane_popups += added,
             RenderElementSource::OverlayRegionDebug => self.counts.overlay_region_debug += added,
             RenderElementSource::Overlay => self.counts.overlay += added,
@@ -6732,6 +6739,7 @@ struct RenderElementCounts {
     main: usize,
     main_popups: usize,
     native_panes: usize,
+    native_pane_accessories: usize,
     native_pane_popups: usize,
     overlay_region_debug: usize,
     overlay: usize,
@@ -6741,6 +6749,13 @@ struct RenderElementCounts {
 struct ManagedPopup {
     surface: PopupSurface,
     owner_role: RuntimeSurfaceRole,
+    mapped: bool,
+}
+
+struct ManagedNativePaneToplevel {
+    surface: ToplevelSurface,
+    pane_id: PaneId,
+    mapped: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7338,6 +7353,9 @@ impl RuntimeWaylandState {
             main_toplevel: None,
             overlay_toplevel: None,
             native_pane_toplevels: HashMap::new(),
+            native_pane_accessories: Vec::new(),
+            native_pane_focused_surfaces: HashMap::new(),
+            native_pane_focus_history: HashMap::new(),
             pending_toplevels: Vec::new(),
             popups: Vec::new(),
             pressed_pointer_buttons: HashSet::new(),
@@ -7535,6 +7553,9 @@ impl RuntimeWaylandState {
                 },
             );
             let focus_target = surface_under.map(|(surface, _)| surface);
+            if let Some(surface) = focus_target.as_ref() {
+                self.note_native_pane_surface_focus(surface, true);
+            }
             if let Some(keyboard) = self.seat.get_keyboard() {
                 keyboard.set_focus(self, focus_target, serial);
             }
@@ -7737,14 +7758,9 @@ impl RuntimeWaylandState {
                         )
                     })
                 }
-                Some(RuntimeFocusTarget::NativePane { pane_id }) => {
-                    self.native_pane_toplevels.get(&pane_id).map(|surface| {
-                        (
-                            RuntimeFocusTarget::NativePane { pane_id },
-                            surface.wl_surface().clone(),
-                        )
-                    })
-                }
+                Some(RuntimeFocusTarget::NativePane { pane_id }) => self
+                    .native_pane_focus_surface(&pane_id)
+                    .map(|surface| (RuntimeFocusTarget::NativePane { pane_id }, surface)),
                 None => None,
             })
             .or_else(|| {
@@ -7769,6 +7785,9 @@ impl RuntimeWaylandState {
         if let Some(keyboard) = self.seat.get_keyboard() {
             keyboard.set_focus(self, focus_surface, 0.into());
         }
+        if let Some((RuntimeFocusTarget::NativePane { .. }, surface)) = resolved.as_ref() {
+            self.note_native_pane_surface_focus(surface, false);
+        }
 
         let resolved_target = resolved.map(|(target, _)| target);
         if requested_target != resolved_target || shell_overlay_focus_requested {
@@ -7782,6 +7801,257 @@ impl RuntimeWaylandState {
         }
     }
 
+    fn native_pane_focus_surface(&mut self, pane_id: &PaneId) -> Option<WlSurface> {
+        let focused_id = self.native_pane_focused_surfaces.get(pane_id).cloned();
+        if let Some(focused_id) = focused_id {
+            if let Some(surface) = self.native_pane_surface_for_window_id(pane_id, &focused_id) {
+                return Some(surface);
+            }
+            self.native_pane_focused_surfaces.remove(pane_id);
+        }
+        let previous = self
+            .native_pane_focus_history
+            .get(pane_id)
+            .cloned()
+            .unwrap_or_default();
+        for window_id in previous.into_iter().rev() {
+            if let Some(surface) = self.native_pane_surface_for_window_id(pane_id, &window_id) {
+                self.native_pane_focused_surfaces
+                    .insert(pane_id.clone(), window_id);
+                return Some(surface);
+            }
+        }
+        let primary = self
+            .native_pane_toplevels
+            .get(pane_id)
+            .map(|surface| surface.wl_surface().clone());
+        if let Some(surface) = primary.as_ref() {
+            let window_id = surface_id(surface).to_string();
+            self.native_pane_focused_surfaces
+                .insert(pane_id.clone(), window_id.clone());
+            let history = self
+                .native_pane_focus_history
+                .entry(pane_id.clone())
+                .or_default();
+            history.retain(|item| item != &window_id);
+            history.push(window_id);
+        }
+        primary
+    }
+
+    fn native_pane_surface_for_window_id(
+        &self,
+        pane_id: &PaneId,
+        window_id: &str,
+    ) -> Option<WlSurface> {
+        if let Some(primary) = self.native_pane_toplevels.get(pane_id) {
+            if surface_id(primary.wl_surface()).to_string() == window_id {
+                return Some(primary.wl_surface().clone());
+            }
+        }
+        if let Some(accessory) = self.native_pane_accessories.iter().find(|accessory| {
+            &accessory.pane_id == pane_id
+                && accessory.mapped
+                && surface_id(accessory.surface.wl_surface()).to_string() == window_id
+        }) {
+            return Some(accessory.surface.wl_surface().clone());
+        }
+        self.popups
+            .iter()
+            .find(|popup| {
+                popup.mapped
+                    && popup.owner_role == RuntimeSurfaceRole::NativePane(pane_id.clone())
+                    && surface_id(popup.surface.wl_surface()).to_string() == window_id
+            })
+            .map(|popup| popup.surface.wl_surface().clone())
+    }
+
+    fn native_pane_is_keyboard_focused(&self, pane_id: &PaneId) -> bool {
+        matches!(
+            lock_state(&self.shared_state).status_snapshot().runtime.active_focus_target,
+            Some(RuntimeFocusTarget::NativePane { pane_id: ref focused }) if focused == pane_id
+        )
+    }
+
+    fn native_pane_surface_is_visible(&self, pane_id: &PaneId, mapped: bool) -> bool {
+        mapped && self.native_pane_is_keyboard_focused(pane_id)
+    }
+
+    fn native_pane_accessory_rect(
+        &self,
+        pane_id: &PaneId,
+        surface: &ToplevelSurface,
+    ) -> Option<Rectangle<i32, Logical>> {
+        let pane = self.native_pane_rect(pane_id)?;
+        let output = self.runtime_output_size();
+        let requested_size = surface.current_state().size.unwrap_or_else(|| {
+            Size::new(
+                ((pane.size.w as f64 * 1.4).ceil() as i32)
+                    .min(output.w)
+                    .max(1),
+                ((pane.size.h as f64 * 1.2).ceil() as i32)
+                    .min(output.h)
+                    .max(1),
+            )
+        });
+        let size = Size::new(
+            requested_size.w.max(1).min(output.w.max(1)),
+            requested_size.h.max(1).min(output.h.max(1)),
+        );
+        let max_x = (output.w - size.w).max(0);
+        let max_y = (output.h - size.h).max(0);
+        let x = (pane.loc.x + (pane.size.w - size.w) / 2).clamp(0, max_x);
+        let y = (pane.loc.y + (pane.size.h - size.h) / 2).clamp(0, max_y);
+        Some(Rectangle::new((x, y).into(), size))
+    }
+
+    fn native_pane_window_id_for_surface(
+        &self,
+        pane_id: &PaneId,
+        candidate: &WlSurface,
+    ) -> Option<String> {
+        if let Some(primary) = self.native_pane_toplevels.get(pane_id) {
+            if surface_tree_contains(primary.wl_surface(), candidate) {
+                return Some(surface_id(primary.wl_surface()).to_string());
+            }
+        }
+        if let Some(accessory) = self.native_pane_accessories.iter().find(|accessory| {
+            &accessory.pane_id == pane_id
+                && surface_tree_contains(accessory.surface.wl_surface(), candidate)
+        }) {
+            return Some(surface_id(accessory.surface.wl_surface()).to_string());
+        }
+        self.popups
+            .iter()
+            .find(|popup| {
+                popup.owner_role == RuntimeSurfaceRole::NativePane(pane_id.clone())
+                    && surface_tree_contains(popup.surface.wl_surface(), candidate)
+            })
+            .map(|popup| surface_id(popup.surface.wl_surface()).to_string())
+    }
+
+    fn native_pane_group_members_with_popups(
+        &self,
+        pane_id: &PaneId,
+        focused_window_id: Option<&str>,
+    ) -> Vec<crate::model::NativePaneWindowGroupMemberStatus> {
+        let mut members = lock_state(&self.shared_state)
+            .status_snapshot()
+            .native_pane_window_groups
+            .into_iter()
+            .find(|group| &group.pane_id == pane_id)
+            .map(|group| group.members)
+            .unwrap_or_default();
+        for accessory in self
+            .native_pane_accessories
+            .iter()
+            .filter(|accessory| &accessory.pane_id == pane_id)
+        {
+            let id = surface_id(accessory.surface.wl_surface()).to_string();
+            let bounds = self
+                .native_pane_accessory_rect(pane_id, &accessory.surface)
+                .map(|rect| crate::model::PaneGeometry {
+                    x: rect.loc.x as f64,
+                    y: rect.loc.y as f64,
+                    width: rect.size.w as f64,
+                    height: rect.size.h as f64,
+                    coordinate_space: crate::model::PaneGeometryCoordinateSpace::CompositorLogical,
+                });
+            let status = crate::model::NativePaneWindowGroupMemberStatus {
+                id: id.clone(),
+                role: "secondary".to_string(),
+                bounds,
+                focused: false,
+                lifecycle: if accessory.mapped { "live" } else { "unmapped" }.to_string(),
+                clipped_to_pane: Some(false),
+            };
+            if let Some(member) = members.iter_mut().find(|member| member.id == id) {
+                *member = status;
+            } else {
+                members.push(status);
+            }
+        }
+        for popup in self
+            .popups
+            .iter()
+            .filter(|popup| popup.owner_role == RuntimeSurfaceRole::NativePane(pane_id.clone()))
+        {
+            let id = surface_id(popup.surface.wl_surface()).to_string();
+            let status = crate::model::NativePaneWindowGroupMemberStatus {
+                id: id.clone(),
+                role: "popup".to_string(),
+                bounds: None,
+                focused: false,
+                lifecycle: if popup.mapped { "live" } else { "unmapped" }.to_string(),
+                clipped_to_pane: Some(false),
+            };
+            if let Some(member) = members.iter_mut().find(|member| member.id == id) {
+                *member = status;
+            } else {
+                members.push(status);
+            }
+        }
+        for member in &mut members {
+            member.focused = focused_window_id == Some(member.id.as_str());
+        }
+        members
+    }
+
+    fn sync_native_pane_group_focus_status(&self, pane_id: &PaneId) {
+        let focused = self.native_pane_is_keyboard_focused(pane_id);
+        let focused_window_id = focused
+            .then(|| self.native_pane_focused_surfaces.get(pane_id).cloned())
+            .flatten();
+        let members =
+            self.native_pane_group_members_with_popups(pane_id, focused_window_id.as_deref());
+        lock_state(&self.shared_state).runtime_set_native_pane_window_group_focus(
+            pane_id,
+            focused_window_id,
+            members,
+        );
+    }
+
+    fn note_native_pane_surface_focus(
+        &mut self,
+        surface: &WlSurface,
+        advance_focus_revision: bool,
+    ) {
+        let owner = self
+            .native_pane_toplevels
+            .iter()
+            .find_map(|(pane_id, root)| {
+                self.native_pane_surface_tree_contains(pane_id, root.wl_surface(), surface)
+                    .then(|| pane_id.clone())
+            });
+        let Some(pane_id) = owner else {
+            return;
+        };
+        let Some(focused_window_id) = self.native_pane_window_id_for_surface(&pane_id, surface)
+        else {
+            return;
+        };
+        self.native_pane_focused_surfaces
+            .insert(pane_id.clone(), focused_window_id.clone());
+        let history = self
+            .native_pane_focus_history
+            .entry(pane_id.clone())
+            .or_default();
+        history.retain(|item| item != &focused_window_id);
+        history.push(focused_window_id.clone());
+        if history.len() > 64 {
+            history.remove(0);
+        }
+        let members =
+            self.native_pane_group_members_with_popups(&pane_id, Some(focused_window_id.as_str()));
+        let mut state = lock_state(&self.shared_state);
+        state.runtime_focus_native_pane_from_compositor(&pane_id, advance_focus_revision);
+        state.runtime_set_native_pane_window_group_focus(
+            &pane_id,
+            self.native_pane_focused_surfaces.get(&pane_id).cloned(),
+            members,
+        );
+    }
+
     fn native_pane_surface_tree_contains(
         &self,
         pane_id: &PaneId,
@@ -7789,6 +8059,10 @@ impl RuntimeWaylandState {
         candidate: &WlSurface,
     ) -> bool {
         surface_tree_contains(root, candidate)
+            || self.native_pane_accessories.iter().any(|accessory| {
+                &accessory.pane_id == pane_id
+                    && surface_tree_contains(accessory.surface.wl_surface(), candidate)
+            })
             || self.popups.iter().any(|popup| {
                 matches!(
                     &popup.owner_role,
@@ -8014,15 +8288,56 @@ impl RuntimeWaylandState {
             state.increment_runtime_denied_toplevel();
             return;
         };
-        if self
-            .native_pane_toplevels
-            .get(&pane_id)
-            .map(|existing| !same_surface(existing.wl_surface(), surface.wl_surface()))
-            .unwrap_or(false)
-        {
-            surface.send_close();
-            let mut state = lock_state(&self.shared_state);
-            state.increment_runtime_denied_toplevel();
+        if let Some(primary) = self.native_pane_toplevels.get(&pane_id) {
+            if same_surface(primary.wl_surface(), surface.wl_surface()) {
+                let evidence = self.native_pane_binding_evidence_for_surface(&surface, launch_pid);
+                self.bridge_native_pane_surface_attached(
+                    launch_pid,
+                    client_pid,
+                    Some(surface_id(surface.wl_surface())),
+                    evidence,
+                );
+                return;
+            }
+            let group_request = lock_state(&self.shared_state)
+                .native_pane_window_group_request(&pane_id)
+                .cloned();
+            let identity_matches = group_request.as_ref().is_some_and(|group| {
+                let identity = &group.launch_identity;
+                let process_matches = pid_matches_or_descends_from(client_pid, launch_pid)
+                    || process_launch_token_matches(client_pid, &identity.launch_token);
+                identity.pane_id == pane_id
+                    && identity.launch_token
+                        == lock_state(&self.shared_state)
+                            .runtime_expected_native_pane_bindings()
+                            .into_iter()
+                            .find(|binding| binding.pane_id == pane_id)
+                            .and_then(|binding| binding.launch_token)
+                            .unwrap_or_default()
+                    && process_matches
+                    && group.policy.same_launch_secondary_toplevels
+                        == crate::model::NativePaneSameLaunchSecondaryToplevels::Accept
+            });
+            if !identity_matches {
+                surface.send_close();
+                let mut state = lock_state(&self.shared_state);
+                state.increment_runtime_denied_toplevel();
+                state.runtime_mark_native_pane_window_group_denied(
+                    &pane_id,
+                    "secondary_toplevel_launch_identity_rejected",
+                );
+                return;
+            }
+            let pane_id_for_role = pane_id.clone();
+            self.configure_native_pane_accessory(&surface, &pane_id);
+            self.native_pane_accessories
+                .push(ManagedNativePaneToplevel {
+                    surface,
+                    pane_id,
+                    mapped: false,
+                });
+            self.sync_native_pane_group_focus_status(&pane_id_for_role);
+            self.sync_runtime_status_with_roles();
             return;
         }
 
@@ -8311,13 +8626,73 @@ impl RuntimeWaylandState {
         };
         let output_size = self.runtime_output_size();
         for popup in self.popups.iter().rev() {
+            let RuntimeSurfaceRole::NativePane(pane_id) = &popup.owner_role else {
+                continue;
+            };
+            if !self.native_pane_surface_is_visible(pane_id, popup.mapped) {
+                continue;
+            }
+            let local = self.popup_geometry_local(&popup.surface);
+            let base = popup
+                .surface
+                .get_parent_surface()
+                .and_then(|parent| {
+                    self.native_pane_accessories
+                        .iter()
+                        .find(|accessory| {
+                            &accessory.pane_id == pane_id
+                                && same_surface(accessory.surface.wl_surface(), &parent)
+                        })
+                        .and_then(|accessory| {
+                            self.native_pane_accessory_rect(pane_id, &accessory.surface)
+                        })
+                        .map(|rect| rect.loc)
+                })
+                .or_else(|| pane_rect(pane_id).map(|rect| rect.loc))
+                .unwrap_or_else(|| Point::from((0, 0)));
+            let popup_geometry = Rectangle::new(
+                (base.x + local.loc.x, base.y + local.loc.y).into(),
+                local.size,
+            );
+            let hit = pos.x >= popup_geometry.loc.x as f64
+                && pos.x < (popup_geometry.loc.x + popup_geometry.size.w) as f64
+                && pos.y >= popup_geometry.loc.y as f64
+                && pos.y < (popup_geometry.loc.y + popup_geometry.size.h) as f64;
+            if hit {
+                return Some((
+                    popup.surface.wl_surface().clone(),
+                    popup_geometry.loc.to_f64(),
+                ));
+            }
+        }
+
+        for accessory in self.native_pane_accessories.iter().rev() {
+            if !self.native_pane_surface_is_visible(&accessory.pane_id, accessory.mapped) {
+                continue;
+            }
+            let Some(rect) =
+                self.native_pane_accessory_rect(&accessory.pane_id, &accessory.surface)
+            else {
+                continue;
+            };
+            let hit = pos.x >= rect.loc.x as f64
+                && pos.x < (rect.loc.x + rect.size.w) as f64
+                && pos.y >= rect.loc.y as f64
+                && pos.y < (rect.loc.y + rect.size.h) as f64;
+            if hit {
+                return Some((accessory.surface.wl_surface().clone(), rect.loc.to_f64()));
+            }
+        }
+
+        for popup in self.popups.iter().rev() {
+            if !popup.mapped || matches!(popup.owner_role, RuntimeSurfaceRole::NativePane(_)) {
+                continue;
+            }
             let local = self.popup_geometry_local(&popup.surface);
             let base = match popup.owner_role {
                 RuntimeSurfaceRole::MainApp => Point::from((0, 0)),
                 RuntimeSurfaceRole::OverlayNative => self.overlay_rect().loc,
-                RuntimeSurfaceRole::NativePane(ref pane_id) => pane_rect(pane_id)
-                    .map(|rect| rect.loc)
-                    .unwrap_or_else(|| Point::from((0, 0))),
+                RuntimeSurfaceRole::NativePane(_) => continue,
             };
             let popup_geometry = Rectangle::new(
                 (base.x + local.loc.x, base.y + local.loc.y).into(),
@@ -8411,7 +8786,33 @@ impl RuntimeWaylandState {
                 return Some(RuntimeSurfaceRole::NativePane(pane_id.clone()));
             }
         }
-        None
+        self.native_pane_accessories
+            .iter()
+            .find(|accessory| same_surface(accessory.surface.wl_surface(), &parent))
+            .map(|accessory| RuntimeSurfaceRole::NativePane(accessory.pane_id.clone()))
+    }
+
+    fn popup_target_rect_for_parent(
+        &self,
+        popup: &PopupSurface,
+        role: RuntimeSurfaceRole,
+    ) -> Rectangle<i32, Logical> {
+        let parent = popup.get_parent_surface();
+        if let Some(parent) = parent {
+            if let Some(accessory) = self
+                .native_pane_accessories
+                .iter()
+                .find(|accessory| same_surface(accessory.surface.wl_surface(), &parent))
+            {
+                let size = accessory.surface.current_state().size.unwrap_or_else(|| {
+                    self.native_pane_rect(&accessory.pane_id)
+                        .map(|rect| rect.size)
+                        .unwrap_or_else(|| Size::from((1, 1)))
+                });
+                return Rectangle::new((0, 0).into(), size);
+            }
+        }
+        self.popup_target_rect(role)
     }
 
     fn popup_target_rect(&self, role: RuntimeSurfaceRole) -> Rectangle<i32, Logical> {
@@ -8529,7 +8930,15 @@ impl RuntimeWaylandState {
             self.assign_main_role(surface.clone());
         }
         if let Some((pane_id, launch_pid)) = self.expected_native_pane_for_toplevel(surface) {
-            if !self.native_pane_toplevels.contains_key(&pane_id) {
+            let already_assigned = self
+                .native_pane_toplevels
+                .get(&pane_id)
+                .is_some_and(|root| same_surface(root.wl_surface(), surface.wl_surface()))
+                || self.native_pane_accessories.iter().any(|accessory| {
+                    accessory.pane_id == pane_id
+                        && same_surface(accessory.surface.wl_surface(), surface.wl_surface())
+                });
+            if !already_assigned {
                 self.assign_native_pane_role(surface.clone(), pane_id, launch_pid);
             }
         }
@@ -8568,6 +8977,13 @@ impl RuntimeWaylandState {
             if same_surface(toplevel.wl_surface(), surface) {
                 return Some(RuntimeSurfaceRole::NativePane(pane_id.clone()));
             }
+        }
+        if let Some(accessory) = self
+            .native_pane_accessories
+            .iter()
+            .find(|accessory| same_surface(accessory.surface.wl_surface(), surface))
+        {
+            return Some(RuntimeSurfaceRole::NativePane(accessory.pane_id.clone()));
         }
         for popup in &self.popups {
             if same_surface(popup.surface.wl_surface(), surface) {
@@ -8610,7 +9026,47 @@ impl RuntimeWaylandState {
         let _ = surface.send_pending_configure();
     }
 
+    fn configure_native_pane_accessory(&self, surface: &ToplevelSurface, pane_id: &PaneId) {
+        let pane_rect = self
+            .presentation_root_geometry
+            .as_ref()
+            .or(self.staged_root_geometry.as_ref())
+            .and_then(|root| {
+                root.topology
+                    .panes
+                    .iter()
+                    .find(|pane| &pane.id == pane_id)
+                    .map(|pane| rectangle_from_pane_geometry(pane.geometry))
+            })
+            .or_else(|| self.native_pane_rect(pane_id));
+        let Some(pane_rect) = pane_rect else {
+            surface.send_close();
+            return;
+        };
+        let output = self.runtime_output_size();
+        let width = ((pane_rect.size.w as f64 * 1.4).ceil() as i32)
+            .min(output.w.max(1))
+            .max(1);
+        let height = ((pane_rect.size.h as f64 * 1.2).ceil() as i32)
+            .min(output.h.max(1))
+            .max(1);
+        surface.with_pending_state(|pending| {
+            pending.states.set(xdg_toplevel::State::Activated);
+            pending.decoration_mode = Some(embedded_toplevel_decoration_mode());
+            pending.size = Some((width, height).into());
+        });
+        let _ = surface.send_pending_configure();
+    }
+
     fn configure_toplevel_with_current_role(&self, surface: &ToplevelSurface) {
+        if let Some(accessory) = self
+            .native_pane_accessories
+            .iter()
+            .find(|accessory| same_surface(accessory.surface.wl_surface(), surface.wl_surface()))
+        {
+            self.configure_native_pane_accessory(surface, &accessory.pane_id);
+            return;
+        }
         if let Some(role) = self.role_for_surface(surface.wl_surface()) {
             self.configure_toplevel_for_role(surface, role);
             return;
@@ -8643,6 +9099,9 @@ impl RuntimeWaylandState {
                 native,
                 RuntimeSurfaceRole::NativePane(pane_id.clone()),
             );
+        }
+        for accessory in &self.native_pane_accessories {
+            self.configure_native_pane_accessory(&accessory.surface, &accessory.pane_id);
         }
     }
 
@@ -8759,8 +9218,8 @@ impl RuntimeWaylandState {
         let mut main_popup_elements = Vec::new();
         let mut native_pane_elements = Vec::new();
         let mut cropped_native_pane_elements = Vec::new();
+        let mut native_pane_accessory_elements = Vec::new();
         let mut native_pane_popup_elements = Vec::new();
-        let mut cropped_native_pane_popup_elements = Vec::new();
         let mut overlay_elements = Vec::new();
         let mut overlay_popup_elements = Vec::new();
         let output_rect = Rectangle::new(
@@ -8810,7 +9269,7 @@ impl RuntimeWaylandState {
         }
 
         for popup in &self.popups {
-            if popup.owner_role != RuntimeSurfaceRole::MainApp {
+            if !popup.mapped || popup.owner_role != RuntimeSurfaceRole::MainApp {
                 continue;
             }
             if let Some(mapping) = main_mapping {
@@ -8941,8 +9400,42 @@ impl RuntimeWaylandState {
             }
         }
 
+        for accessory in &self.native_pane_accessories {
+            if !self.native_pane_surface_is_visible(&accessory.pane_id, accessory.mapped) {
+                continue;
+            }
+            let Some(rect) =
+                self.native_pane_accessory_rect(&accessory.pane_id, &accessory.surface)
+            else {
+                continue;
+            };
+            if self
+                .host_surface_buffers
+                .get(&surface_key(accessory.surface.wl_surface()))
+                .is_none()
+            {
+                continue;
+            }
+            let mapping =
+                RoleSurfaceMapping::new(toplevel_surface_source_rect(&accessory.surface), rect);
+            if let Err(err) = import_surface_tree(renderer, accessory.surface.wl_surface()) {
+                capture.failure = Some(format!(
+                    "host renderer could not import native pane accessory surface tree: {err:#?}"
+                ));
+                continue;
+            }
+            native_pane_accessory_elements.extend(render_elements_from_surface_tree(
+                renderer,
+                accessory.surface.wl_surface(),
+                mapping.render_element_location(),
+                mapping.render_element_scale(),
+                1.0,
+                Kind::Unspecified,
+            ));
+        }
+
         for popup in &self.popups {
-            if popup.owner_role != RuntimeSurfaceRole::OverlayNative {
+            if !popup.mapped || popup.owner_role != RuntimeSurfaceRole::OverlayNative {
                 continue;
             }
             if let Some(mapping) = overlay_mapping {
@@ -8969,75 +9462,43 @@ impl RuntimeWaylandState {
             let RuntimeSurfaceRole::NativePane(ref pane_id) = popup.owner_role else {
                 continue;
             };
-            let Some(geometry) = pinned_status
+            if !self.native_pane_surface_is_visible(pane_id, popup.mapped) {
+                continue;
+            }
+            let pane_origin = pinned_status
                 .panes
                 .iter()
                 .find(|pane| &pane.id == pane_id)
-                .map(|pane| pane.geometry)
-            else {
+                .map(|pane| rectangle_from_pane_geometry(pane.geometry).loc);
+            let Some(mut base) = pane_origin else {
                 continue;
             };
-            if let Some(mapping) = self.native_pane_surface_mapping(pane_id, geometry) {
-                if let Err(err) = import_surface_tree(renderer, popup.surface.wl_surface()) {
-                    capture.failure = Some(format!(
-                        "host renderer could not import native pane popup surface tree: {err:#?}"
-                    ));
-                    continue;
-                }
-                let popup_geo = self.popup_geometry_local(&popup.surface);
-                let elements = render_elements_from_surface_tree(
-                    renderer,
-                    popup.surface.wl_surface(),
-                    mapping.map_render_element_location(popup_geo.loc),
-                    mapping.render_element_scale(),
-                    1.0,
-                    Kind::Unspecified,
-                );
-                let native_clip = self
-                    .presentation_root_geometry
-                    .as_ref()
-                    .or(self.active_root_geometry_consumers.as_ref())
-                    .and_then(|root| {
-                        root.native_materializations
-                            .iter()
-                            .find(|(candidate, _)| candidate == pane_id)
-                            .map(|(_, projection)| crate::root_geometry::PhysicalPixelRect {
-                                x: projection.origin_x,
-                                y: projection.origin_y,
-                                width: projection.width_px,
-                                height: projection.height_px,
-                            })
-                    });
-                if native_clip.is_some()
-                    && let (Some(projection), Some(clip_program)) = (
-                        self.presentation_root_geometry
-                            .as_ref()
-                            .or(self.active_root_geometry_consumers.as_ref())
-                            .and_then(|root| {
-                                root.native_materializations
-                                    .iter()
-                                    .find(|(candidate, _)| candidate == pane_id)
-                                    .map(|(_, projection)| *projection)
-                            }),
-                        self.native_clip_program.as_ref(),
-                    )
-                {
-                    let target_height_px = render_output_size_before_transform(self).h as f32;
-                    cropped_native_pane_popup_elements.extend(
-                        materialize_native_surface_elements(
-                            elements,
-                            None,
-                            projection,
-                            clip_program,
-                            target_height_px,
-                        )
-                        .into_iter()
-                        .map(SurfAceRenderElement::from),
-                    );
-                } else {
-                    native_pane_popup_elements.extend(elements);
+            if let Some(parent) = popup.surface.get_parent_surface() {
+                if let Some(accessory) = self.native_pane_accessories.iter().find(|accessory| {
+                    &accessory.pane_id == pane_id
+                        && same_surface(accessory.surface.wl_surface(), &parent)
+                }) {
+                    if let Some(rect) = self.native_pane_accessory_rect(pane_id, &accessory.surface)
+                    {
+                        base = rect.loc;
+                    }
                 }
             }
+            if let Err(err) = import_surface_tree(renderer, popup.surface.wl_surface()) {
+                capture.failure = Some(format!(
+                    "host renderer could not import native pane popup surface tree: {err:#?}"
+                ));
+                continue;
+            }
+            let popup_geo = self.popup_geometry_local(&popup.surface);
+            native_pane_popup_elements.extend(render_elements_from_surface_tree(
+                renderer,
+                popup.surface.wl_surface(),
+                Point::from((base.x + popup_geo.loc.x, base.y + popup_geo.loc.y)),
+                1.0,
+                1.0,
+                Kind::Unspecified,
+            ));
         }
 
         let debug_border_regions = overlay_region_status
@@ -9048,6 +9509,14 @@ impl RuntimeWaylandState {
         // Smithay expects top-to-bottom order; otherwise an opaque main surface
         // can cull the overlay before it is drawn. The compositor cursor is
         // drawn in the final output pass so it is not clipped by scene surfaces.
+        capture.push(
+            RenderElementSource::NativePanePopup,
+            native_pane_popup_elements,
+        );
+        capture.push(
+            RenderElementSource::NativePaneAccessory,
+            native_pane_accessory_elements,
+        );
         capture.push(RenderElementSource::OverlayPopup, overlay_popup_elements);
         capture.push(RenderElementSource::Overlay, overlay_elements);
         if let Some(regions) = debug_border_regions {
@@ -9059,14 +9528,6 @@ impl RuntimeWaylandState {
         capture.push_elements(
             RenderElementSource::MainOverlayRegion,
             main_overlay_region_elements,
-        );
-        capture.push(
-            RenderElementSource::NativePanePopup,
-            native_pane_popup_elements,
-        );
-        capture.push_elements(
-            RenderElementSource::NativePanePopup,
-            cropped_native_pane_popup_elements,
         );
         capture.push_elements(
             RenderElementSource::NativePane,
@@ -9140,8 +9601,22 @@ impl RuntimeWaylandState {
         for native in self.native_pane_toplevels.values() {
             send_frames_surface_tree(native.wl_surface(), elapsed_ms);
         }
+        for accessory in &self.native_pane_accessories {
+            if accessory.mapped && self.native_pane_is_keyboard_focused(&accessory.pane_id) {
+                send_frames_surface_tree(accessory.surface.wl_surface(), elapsed_ms);
+            }
+        }
         for popup in &self.popups {
-            send_frames_surface_tree(popup.surface.wl_surface(), elapsed_ms);
+            if popup.mapped
+                && (!matches!(popup.owner_role, RuntimeSurfaceRole::NativePane(_))
+                    || matches!(
+                        &popup.owner_role,
+                        RuntimeSurfaceRole::NativePane(pane_id)
+                            if self.native_pane_is_keyboard_focused(pane_id)
+                    ))
+            {
+                send_frames_surface_tree(popup.surface.wl_surface(), elapsed_ms);
+            }
         }
     }
 
@@ -9413,6 +9888,80 @@ impl RuntimeWaylandState {
         }
     }
 
+    fn update_native_pane_member_map_state(&mut self, surface: &WlSurface) {
+        let id = surface_key(surface);
+        let mapped_now = self.host_surface_buffers.contains_key(&id);
+        let mut changed_owner = None;
+        let mut just_mapped = false;
+        for accessory in &mut self.native_pane_accessories {
+            if !same_surface(accessory.surface.wl_surface(), surface)
+                || accessory.mapped == mapped_now
+            {
+                continue;
+            }
+            accessory.mapped = mapped_now;
+            changed_owner = Some(accessory.pane_id.clone());
+            just_mapped = mapped_now;
+            break;
+        }
+        if changed_owner.is_none() {
+            for popup in &mut self.popups {
+                if !same_surface(popup.surface.wl_surface(), surface) || popup.mapped == mapped_now
+                {
+                    continue;
+                }
+                popup.mapped = mapped_now;
+                if let RuntimeSurfaceRole::NativePane(pane_id) = &popup.owner_role {
+                    changed_owner = Some(pane_id.clone());
+                    just_mapped = mapped_now;
+                }
+                break;
+            }
+        }
+        let Some(pane_id) = changed_owner else {
+            return;
+        };
+        if just_mapped {
+            if let Some(index) = self.native_pane_accessories.iter().position(|accessory| {
+                accessory.pane_id == pane_id
+                    && same_surface(accessory.surface.wl_surface(), surface)
+            }) {
+                let accessory = self.native_pane_accessories.remove(index);
+                self.native_pane_accessories.push(accessory);
+            }
+            if let Some(index) = self.popups.iter().position(|popup| {
+                popup.owner_role == RuntimeSurfaceRole::NativePane(pane_id.clone())
+                    && same_surface(popup.surface.wl_surface(), surface)
+            }) {
+                let popup = self.popups.remove(index);
+                self.popups.push(popup);
+            }
+            // Mapping records a pane-group member, but it does not activate
+            // an accessory whose pane is currently blurred. Such a dialog stays
+            // hidden until the user focuses its owning pane.
+            if self.native_pane_is_keyboard_focused(&pane_id) {
+                self.note_native_pane_surface_focus(surface, true);
+                if let Some(keyboard) = self.seat.get_keyboard() {
+                    keyboard.set_focus(self, Some(surface.clone()), 0.into());
+                }
+            }
+        } else if self
+            .native_pane_focused_surfaces
+            .get(&pane_id)
+            .is_some_and(|focused| focused == &surface_id(surface).to_string())
+            && self.native_pane_is_keyboard_focused(&pane_id)
+        {
+            let fallback = self.native_pane_focus_surface(&pane_id);
+            if let Some(fallback) = fallback {
+                self.note_native_pane_surface_focus(&fallback, false);
+                if let Some(keyboard) = self.seat.get_keyboard() {
+                    keyboard.set_focus(self, Some(fallback), 0.into());
+                }
+            }
+        }
+        self.sync_native_pane_group_focus_status(&pane_id);
+    }
+
     fn drop_surface_buffer(&mut self, surface: &WlSurface) {
         let id = surface_key(surface);
         self.host_surface_buffers.remove(&id);
@@ -9476,43 +10025,108 @@ impl RuntimeWaylandState {
             }
         }
 
+        for accessory in &self.native_pane_accessories {
+            if !self.native_pane_surface_is_visible(&accessory.pane_id, accessory.mapped) {
+                continue;
+            }
+            if !self
+                .host_surface_buffers
+                .contains_key(&surface_key(accessory.surface.wl_surface()))
+            {
+                continue;
+            }
+            let Some(rect) =
+                self.native_pane_accessory_rect(&accessory.pane_id, &accessory.surface)
+            else {
+                continue;
+            };
+            let mapping =
+                RoleSurfaceMapping::new(toplevel_surface_source_rect(&accessory.surface), rect);
+            self.collect_surface_tree_surfaces(
+                accessory.surface.wl_surface(),
+                (0, 0).into(),
+                mapping,
+                &mut surfaces,
+            );
+        }
+
         for popup in &self.popups {
-            if let Some(snapshot) = self
+            if !popup.mapped {
+                continue;
+            }
+            if let RuntimeSurfaceRole::NativePane(pane_id) = &popup.owner_role {
+                if !self.native_pane_is_keyboard_focused(pane_id) {
+                    continue;
+                }
+            }
+            let Some(snapshot) = self
                 .host_surface_buffers
                 .get(&surface_key(popup.surface.wl_surface()))
-            {
-                let mapping = match &popup.owner_role {
-                    RuntimeSurfaceRole::MainApp => main_mapping,
-                    RuntimeSurfaceRole::OverlayNative => overlay_mapping,
-                    RuntimeSurfaceRole::NativePane(pane_id) => status
+            else {
+                continue;
+            };
+            let target_size = if let Some(size) = snapshot.size.as_ref() {
+                Some(Size::new(size.w, size.h))
+            } else if let Some(info) = snapshot.dmabuf.as_ref() {
+                Some(Size::new(info.width, info.height))
+            } else {
+                None
+            };
+            let Some(target_size) = target_size else {
+                continue;
+            };
+            let popup_geo = self.popup_geometry_local(&popup.surface);
+            let target = match &popup.owner_role {
+                RuntimeSurfaceRole::MainApp => {
+                    let Some(mapping) = main_mapping else {
+                        continue;
+                    };
+                    mapping.map_rect(Rectangle::new(popup_geo.loc, target_size))
+                }
+                RuntimeSurfaceRole::OverlayNative => {
+                    let Some(mapping) = overlay_mapping else {
+                        continue;
+                    };
+                    mapping.map_rect(Rectangle::new(popup_geo.loc, target_size))
+                }
+                RuntimeSurfaceRole::NativePane(pane_id) => {
+                    let Some(pane_rect) = status
                         .panes
                         .iter()
                         .find(|pane| &pane.id == pane_id)
-                        .and_then(|pane| self.native_pane_surface_mapping(pane_id, pane.geometry)),
-                };
-                let Some(mapping) = mapping else {
-                    continue;
-                };
-                let target_size = if let Some(size) = snapshot.size.as_ref() {
-                    Some(Size::new(size.w, size.h))
-                } else if let Some(info) = snapshot.dmabuf.as_ref() {
-                    Some(Size::new(info.width, info.height))
-                } else {
-                    None
-                };
-                let Some(target_size) = target_size else {
-                    continue;
-                };
-                let popup_geo = self.popup_geometry_local(&popup.surface);
-                surfaces.push(HostSceneSurface {
-                    buffer: snapshot.buffer.clone(),
-                    kind: snapshot.kind,
-                    target: mapping.map_rect(Rectangle::new(popup_geo.loc, target_size)),
-                    dmabuf: snapshot.dmabuf,
-                    native_materialization: snapshot.native_materialization,
-                    damage: snapshot.damage,
-                });
-            }
+                        .map(|pane| rectangle_from_pane_geometry(pane.geometry))
+                    else {
+                        continue;
+                    };
+                    let mut base = pane_rect.loc;
+                    if let Some(parent) = popup.surface.get_parent_surface() {
+                        if let Some(accessory) =
+                            self.native_pane_accessories.iter().find(|accessory| {
+                                &accessory.pane_id == pane_id
+                                    && same_surface(accessory.surface.wl_surface(), &parent)
+                            })
+                        {
+                            if let Some(rect) =
+                                self.native_pane_accessory_rect(pane_id, &accessory.surface)
+                            {
+                                base = rect.loc;
+                            }
+                        }
+                    }
+                    Rectangle::new(
+                        (base.x + popup_geo.loc.x, base.y + popup_geo.loc.y).into(),
+                        target_size,
+                    )
+                }
+            };
+            surfaces.push(HostSceneSurface {
+                buffer: snapshot.buffer.clone(),
+                kind: snapshot.kind,
+                target,
+                dmabuf: snapshot.dmabuf,
+                native_materialization: snapshot.native_materialization,
+                damage: snapshot.damage,
+            });
         }
 
         surfaces
@@ -9683,6 +10297,7 @@ impl CompositorHandler for RuntimeWaylandState {
             });
         });
         self.capture_surface_buffer_commit(surface);
+        self.update_native_pane_member_map_state(surface);
         on_commit_buffer_handler::<Self>(surface);
     }
 }
@@ -9709,15 +10324,23 @@ impl XdgShellHandler for RuntimeWaylandState {
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
         if let Some(owner_role) = self.popup_owner_role(&surface) {
-            let target = self.popup_target_rect(owner_role.clone());
+            let target = self.popup_target_rect_for_parent(&surface, owner_role.clone());
             surface.with_pending_state(|pending| {
                 pending.geometry = pending.positioner.get_unconstrained_geometry(target);
             });
             let _ = surface.send_configure();
+            let pane_owner = match &owner_role {
+                RuntimeSurfaceRole::NativePane(pane_id) => Some(pane_id.clone()),
+                _ => None,
+            };
             self.popups.push(ManagedPopup {
                 surface,
                 owner_role,
+                mapped: false,
             });
+            if let Some(pane_id) = pane_owner {
+                self.sync_native_pane_group_focus_status(&pane_id);
+            }
             return;
         }
         surface.send_popup_done();
@@ -9741,6 +10364,13 @@ impl XdgShellHandler for RuntimeWaylandState {
                     RuntimeSurfaceRole::NativePane(pane_id.clone()),
                 );
             }
+        }
+        if let Some(accessory) = self
+            .native_pane_accessories
+            .iter()
+            .find(|accessory| accessory.surface.wl_surface() == &surface)
+        {
+            self.configure_native_pane_accessory(&accessory.surface, &accessory.pane_id);
         }
     }
 
@@ -9794,7 +10424,7 @@ impl XdgShellHandler for RuntimeWaylandState {
                 .find_map(|(pane_id, item)| {
                     (surface_key(item.wl_surface()) == destroyed_id).then(|| pane_id.clone())
                 });
-        if let Some(pane_id) = destroyed_native_pane {
+        if let Some(pane_id) = destroyed_native_pane.clone() {
             let root_surface = self
                 .native_pane_toplevels
                 .get(&pane_id)
@@ -9816,6 +10446,60 @@ impl XdgShellHandler for RuntimeWaylandState {
                 suppressed_pointer_releases,
             );
         }
+        if let Some(pane_id) = destroyed_native_pane.as_ref() {
+            let orphaned = self
+                .native_pane_accessories
+                .iter()
+                .filter(|accessory| &accessory.pane_id == pane_id)
+                .map(|accessory| {
+                    (
+                        accessory.surface.wl_surface().clone(),
+                        surface_id(accessory.surface.wl_surface()).to_string(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            for (surface, window_id) in orphaned {
+                if let Some(accessory) = self.native_pane_accessories.iter().find(|accessory| {
+                    &accessory.pane_id == pane_id
+                        && surface_id(accessory.surface.wl_surface()).to_string() == window_id
+                }) {
+                    accessory.surface.send_close();
+                }
+                self.drop_surface_buffer(&surface);
+                if let Some(history) = self.native_pane_focus_history.get_mut(pane_id) {
+                    history.retain(|item| item != &window_id);
+                }
+            }
+            self.native_pane_accessories
+                .retain(|accessory| &accessory.pane_id != pane_id);
+            self.native_pane_focused_surfaces.remove(pane_id);
+            self.native_pane_focus_history.remove(pane_id);
+        } else if let Some(index) = self
+            .native_pane_accessories
+            .iter()
+            .position(|accessory| surface_key(accessory.surface.wl_surface()) == destroyed_id)
+        {
+            let accessory = self.native_pane_accessories.remove(index);
+            let pane_id = accessory.pane_id;
+            let destroyed_window_id = surface_id(accessory.surface.wl_surface()).to_string();
+            if let Some(history) = self.native_pane_focus_history.get_mut(&pane_id) {
+                history.retain(|item| item != &destroyed_window_id);
+            }
+            let was_focused =
+                self.native_pane_focused_surfaces.get(&pane_id) == Some(&destroyed_window_id);
+            if was_focused {
+                self.native_pane_focused_surfaces.remove(&pane_id);
+            }
+            if was_focused && self.native_pane_is_keyboard_focused(&pane_id) {
+                if let Some(fallback) = self.native_pane_focus_surface(&pane_id) {
+                    self.note_native_pane_surface_focus(&fallback, false);
+                    if let Some(keyboard) = self.seat.get_keyboard() {
+                        keyboard.set_focus(self, Some(fallback), 0.into());
+                    }
+                }
+            }
+            self.sync_native_pane_group_focus_status(&pane_id);
+        }
         let mut removed_popup_ids = Vec::new();
         self.popups.retain(|popup| {
             let keep = popup.surface.get_parent_surface().as_ref().map(surface_key)
@@ -9827,6 +10511,7 @@ impl XdgShellHandler for RuntimeWaylandState {
         });
         for popup_id in removed_popup_ids {
             self.host_surface_buffers.remove(&popup_id);
+            self.surface_material_serials.remove(&popup_id);
         }
         self.promote_pending_toplevels();
         self.sync_runtime_status_with_roles();
@@ -9835,9 +10520,38 @@ impl XdgShellHandler for RuntimeWaylandState {
 
     fn popup_destroyed(&mut self, surface: PopupSurface) {
         let destroyed_id = surface_key(surface.wl_surface());
+        let destroyed_window_id = surface_id(surface.wl_surface()).to_string();
+        let native_owner = self.popups.iter().find_map(|popup| {
+            (surface_key(popup.surface.wl_surface()) == destroyed_id)
+                .then(|| match &popup.owner_role {
+                    RuntimeSurfaceRole::NativePane(pane_id) => Some(pane_id.clone()),
+                    _ => None,
+                })
+                .flatten()
+        });
         self.drop_surface_buffer(surface.wl_surface());
         self.popups
             .retain(|popup| surface_key(popup.surface.wl_surface()) != destroyed_id);
+        if let Some(pane_id) = native_owner {
+            if let Some(history) = self.native_pane_focus_history.get_mut(&pane_id) {
+                history.retain(|window_id| window_id != &destroyed_window_id);
+            }
+            let was_focused =
+                self.native_pane_focused_surfaces.get(&pane_id) == Some(&destroyed_window_id);
+            if was_focused {
+                self.native_pane_focused_surfaces.remove(&pane_id);
+            }
+            let active = self.native_pane_is_keyboard_focused(&pane_id);
+            if was_focused && active {
+                if let Some(fallback) = self.native_pane_focus_surface(&pane_id) {
+                    self.note_native_pane_surface_focus(&fallback, false);
+                    if let Some(keyboard) = self.seat.get_keyboard() {
+                        keyboard.set_focus(self, Some(fallback), 0.into());
+                    }
+                }
+            }
+            self.sync_native_pane_group_focus_status(&pane_id);
+        }
     }
 
     fn app_id_changed(&mut self, surface: ToplevelSurface) {
@@ -10627,6 +11341,7 @@ mod tests {
         parse_shell_overlay_toggle_shortcut, pid_matches_or_descends_from,
         render_output_size_before_transform, scene_texture_transform, screen_capture_src_flipped,
         render_elements_to_texture,
+        same_surface,
         composite_scene_texture_to_physical_scanout,
         select_atomic_plane_zpos_values, select_preferred_scanout_format, select_primary_path,
         remap_damage_to_materialized_destination, source_rect_from_bbox_and_geometry,
@@ -11659,6 +12374,7 @@ mod tests {
         state.mark_runtime_resize(3840, 2160);
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
                 id: PaneId::new("native"),
                 content_id: Some("content".to_string()),
                 binding_id: Some("binding".to_string()),
@@ -12239,6 +12955,7 @@ mod tests {
         let pane_id = PaneId::new("native-owner");
         lock_state(&runtime.shared_state)
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
                 id: pane_id.clone(),
                 content_id: Some("terminal-content".to_string()),
                 binding_id: Some("native-owner-binding".to_string()),
@@ -12770,6 +13487,7 @@ mod tests {
         state.mark_runtime_resize(3840, 2160);
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
                 id: PaneId::new("native"),
                 content_id: Some("content".to_string()),
                 binding_id: Some("binding".to_string()),
@@ -13036,6 +13754,216 @@ mod tests {
     }
 
     #[test]
+    fn mapped_popup_in_unfocused_native_pane_waits_for_pane_focus_and_clicks_locally() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
+        state.mark_runtime_resize(1280, 720);
+        let pane_id = PaneId::new("surface:dialog-pane");
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
+                id: pane_id.clone(),
+                content_id: Some("dialog-pane-content".to_string()),
+                binding_id: Some("dialog-pane-binding".to_string()),
+                launch_token: None,
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 100.0,
+                    y: 20.0,
+                    width: 480.0,
+                    height: 320.0,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+                target: NativeTargetClass::Terminal,
+                process: ProcessSpec {
+                    command: "dialog-pane-fixture".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: Default::default(),
+                },
+            }])
+            .expect("native pane plan should apply");
+        state
+            .launch_native_pane_hosts(vec![pane_id.clone()])
+            .expect("fake pane process should launch");
+        state.set_runtime_focus_target(Some(RuntimeFocusTarget::MainApp));
+        let shared_state = Arc::new(Mutex::new(state));
+
+        let mut display: Display<RuntimeWaylandState> = Display::new().unwrap();
+        let mut display_handle = display.handle();
+        let mut wayland =
+            RuntimeWaylandState::new(display_handle.clone(), Arc::clone(&shared_state)).unwrap();
+        let (server_socket, client_socket) = UnixStream::pair().unwrap();
+        let server_client = display_handle
+            .insert_client(
+                server_socket,
+                Arc::new(super::RuntimeClientState::default()),
+            )
+            .unwrap();
+        let (surface_ids, release_client) = spawn_real_shm_surface_tree(client_socket);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        while !wayland.native_pane_toplevels.contains_key(&pane_id) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture must offer its native pane surface"
+            );
+            display.dispatch_clients(&mut wayland).unwrap();
+            if !wayland.native_pane_toplevels.contains_key(&pane_id)
+                && !wayland.pending_toplevels.is_empty()
+            {
+                let native = wayland.pending_toplevels.remove(0);
+                wayland.assign_native_pane_role(native, pane_id.clone(), 1);
+            }
+            display.flush_clients().unwrap();
+            std::thread::yield_now();
+        }
+        lock_state(&shared_state).set_runtime_focus_target(Some(RuntimeFocusTarget::MainApp));
+
+        let (_root_id, _child_id, popup_id) = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture must create and map its native-pane popup"
+            );
+            display.dispatch_clients(&mut wayland).unwrap();
+            display.flush_clients().unwrap();
+            if let Ok(ids) = surface_ids.try_recv() {
+                break ids;
+            }
+            std::thread::yield_now();
+        };
+        let popup: smithay::reexports::wayland_server::protocol::wl_surface::WlSurface =
+            server_client
+                .object_from_protocol_id(&display_handle, popup_id)
+                .expect("server must recover the real popup surface");
+        while !wayland.popups.iter().any(|candidate| {
+            candidate.mapped && same_surface(candidate.surface.wl_surface(), &popup)
+        }) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native popup commit must reach the production map handler"
+            );
+            display.dispatch_clients(&mut wayland).unwrap();
+            display.flush_clients().unwrap();
+            std::thread::yield_now();
+        }
+
+        let popup_window_id = popup_id.to_string();
+        let hidden_status = lock_state(&shared_state).status_snapshot();
+        assert_eq!(
+            hidden_status.runtime.active_focus_target,
+            Some(RuntimeFocusTarget::MainApp),
+            "mapping in an unfocused native pane must preserve the current Surf Ace focus"
+        );
+        let hidden_group = hidden_status
+            .native_pane_window_groups
+            .iter()
+            .find(|group| group.pane_id == pane_id)
+            .expect("native pane group should remain in status");
+        assert_eq!(hidden_group.pane_focused, Some(false));
+        assert_eq!(hidden_group.focused_window_id, None);
+        assert!(
+            !wayland.native_pane_surface_is_visible(&pane_id, true),
+            "a mapped member in a blurred pane must not enter rendering or input paths"
+        );
+        let popup_member = hidden_group
+            .members
+            .iter()
+            .find(|member| member.id == popup_window_id)
+            .expect("mapped popup should remain a remembered group member");
+        assert_eq!(popup_member.role, "popup");
+        assert_eq!(popup_member.lifecycle, "live");
+        assert!(!popup_member.focused);
+
+        let popup = wayland
+            .popups
+            .iter()
+            .find(|candidate| same_surface(candidate.surface.wl_surface(), &popup))
+            .expect("mapped popup should still be registered")
+            .surface
+            .clone();
+        let local_popup = wayland.popup_geometry_local(&popup);
+        let pane_origin = wayland
+            .native_pane_rect(&pane_id)
+            .expect("unfocused pane should retain its geometry")
+            .loc;
+        let popup_center = (
+            pane_origin.x as f64
+                + local_popup.loc.x as f64
+                + local_popup.size.w.max(1) as f64 / 2.0,
+            pane_origin.y as f64
+                + local_popup.loc.y as f64
+                + local_popup.size.h.max(1) as f64 / 2.0,
+        )
+            .into();
+        let (_, hidden_input_status) = wayland.input_operation_snapshot();
+        assert!(
+            !wayland
+                .surface_under_point_for_capture(
+                    popup_center,
+                    OverlayCaptureCapability::PointerButton,
+                    &hidden_input_status,
+                )
+                .is_some_and(|(surface, _)| same_surface(&surface, popup.wl_surface())),
+            "unfocused pane popup must not receive pointer input"
+        );
+
+        lock_state(&shared_state).set_runtime_focus_target(Some(RuntimeFocusTarget::NativePane {
+            pane_id: pane_id.clone(),
+        }));
+        wayland.apply_focus_route();
+        let (_, visible_input_status) = wayland.input_operation_snapshot();
+        assert!(
+            wayland
+                .surface_under_point_for_capture(
+                    popup_center,
+                    OverlayCaptureCapability::PointerButton,
+                    &visible_input_status,
+                )
+                .is_some_and(|(surface, _)| same_surface(&surface, popup.wl_surface())),
+            "mapped popup should become hit-testable only after its pane is focused"
+        );
+        wayland.forward_pointer_motion(popup_center, 10);
+        wayland.forward_pointer_button(0x110, ButtonState::Pressed, 11);
+        let keyboard_focus = wayland
+            .seat
+            .get_keyboard()
+            .expect("compositor seat should expose its keyboard")
+            .current_focus();
+        assert!(
+            keyboard_focus
+                .as_ref()
+                .is_some_and(|focused| same_surface(focused, popup.wl_surface())),
+            "typing after the physical click must reach the clicked popup"
+        );
+
+        let focused_status = lock_state(&shared_state).status_snapshot();
+        assert_eq!(
+            focused_status.runtime.active_focus_target,
+            Some(RuntimeFocusTarget::NativePane {
+                pane_id: pane_id.clone(),
+            })
+        );
+        let focused_group = focused_status
+            .native_pane_window_groups
+            .iter()
+            .find(|group| group.pane_id == pane_id)
+            .expect("focused pane group should remain in status");
+        assert_eq!(focused_group.pane_focused, Some(true));
+        assert_eq!(
+            focused_group.focused_window_id.as_deref(),
+            Some(popup_window_id.as_str())
+        );
+        assert!(
+            focused_group
+                .members
+                .iter()
+                .any(|member| member.id == popup_window_id && member.focused),
+            "physical accessory click should focus the popup within its own pane group"
+        );
+        release_client.send(()).unwrap();
+    }
+
+    #[test]
     fn missing_native_focus_owner_returns_to_main_surface_not_overlay() {
         let shared_state = Arc::new(Mutex::new(CompositorState::new(
             true,
@@ -13121,6 +14049,7 @@ mod tests {
         let pane_id = PaneId::new("native-grab-owner");
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
                 id: pane_id.clone(),
                 content_id: Some("terminal-content".to_string()),
                 binding_id: Some("native-grab-binding".to_string()),

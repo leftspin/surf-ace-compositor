@@ -1,8 +1,9 @@
 use crate::model::{
-    EnvironmentAppearance, HostRuntimeStartTrigger, MainAppLaunchIntent, NativePaneHostRequest,
-    NativeTargetClass, NodeSunScheduleProfile, OutputRotation, OverlayCoordinateSpace,
-    OverlayRegionRequest, OverlayRegionUpdateReason, PaneId, ProcessSpec, ProviderPaneSnapshot,
-    RuntimeBackend, RuntimeFocusTarget, RuntimePhase, StatusSnapshot, SurfaceBindingEvidence,
+    EnvironmentAppearance, HostRuntimeStartTrigger, MainAppLaunchIntent, NativePaneFocusGeneration,
+    NativePaneHostRequest, NativePanePresentationGeneration, NativeTargetClass,
+    NodeSunScheduleProfile, OutputRotation, OverlayCoordinateSpace, OverlayRegionRequest,
+    OverlayRegionUpdateReason, PaneId, ProcessSpec, ProviderPaneSnapshot, RuntimeBackend,
+    RuntimeFocusTarget, RuntimePhase, StatusSnapshot, SurfaceBindingEvidence,
     SurfaceBindingEvidenceOutcome,
 };
 use crate::root_geometry::CaptureGeometry;
@@ -98,10 +99,14 @@ pub enum ControlRequest {
     #[serde(rename = "native_pane.host")]
     NativePaneHost {
         panes: Vec<NativePaneHostRequest>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        presentation_generation: Option<NativePanePresentationGeneration>,
     },
     #[serde(rename = "native_pane.update")]
     NativePaneUpdate {
         panes: Vec<NativePaneHostRequest>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        presentation_generation: Option<NativePanePresentationGeneration>,
     },
     #[serde(rename = "native_pane.release")]
     NativePaneRelease {
@@ -168,8 +173,13 @@ pub enum ControlRequest {
     },
     SetRuntimeFocusTarget {
         target: RuntimeFocusTarget,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus_generation: Option<NativePaneFocusGeneration>,
     },
-    ClearRuntimeFocusTarget,
+    ClearRuntimeFocusTarget {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus_generation: Option<NativePaneFocusGeneration>,
+    },
     StartHostRuntime,
     PollProcesses,
     CaptureScreen {
@@ -526,18 +536,46 @@ fn handle_request_with_capture(
             .apply_native_pane_host_plan(panes)
             .map(|_| Some(state.status_snapshot()))
             .map_err(|err| err.to_string()),
-        ControlRequest::NativePaneHost { panes } => {
+        ControlRequest::NativePaneHost {
+            panes,
+            presentation_generation,
+        } => (|| {
+            if let Some(generation) = presentation_generation.as_ref() {
+                state.validate_native_pane_presentation_generation(generation)?;
+            }
+            state.validate_native_pane_host_group_requests(
+                &panes,
+                presentation_generation.as_ref(),
+            )?;
             let pane_ids = panes.iter().map(|request| request.id.clone()).collect();
             state
                 .apply_native_pane_host_plan(panes)
                 .and_then(|_| state.launch_native_pane_hosts(pane_ids))
-                .map(|_| Some(state.status_snapshot()))
-                .map_err(|err| err.to_string())
-        }
-        ControlRequest::NativePaneUpdate { panes } => state
-            .apply_native_pane_host_plan(panes)
-            .map(|_| Some(state.status_snapshot()))
-            .map_err(|err| err.to_string()),
+                .map_err(|err| err.to_string())?;
+            if let Some(generation) = presentation_generation {
+                state.record_native_pane_presentation_generation(generation)?;
+            }
+            Ok(Some(state.status_snapshot()))
+        })(),
+        ControlRequest::NativePaneUpdate {
+            panes,
+            presentation_generation,
+        } => (|| {
+            if let Some(generation) = presentation_generation.as_ref() {
+                state.validate_native_pane_presentation_generation(generation)?;
+            }
+            state.validate_native_pane_host_group_requests(
+                &panes,
+                presentation_generation.as_ref(),
+            )?;
+            state
+                .apply_native_pane_host_plan(panes)
+                .map_err(|err| err.to_string())?;
+            if let Some(generation) = presentation_generation {
+                state.record_native_pane_presentation_generation(generation)?;
+            }
+            Ok(Some(state.status_snapshot()))
+        })(),
         ControlRequest::NativePaneRelease { pane_ids } => state
             .release_native_pane_hosts(pane_ids)
             .map(|_| Some(state.status_snapshot()))
@@ -614,14 +652,31 @@ fn handle_request_with_capture(
             .select_main_app_launch_intent(intent)
             .map(|_| Some(state.status_snapshot()))
             .map_err(|err| err.to_string()),
-        ControlRequest::SetRuntimeFocusTarget { target } => {
-            state.set_runtime_focus_target(Some(target));
+        ControlRequest::SetRuntimeFocusTarget {
+            target,
+            focus_generation,
+        } => (|| {
+            if let Some(generation) = focus_generation {
+                state
+                    .set_runtime_focus_target_guarded(Some(target), generation)
+                    .map_err(|err| err.to_string())?;
+            } else {
+                state.set_runtime_focus_target(Some(target));
+                state.clear_runtime_focus_generation();
+            }
             Ok(Some(state.status_snapshot()))
-        }
-        ControlRequest::ClearRuntimeFocusTarget => {
-            state.set_runtime_focus_target(None);
+        })(),
+        ControlRequest::ClearRuntimeFocusTarget { focus_generation } => (|| {
+            if let Some(generation) = focus_generation {
+                state
+                    .set_runtime_focus_target_guarded(None, generation)
+                    .map_err(|err| err.to_string())?;
+            } else {
+                state.set_runtime_focus_target(None);
+                state.clear_runtime_focus_generation();
+            }
             Ok(Some(state.status_snapshot()))
-        }
+        })(),
         ControlRequest::StartHostRuntime => {
             if !state.host_mode_active() {
                 return ControlResponse::err("host runtime control is unavailable in this mode");
@@ -1462,6 +1517,7 @@ mod tests {
             ControlRequest::ApplyNativePaneHostPlan {
                 panes: vec![
                     NativePaneHostRequest {
+                        window_group: None,
                         id: PaneId::new("pane-a"),
                         content_id: None,
                         binding_id: None,
@@ -1483,6 +1539,7 @@ mod tests {
                         },
                     },
                     NativePaneHostRequest {
+                        window_group: None,
                         id: PaneId::new("pane-b"),
                         content_id: None,
                         binding_id: None,
@@ -1777,6 +1834,7 @@ mod tests {
             .expect("provider pane should apply");
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
                 id: PaneId::new("pane-a"),
                 content_id: Some("target-egl".to_string()),
                 binding_id: Some("pane-a:target-egl".to_string()),
@@ -2054,6 +2112,7 @@ mod tests {
             &mut state,
             ControlRequest::ApplyNativePaneHostPlan {
                 panes: vec![NativePaneHostRequest {
+                    window_group: None,
                     id: PaneId::new("pane-a"),
                     content_id: None,
                     binding_id: None,
@@ -2110,6 +2169,7 @@ mod tests {
             &mut state,
             ControlRequest::ApplyNativePaneHostPlan {
                 panes: vec![NativePaneHostRequest {
+                    window_group: None,
                     id: PaneId::new("pane-a"),
                     content_id: Some("content-a".to_string()),
                     binding_id: Some("binding-a".to_string()),
@@ -2210,7 +2270,9 @@ mod tests {
         let host_response = handle_request(
             &mut state,
             ControlRequest::NativePaneHost {
+                presentation_generation: None,
                 panes: vec![NativePaneHostRequest {
+                    window_group: None,
                     id: PaneId::new("pane-a"),
                     content_id: Some("content-a".to_string()),
                     binding_id: Some("binding-a".to_string()),
@@ -2244,7 +2306,9 @@ mod tests {
         let update_response = handle_request(
             &mut state,
             ControlRequest::NativePaneUpdate {
+                presentation_generation: None,
                 panes: vec![NativePaneHostRequest {
+                    window_group: None,
                     id: PaneId::new("pane-a"),
                     content_id: Some("content-a".to_string()),
                     binding_id: Some("binding-a".to_string()),
@@ -2327,7 +2391,9 @@ mod tests {
         let host_response = handle_request(
             &mut state,
             ControlRequest::NativePaneHost {
+                presentation_generation: None,
                 panes: vec![NativePaneHostRequest {
+                    window_group: None,
                     id: PaneId::new("pane-a"),
                     content_id: Some("content-a".to_string()),
                     binding_id: Some("binding-a".to_string()),
@@ -2503,6 +2569,7 @@ mod tests {
         state.mark_runtime_resize(4, 4);
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
                 id: PaneId::new("pane"),
                 content_id: Some("content".to_string()),
                 binding_id: Some("binding".to_string()),
@@ -2539,6 +2606,7 @@ mod tests {
         );
         state
             .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
                 id: PaneId::new("pane"),
                 content_id: Some("content".to_string()),
                 binding_id: Some("binding".to_string()),
