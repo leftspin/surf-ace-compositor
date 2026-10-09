@@ -6,6 +6,108 @@ use std::collections::BTreeMap;
 
 pub const CAPABILITY_VERSION: u32 = 1;
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+impl From<StrictRect> for OverlayRect {
+    fn from(rect: StrictRect) -> Self {
+        Self {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        }
+    }
+}
+fn deserialize_rect<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<OverlayRect, D::Error> {
+    StrictRect::deserialize(deserializer).map(Into::into)
+}
+fn deserialize_optional_rect<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<OverlayRect>, D::Error> {
+    Option::<StrictRect>::deserialize(deserializer).map(|rect| rect.map(Into::into))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictGeneration {
+    surface_id: String,
+    surface_epoch: String,
+    topology_epoch: u64,
+    geometry_revision: u64,
+    focus_revision: u64,
+    pane_instances: BTreeMap<String, String>,
+}
+fn deserialize_generation<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<NativePanePresentationGeneration, D::Error> {
+    let generation = StrictGeneration::deserialize(deserializer)?;
+    Ok(NativePanePresentationGeneration {
+        surface_id: generation.surface_id,
+        surface_epoch: generation.surface_epoch,
+        topology_epoch: generation.topology_epoch,
+        geometry_revision: generation.geometry_revision,
+        focus_revision: generation.focus_revision,
+        pane_instances: generation.pane_instances,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedPresentationHost {
+    pub host_surface_id: u32,
+    pub host_incarnation: String,
+    pub root_geometry_generation: u64,
+    #[serde(deserialize_with = "deserialize_rect")]
+    pub source_rect: OverlayRect,
+    #[serde(deserialize_with = "deserialize_rect")]
+    pub logical_rect: OverlayRect,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PresentationWindowRoute {
+    pub window_id: String,
+    pub renderer_surface_id: String,
+    pub host: ObservedPresentationHost,
+}
+
+impl PresentationWindowRoute {
+    pub fn validate(
+        &self,
+        surface_id: &str,
+        observed: &ObservedPresentationHost,
+    ) -> Result<(), String> {
+        if self.window_id.is_empty()
+            || self.renderer_surface_id != surface_id
+            || self.host != *observed
+        {
+            return Err("presentation window or observed host identity/transform is stale".into());
+        }
+        let source = observed.source_rect;
+        let logical = observed.logical_rect;
+        // v1 supports the observed full-host identity transform. An offset or
+        // scaled source needs a separately proven tiled/native transform too.
+        if observed.host_surface_id == 0
+            || observed.host_incarnation.is_empty()
+            || !valid_rect(source, (source.width, source.height))
+            || source.x != 0.0
+            || source.y != 0.0
+            || source != logical
+        {
+            return Err("presentation source-to-logical identity transform is unproven".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "host", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SelectedPane {
@@ -26,9 +128,13 @@ pub enum SelectedPane {
 pub struct PresentationRequest {
     pub version: u32,
     pub request_revision: u64,
+    #[serde(deserialize_with = "deserialize_generation")]
     pub presentation_generation: NativePanePresentationGeneration,
+    pub window_route: PresentationWindowRoute,
     pub selected: Option<SelectedPane>,
+    #[serde(default, deserialize_with = "deserialize_optional_rect")]
     pub overlay_rect: Option<OverlayRect>,
+    #[serde(default, deserialize_with = "deserialize_optional_rect")]
     pub content_rect: Option<OverlayRect>,
 }
 
@@ -36,8 +142,14 @@ pub struct PresentationRequest {
 pub struct PresentationAck {
     pub version: u32,
     pub request_revision: u64,
+    #[serde(deserialize_with = "deserialize_generation")]
     pub presentation_generation: NativePanePresentationGeneration,
+    pub window_route: PresentationWindowRoute,
     pub selected: Option<SelectedPane>,
+    #[serde(default, deserialize_with = "deserialize_optional_rect")]
+    pub overlay_rect: Option<OverlayRect>,
+    #[serde(default, deserialize_with = "deserialize_optional_rect")]
+    pub content_rect: Option<OverlayRect>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +166,19 @@ pub struct PresentationLedger {
 }
 
 impl PresentationLedger {
+    pub fn can_retire(&self, request: &PresentationRequest) -> bool {
+        request.selected.is_none()
+            && request.overlay_rect.is_none()
+            && request.content_rect.is_none()
+            && self
+                .entries
+                .get(&request.presentation_generation.surface_id)
+                .is_some_and(|previous| {
+                    previous.presentation_generation == request.presentation_generation
+                        && previous.window_route == request.window_route
+                        && request.request_revision > previous.request_revision
+                })
+    }
     pub fn accept(
         &mut self,
         request: PresentationRequest,
@@ -67,17 +192,7 @@ impl PresentationLedger {
         // A caller can retire its exact acknowledged selection after local
         // geometry/focus/topology advanced. This cannot select stale content,
         // replace a newer generation, or remove the monotonic replay fence.
-        if request.selected.is_none()
-            && request.overlay_rect.is_none()
-            && request.content_rect.is_none()
-            && self
-                .entries
-                .get(&generation.surface_id)
-                .is_some_and(|previous| {
-                    previous.presentation_generation == *generation
-                        && request.request_revision > previous.request_revision
-                })
-        {
+        if self.can_retire(&request) {
             let accepted = ack(&request);
             self.entries.insert(generation.surface_id.clone(), request);
             return Ok(accepted);
@@ -254,6 +369,16 @@ impl StatusSnapshot {
             })
     }
     pub fn presentation_input_at(&self, x: f64, y: f64) -> PresentationInput {
+        if self.pane_presentations.iter().any(|request| {
+            self.pane_presentation_host.as_ref().is_none_or(|host| {
+                request
+                    .window_route
+                    .validate(&request.presentation_generation.surface_id, host)
+                    .is_err()
+            })
+        }) {
+            return PresentationInput::Renderer;
+        }
         match self.pane_presentations.as_slice() {
             [] => PresentationInput::Normal,
             [request] => request.input_at(x, y),
@@ -263,9 +388,19 @@ impl StatusSnapshot {
         }
     }
     pub fn presentation_native_visible(&self, pane_id: &str) -> bool {
-        self.pane_presentations
-            .iter()
-            .all(|request| request.native_visible(pane_id))
+        self.pane_presentations.iter().all(|request| {
+            request.native_visible(pane_id)
+                && (!request
+                    .presentation_generation
+                    .pane_instances
+                    .contains_key(pane_id)
+                    || self.pane_presentation_host.as_ref().is_some_and(|host| {
+                        request
+                            .window_route
+                            .validate(&request.presentation_generation.surface_id, host)
+                            .is_ok()
+                    }))
+        })
     }
 
     pub fn presentation_revisions(&self) -> Vec<(String, String, u64)> {
@@ -298,7 +433,31 @@ fn ack(request: &PresentationRequest) -> PresentationAck {
         version: CAPABILITY_VERSION,
         request_revision: request.request_revision,
         presentation_generation: request.presentation_generation.clone(),
+        window_route: request.window_route.clone(),
         selected: request.selected.clone(),
+        overlay_rect: request.overlay_rect,
+        content_rect: request.content_rect,
+    }
+}
+
+#[cfg(test)]
+pub fn test_window_route(surface: &str, width: f64, height: f64) -> PresentationWindowRoute {
+    let rect = OverlayRect {
+        x: 0.0,
+        y: 0.0,
+        width,
+        height,
+    };
+    PresentationWindowRoute {
+        window_id: format!("window:{surface}"),
+        renderer_surface_id: surface.into(),
+        host: ObservedPresentationHost {
+            host_surface_id: 99,
+            host_incarnation: "fixture-host".into(),
+            root_geometry_generation: 0,
+            source_rect: rect,
+            logical_rect: rect,
+        },
     }
 }
 
@@ -329,6 +488,7 @@ mod tests {
     fn request(revision: u64) -> PresentationRequest {
         PresentationRequest {
             version: 1,
+            window_route: test_window_route("s", 1000.0, 700.0),
             request_revision: revision,
             presentation_generation: NativePanePresentationGeneration {
                 surface_id: "s".into(),

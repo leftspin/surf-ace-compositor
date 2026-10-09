@@ -9270,6 +9270,9 @@ impl RuntimeWaylandState {
     }
 
     fn sync_runtime_status_with_roles(&self) {
+        // Observation must not activate geometry or invoke the legacy output
+        // fallback during host startup. Without a committed basis v1 is absent.
+        let root = self.root_geometry_snapshot();
         let main_id = self
             .main_toplevel
             .as_ref()
@@ -9285,6 +9288,38 @@ impl RuntimeWaylandState {
             None
         };
         state.set_runtime_surface_roles(main_id, overlay_id, overlay_pane);
+        let source = self.main_toplevel.as_ref().zip(root).map(|(main, root)| {
+            let rect = toplevel_surface_source_rect(main);
+            (
+                surface_key(main.wl_surface()),
+                crate::model::OverlayRect {
+                    x: f64::from(rect.loc.x),
+                    y: f64::from(rect.loc.y),
+                    width: f64::from(rect.size.w),
+                    height: f64::from(rect.size.h),
+                },
+                crate::model::OverlayRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: root.logical_size.width,
+                    height: root.logical_size.height,
+                },
+            )
+        });
+        let (key, source_rect, logical_rect) = source.map_or(
+            (
+                None,
+                None,
+                crate::model::OverlayRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                },
+            ),
+            |(key, rect, logical)| (Some(key), Some(rect), logical),
+        );
+        state.observe_presentation_host(key, source_rect, logical_rect);
     }
 
     fn prune_dead_surfaces(&mut self) {
@@ -14181,10 +14216,20 @@ mod tests {
                 .record_native_pane_presentation_generation(generation.clone())
                 .unwrap();
             let size = state.status_snapshot().runtime;
+            let mut route = crate::pane_presentation::test_window_route(
+                "surface",
+                f64::from(size.logical_surface_width.unwrap()),
+                f64::from(size.logical_surface_height.unwrap()),
+            );
+            route.host.root_geometry_generation = state
+                .root_geometry_snapshot()
+                .map_or(0, |root| root.generation);
+            state.set_test_presentation_host(route.host.clone());
             let request = crate::pane_presentation::PresentationRequest {
                 version: 1,
                 request_revision: 1,
                 presentation_generation: generation,
+                window_route: route,
                 selected: Some(crate::pane_presentation::SelectedPane::Renderer {
                     renderer_pane_id: 8,
                     pane_lineage_id: "renderer-lineage-8".into(),
@@ -14224,7 +14269,7 @@ mod tests {
         assert!(
             !lock_state(&shared_state).runtime_focus_native_pane_from_compositor(&pane_id, true)
         );
-        let mut restore = presentation;
+        let mut restore = presentation.clone();
         restore.request_revision = 2;
         restore.selected = None;
         restore.overlay_rect = None;
@@ -14243,7 +14288,62 @@ mod tests {
                 )
                 .is_some_and(|(surface, _)| same_surface(&surface, popup.wl_surface()))
         );
+        // Use real backend ObjectIds to prove incarnation fencing independently
+        // of the protocol surface number. Host-role coordinates remain injected
+        // fixture evidence here, not a production main-window acceptance claim.
+        {
+            let parent = popup.get_parent_surface().unwrap();
+            let key = super::surface_key(&parent);
+            let replacement = super::surface_key(popup.wl_surface());
+            assert_ne!(key, replacement);
+            let mut state = lock_state(&shared_state);
+            state.set_runtime_surface_roles(Some(super::surface_id(&parent)), None, None);
+            let rect = presentation.window_route.host.source_rect;
+            state.observe_presentation_host(Some(key.clone()), Some(rect), rect);
+            let observed = state.status_snapshot().pane_presentation_host.unwrap();
+            state.observe_presentation_host(Some(key), Some(rect), rect);
+            assert_eq!(
+                state.status_snapshot().pane_presentation_host,
+                Some(observed.clone())
+            );
+            let mut selected = presentation.clone();
+            selected.request_revision = 3;
+            selected.window_route.host = observed.clone();
+            state.set_pane_presentation(selected.clone()).unwrap();
+            state.observe_presentation_host(Some(replacement), Some(rect), rect);
+            let replaced = state.status_snapshot();
+            assert!(replaced.pane_presentations.is_empty());
+            assert_ne!(
+                replaced.pane_presentation_host.unwrap().host_incarnation,
+                observed.host_incarnation
+            );
+            selected.request_revision = 4;
+            assert!(
+                state.set_pane_presentation(selected).is_err(),
+                "old backend host cannot regain presentation"
+            );
+        }
         release_client.send(()).unwrap();
+    }
+
+    #[test]
+    fn pane_presentation_observation_before_host_geometry_is_unavailable() {
+        let shared_state = Arc::new(Mutex::new(CompositorState::new(
+            false,
+            Box::new(NoopProcessController::default()),
+        )));
+        let display: Display<RuntimeWaylandState> = Display::new().unwrap();
+        let wayland =
+            RuntimeWaylandState::new(display.handle(), Arc::clone(&shared_state)).unwrap();
+        // Model the host transition before its first committed root. Construct
+        // the Wayland globals with the ordinary non-host setup first.
+        *lock_state(&shared_state) =
+            CompositorState::new(true, Box::new(NoopProcessController::default()));
+        assert!(wayland.root_geometry_snapshot().is_none());
+        wayland.sync_runtime_status_with_roles();
+        let status = lock_state(&shared_state).status_snapshot();
+        assert!(status.pane_presentation_host.is_none());
+        assert!(status.pane_presentations.is_empty());
     }
 
     #[test]

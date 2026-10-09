@@ -878,6 +878,8 @@ impl Default for RuntimeStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusSnapshot {
     #[serde(default)]
+    pub pane_presentation_host: Option<crate::pane_presentation::ObservedPresentationHost>,
+    #[serde(default)]
     pub capabilities: BTreeMap<String, u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pane_presentations: Vec<crate::pane_presentation::PresentationRequest>,

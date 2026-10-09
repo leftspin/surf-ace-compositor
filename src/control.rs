@@ -893,6 +893,7 @@ mod tests {
     fn pane_presentation_wire_request_is_explicit_and_rejects_unknown_fields() {
         let wire = serde_json::json!({
             "type": "pane_presentation.set", "request": {"version": 1, "request_revision": 1,
+            "window_route": crate::pane_presentation::test_window_route("s", 1000.0, 700.0),
             "presentation_generation": {
                 "surface_id": "s", "surface_epoch": "s:1", "topology_epoch": 2,
                 "geometry_revision": 3, "focus_revision": 4, "pane_instances": {}
@@ -902,6 +903,15 @@ mod tests {
         let parsed: ControlRequest = serde_json::from_value(wire.clone()).unwrap();
         assert!(matches!(parsed, ControlRequest::PanePresentationSet { .. }));
         assert_eq!(serde_json::to_value(parsed).unwrap(), wire);
+        for field in ["presentation_generation", "window_route"] {
+            let mut unsupported = wire.clone();
+            unsupported["request"][field]["ignored_hint"] = serde_json::json!(true);
+            assert!(serde_json::from_value::<ControlRequest>(unsupported).is_err());
+        }
+        let mut unsupported_rect = wire.clone();
+        unsupported_rect["request"]["window_route"]["host"]["source_rect"]["rotation"] =
+            serde_json::json!(90);
+        assert!(serde_json::from_value::<ControlRequest>(unsupported_rect).is_err());
         let mut unsupported = wire;
         unsupported["request"]["ignored_presentation"] = serde_json::json!(true);
         assert!(serde_json::from_value::<ControlRequest>(unsupported).is_err());
@@ -911,6 +921,7 @@ mod tests {
         let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         let request = crate::pane_presentation::PresentationRequest {
             version: 1,
+            window_route: crate::pane_presentation::test_window_route("s", 1000.0, 700.0),
             request_revision: 1,
             presentation_generation: NativePanePresentationGeneration {
                 surface_id: "s".into(),

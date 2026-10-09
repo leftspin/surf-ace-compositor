@@ -166,6 +166,10 @@ pub struct CompositorState {
     overlay_role_policy: OverlayRolePolicy,
     native_pane_presentation_generations: BTreeMap<String, NativePanePresentationGeneration>,
     pane_presentations: PresentationLedger,
+    presentation_host_key: Option<smithay::reexports::wayland_server::backend::ObjectId>,
+    presentation_host: Option<crate::pane_presentation::ObservedPresentationHost>,
+    presentation_window_owner: Option<(String, String)>,
+    presentation_host_counter: u64,
     native_pane_window_group_requests: BTreeMap<PaneId, NativePaneWindowGroupRequest>,
     runtime: RuntimeStatus,
     configured_sun_schedule_profile: Option<NodeSunScheduleProfile>,
@@ -651,6 +655,9 @@ impl CompositorState {
         self.runtime.active_focus_generation = None;
         self.native_pane_presentation_generations.clear();
         self.pane_presentations = PresentationLedger::default();
+        self.presentation_host_key = None;
+        self.presentation_host = None;
+        self.presentation_window_owner = None;
     }
 
     fn clear_host_runtime_route_status(&mut self) {
@@ -713,6 +720,10 @@ impl CompositorState {
             overlay_role_policy: OverlayRolePolicy::default(),
             native_pane_presentation_generations: BTreeMap::new(),
             pane_presentations: PresentationLedger::default(),
+            presentation_host_key: None,
+            presentation_host: None,
+            presentation_window_owner: None,
+            presentation_host_counter: 0,
             native_pane_window_group_requests: BTreeMap::new(),
             runtime: RuntimeStatus::default(),
             configured_sun_schedule_profile: None,
@@ -1282,9 +1293,71 @@ impl CompositorState {
         overlay_surface_id: Option<u32>,
         overlay_bound_pane_id: Option<PaneId>,
     ) {
+        if self.runtime.main_app_surface_id != main_app_surface_id {
+            self.presentation_host_key = None;
+            self.presentation_host = None;
+            self.presentation_window_owner = None;
+            self.pane_presentations = PresentationLedger::default();
+        }
         self.runtime.main_app_surface_id = main_app_surface_id;
         self.runtime.overlay_surface_id = overlay_surface_id;
         self.runtime.overlay_bound_pane_id = overlay_bound_pane_id;
+    }
+
+    pub fn observe_presentation_host(
+        &mut self,
+        key: Option<smithay::reexports::wayland_server::backend::ObjectId>,
+        source_rect: Option<OverlayRect>,
+        logical_rect: OverlayRect,
+    ) {
+        if key != self.presentation_host_key {
+            self.presentation_host_key = key;
+            self.presentation_host = None;
+            self.presentation_window_owner = None;
+            self.pane_presentations = PresentationLedger::default();
+        }
+        let (Some(_), Some(id), Some(source_rect)) = (
+            &self.presentation_host_key,
+            self.runtime.main_app_surface_id,
+            source_rect,
+        ) else {
+            self.presentation_host = None;
+            return;
+        };
+        let incarnation = self
+            .presentation_host
+            .as_ref()
+            .map(|host| host.host_incarnation.clone())
+            .unwrap_or_else(|| {
+                self.presentation_host_counter = self.presentation_host_counter.saturating_add(1);
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or_default();
+                format!(
+                    "sa-presentation-host-{}-{}-{}",
+                    std::process::id(),
+                    now,
+                    self.presentation_host_counter
+                )
+            });
+        self.presentation_host = Some(crate::pane_presentation::ObservedPresentationHost {
+            host_surface_id: id,
+            host_incarnation: incarnation,
+            root_geometry_generation: self
+                .root_geometry_snapshot()
+                .map_or(0, |root| root.generation),
+            source_rect,
+            logical_rect,
+        });
+    }
+
+    #[cfg(test)]
+    pub fn set_test_presentation_host(
+        &mut self,
+        host: crate::pane_presentation::ObservedPresentationHost,
+    ) {
+        self.presentation_host = Some(host);
     }
 
     pub fn set_overlay_regions(
@@ -1515,6 +1588,38 @@ impl CompositorState {
         if self.runtime.main_app_surface_id.is_none() {
             return Err("pane presentation requires a bound main-app surface".into());
         }
+        let host = self
+            .presentation_host
+            .as_ref()
+            .ok_or("presentation main host has no observed coordinate transform")?;
+        let retiring = self.pane_presentations.can_retire(&request)
+            && host.host_incarnation == request.window_route.host.host_incarnation
+            && host.host_surface_id == request.window_route.host.host_surface_id;
+        if !retiring {
+            request
+                .window_route
+                .validate(&request.presentation_generation.surface_id, host)?;
+            if self
+                .root_geometry_snapshot()
+                .map_or(0, |root| root.generation)
+                != host.root_geometry_generation
+            {
+                return Err(
+                    "presentation root transform has not been observed at current geometry".into(),
+                );
+            }
+        }
+        let owner = (
+            request.window_route.window_id.clone(),
+            request.window_route.renderer_surface_id.clone(),
+        );
+        if self
+            .presentation_window_owner
+            .as_ref()
+            .is_some_and(|current| current != &owner)
+        {
+            return Err("bound presentation host already belongs to another window".into());
+        }
         let current = self
             .native_pane_presentation_generations
             .get(&request.presentation_generation.surface_id)
@@ -1539,8 +1644,19 @@ impl CompositorState {
         let (width, height) = self
             .runtime_logical_surface_size()
             .ok_or("missing logical surface size")?;
-        self.pane_presentations
-            .accept(request, current, (f64::from(width), f64::from(height)))
+        if !retiring
+            && (host.logical_rect.width != f64::from(width)
+                || host.logical_rect.height != f64::from(height))
+        {
+            return Err("observed host transform does not match logical output".into());
+        }
+        let accepted = self.pane_presentations.accept(
+            request,
+            current,
+            (f64::from(width), f64::from(height)),
+        )?;
+        self.presentation_window_owner = Some(owner);
+        Ok(accepted)
     }
 
     pub fn record_native_pane_presentation_generation(
@@ -2799,6 +2915,17 @@ impl CompositorState {
             self.pane_presentations
                 .active_requests(&self.native_pane_presentation_generations)
                 .into_iter()
+                .filter(|request| {
+                    self.presentation_host.as_ref().is_some_and(|host| {
+                        request.window_route.host.host_surface_id == host.host_surface_id
+                            && request.window_route.host.host_incarnation == host.host_incarnation
+                    }) && self.presentation_window_owner.as_ref().is_some_and(
+                        |(window, surface)| {
+                            window == &request.window_route.window_id
+                                && surface == &request.window_route.renderer_surface_id
+                        },
+                    )
+                })
                 .filter(|request| match &request.selected {
                     Some(SelectedPane::Native {
                         native_pane_id,
@@ -2870,6 +2997,10 @@ impl CompositorState {
         let native_pane_window_groups = self.native_pane_window_groups_status();
 
         StatusSnapshot {
+            pane_presentation_host: self
+                .presentation_host
+                .clone()
+                .filter(|host| self.runtime.main_app_surface_id == Some(host.host_surface_id)),
             // Advertise only after the rendering and input consumers are wired.
             capabilities: BTreeMap::new(),
             pane_presentations,
@@ -3709,8 +3840,18 @@ mod tests {
             .unwrap();
         let (width, height) = state.runtime_logical_surface_size().unwrap();
         let displayed_width = f64::from(width) - 24.0;
+        let mut route = crate::pane_presentation::test_window_route(
+            "surface",
+            f64::from(width),
+            f64::from(height),
+        );
+        route.host.root_geometry_generation = state
+            .root_geometry_snapshot()
+            .map_or(0, |root| root.generation);
+        state.set_test_presentation_host(route.host.clone());
         let request = PresentationRequest {
             version: 1,
+            window_route: route,
             request_revision: 1,
             presentation_generation: generation,
             selected: Some(SelectedPane::Native {
@@ -3759,6 +3900,69 @@ mod tests {
             shown.presentation_input_at(400.0, 200.0),
             crate::pane_presentation::PresentationInput::Native(id.0.clone())
         );
+        for field in [
+            "host",
+            "incarnation",
+            "generation",
+            "window",
+            "surface",
+            "transform",
+        ] {
+            let mut foreign = request.clone();
+            foreign.request_revision += 1;
+            match field {
+                "host" => foreign.window_route.host.host_surface_id += 1,
+                "incarnation" => foreign.window_route.host.host_incarnation = "old-host".into(),
+                "generation" => foreign.window_route.host.root_geometry_generation += 1,
+                "window" => foreign.window_route.window_id = "another-window".into(),
+                "surface" => foreign.window_route.renderer_surface_id = "another-surface".into(),
+                _ => foreign.window_route.host.source_rect.width += 1.0,
+            }
+            assert!(
+                state.set_pane_presentation(foreign).is_err(),
+                "{field} must reject"
+            );
+            assert_eq!(
+                state.status_snapshot().pane_presentations,
+                shown.pane_presentations
+            );
+        }
+        let mut second_window = request.clone();
+        second_window.presentation_generation.surface_id = "window-b".into();
+        second_window.presentation_generation.pane_instances.clear();
+        second_window.window_route.window_id = "electron-window:2".into();
+        second_window.window_route.renderer_surface_id = "window-b".into();
+        second_window.selected = Some(SelectedPane::Renderer {
+            renderer_pane_id: 9,
+            pane_lineage_id: "window-b-lineage".into(),
+        });
+        state
+            .record_native_pane_presentation_generation(
+                second_window.presentation_generation.clone(),
+            )
+            .unwrap();
+        assert!(
+            state
+                .set_pane_presentation(second_window)
+                .unwrap_err()
+                .contains("another window")
+        );
+        assert_eq!(
+            state.status_snapshot().pane_presentations,
+            shown.pane_presentations
+        );
+        let mut resized_host = request.window_route.host.clone();
+        resized_host.source_rect.width += 1.0;
+        state.set_test_presentation_host(resized_host);
+        let shielded = state.status_snapshot();
+        assert_eq!(
+            shielded.presentation_input_at(400.0, 200.0),
+            crate::pane_presentation::PresentationInput::Renderer
+        );
+        assert!(
+            !shielded.presentation_native_visible(&id.0),
+            "unproven transform cannot draw selected native content"
+        );
         let mut restore = request;
         restore.request_revision = 2;
         restore.selected = None;
@@ -3779,6 +3983,7 @@ mod tests {
             let selected = format!("{surface}:1");
             PresentationRequest {
                 version: 1,
+                window_route: crate::pane_presentation::test_window_route(surface, 1000.0, 700.0),
                 request_revision: 1,
                 presentation_generation: NativePanePresentationGeneration {
                     surface_id: surface.into(),
@@ -3813,6 +4018,7 @@ mod tests {
         };
         let a = request("window-a", 10.0);
         let b = request("window-b", 510.0);
+        status.pane_presentation_host = Some(a.window_route.host.clone());
         status.pane_presentations = vec![a.clone(), b.clone()];
         assert_eq!(
             status.presentation_native_content_rect("window-a:1"),
