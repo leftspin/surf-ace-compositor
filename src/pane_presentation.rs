@@ -1,6 +1,6 @@
 //! Ephemeral presentation policy. Callers validate the bound main-app source;
 //! this module fences its generation and keeps tiled geometry out of the ledger.
-use crate::model::{NativePanePresentationGeneration, OverlayRect};
+use crate::model::{NativePanePresentationGeneration, OverlayRect, PaneGeometry, StatusSnapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -182,6 +182,22 @@ impl PresentationLedger {
 }
 
 impl PresentationRequest {
+    pub fn displayed_geometry(&self, pane_id: &str, tiled: PaneGeometry) -> PaneGeometry {
+        match (&self.selected, self.content_rect) {
+            (Some(SelectedPane::Native { native_pane_id, .. }), Some(rect))
+                if native_pane_id == pane_id =>
+            {
+                PaneGeometry {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                    coordinate_space: tiled.coordinate_space,
+                }
+            }
+            _ => tiled,
+        }
+    }
     pub fn native_visible(&self, pane_id: &str) -> bool {
         if !self
             .presentation_generation
@@ -209,6 +225,36 @@ impl PresentationRequest {
             }
             Some(_) => PresentationInput::Renderer,
         }
+    }
+}
+
+impl StatusSnapshot {
+    pub fn presentation_input_at(&self, x: f64, y: f64) -> PresentationInput {
+        match self.pane_presentations.as_slice() {
+            [] => PresentationInput::Normal,
+            [request] => request.input_at(x, y),
+            // A single bound main-app host cannot disambiguate multiple renderer
+            // window-local coordinates. Fail closed until the caller routes them.
+            _ => PresentationInput::Renderer,
+        }
+    }
+    pub fn presentation_native_visible(&self, pane_id: &str) -> bool {
+        self.pane_presentations
+            .iter()
+            .all(|request| request.native_visible(pane_id))
+    }
+
+    pub fn presentation_revisions(&self) -> Vec<(String, String, u64)> {
+        self.pane_presentations
+            .iter()
+            .map(|request| {
+                (
+                    request.presentation_generation.surface_id.clone(),
+                    request.presentation_generation.surface_epoch.clone(),
+                    request.request_revision,
+                )
+            })
+            .collect()
     }
 }
 
@@ -301,6 +347,28 @@ mod tests {
             PresentationInput::Native("s:1".into())
         );
         assert_eq!(req.input_at(2.0, 2.0), PresentationInput::Renderer);
+    }
+    #[test]
+    fn displayed_geometry_expands_only_selected_host_and_restore_uses_original_tile() {
+        let selected = request(1);
+        let tiled = PaneGeometry {
+            x: 0.0,
+            y: 0.0,
+            width: 200.0,
+            height: 400.0,
+            coordinate_space: crate::model::PaneGeometryCoordinateSpace::CompositorLogical,
+        };
+        let displayed = selected.displayed_geometry("s:1", tiled);
+        assert_eq!(displayed.width, 976.0);
+        assert_eq!(displayed.x, 12.0);
+        assert_eq!(selected.displayed_geometry("s:9", tiled), tiled);
+        assert_eq!(selected.displayed_geometry("other:1", tiled), tiled);
+        let mut restored = selected;
+        restored.selected = None;
+        restored.content_rect = None;
+        restored.overlay_rect = None;
+        assert_eq!(restored.displayed_geometry("s:1", tiled), tiled);
+        assert_eq!(tiled.width, 200.0);
     }
     #[test]
     fn renderer_selection_masks_native_visuals_and_all_native_input() {

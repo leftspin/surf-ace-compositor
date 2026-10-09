@@ -1570,6 +1570,14 @@ impl CompositorState {
         target: Option<RuntimeFocusTarget>,
         generation: NativePaneFocusGeneration,
     ) -> Result<(), String> {
+        if let Some(RuntimeFocusTarget::NativePane { pane_id }) = &target {
+            if !self
+                .status_snapshot()
+                .presentation_native_visible(&pane_id.0)
+            {
+                return Err("covered native pane cannot receive presentation focus".into());
+            }
+        }
         let Some(presentation) = self
             .native_pane_presentation_generations
             .get_mut(&generation.surface_id)
@@ -1616,6 +1624,12 @@ impl CompositorState {
         pane_id: &PaneId,
         advance_focus_revision: bool,
     ) -> bool {
+        if !self
+            .status_snapshot()
+            .presentation_native_visible(&pane_id.0)
+        {
+            return false;
+        }
         let presentation_id = self.native_pane_presentation_generations.iter().find_map(
             |(surface_id, presentation)| {
                 presentation
@@ -2781,12 +2795,39 @@ impl CompositorState {
     }
 
     pub fn status_snapshot(&self) -> StatusSnapshot {
+        let pane_presentations = if self.runtime.main_app_surface_id.is_some() {
+            self.pane_presentations
+                .active_requests(&self.native_pane_presentation_generations)
+                .into_iter()
+                .filter(|request| match &request.selected {
+                    Some(SelectedPane::Native {
+                        native_pane_id,
+                        native_pane_instance_id,
+                        ..
+                    }) => {
+                        let id = PaneId::new(native_pane_id.clone());
+                        self.panes.get(&id).is_some_and(|pane| {
+                            pane_retains_overlay_regions(pane)
+                                && pane_instance_id(&id, pane) == *native_pane_instance_id
+                        })
+                    }
+                    _ => true,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let mut panes: Vec<PaneStatus> = self
             .panes
             .iter()
             .map(|(id, state)| PaneStatus {
                 id: id.clone(),
-                geometry: state.geometry,
+                // Presentation never rewrites retained tiled geometry in PaneRuntimeState.
+                geometry: pane_presentations
+                    .iter()
+                    .fold(state.geometry, |geometry, request| {
+                        request.displayed_geometry(&id.0, geometry)
+                    }),
                 viewport: self.root4_pane_viewports.get(id).cloned(),
                 render_mode: state.render_mode.clone(),
                 external_native_state: state.external_native_state.clone(),
@@ -2831,12 +2872,7 @@ impl CompositorState {
         StatusSnapshot {
             // Advertise only after the rendering and input consumers are wired.
             capabilities: BTreeMap::new(),
-            pane_presentations: if self.runtime.main_app_surface_id.is_some() {
-                self.pane_presentations
-                    .active_requests(&self.native_pane_presentation_generations)
-            } else {
-                Vec::new()
-            },
+            pane_presentations,
             host_mode_active: self.host_mode_active,
             output_rotation: self.output_rotation,
             display_scale: self
@@ -3629,6 +3665,100 @@ mod tests {
                 coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
             },
         }
+    }
+
+    #[test]
+    fn pane_presentation_projects_display_without_rewriting_tile_or_native_host() {
+        let mut state = CompositorState::new(true, Box::new(FakeProcessController::default()));
+        state.mark_runtime_resize(1280, 720);
+        state.runtime.main_app_surface_id = Some(99);
+        let id = PaneId::new("surface:7");
+        let tiled = PaneGeometry {
+            x: 40.0,
+            y: 20.0,
+            width: 320.0,
+            height: 300.0,
+            coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+        };
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: id.clone(),
+                content_id: Some("content-7".into()),
+                binding_id: Some("binding-7".into()),
+                launch_token: Some("launch-7".into()),
+                revision: 1,
+                geometry: tiled,
+                window_group: None,
+                target: NativeTargetClass::Terminal,
+                process: terminal_process(),
+            }])
+            .unwrap();
+        state.launch_native_pane_hosts(vec![id.clone()]).unwrap();
+        let before = state.status_snapshot().panes[0].clone();
+        let instance = pane_instance_id(&id, &state.panes[&id]);
+        let generation = NativePanePresentationGeneration {
+            surface_id: "surface".into(),
+            surface_epoch: "surface:1".into(),
+            topology_epoch: 3,
+            geometry_revision: 5,
+            focus_revision: 8,
+            pane_instances: BTreeMap::from([(id.0.clone(), instance.clone())]),
+        };
+        state
+            .record_native_pane_presentation_generation(generation.clone())
+            .unwrap();
+        let (width, height) = state.runtime_logical_surface_size().unwrap();
+        let displayed_width = f64::from(width) - 24.0;
+        let request = PresentationRequest {
+            version: 1,
+            request_revision: 1,
+            presentation_generation: generation,
+            selected: Some(SelectedPane::Native {
+                renderer_pane_id: 7,
+                pane_lineage_id: "lineage-7".into(),
+                native_pane_id: id.0.clone(),
+                native_pane_instance_id: instance,
+            }),
+            overlay_rect: Some(OverlayRect {
+                x: 10.0,
+                y: 10.0,
+                width: f64::from(width) - 20.0,
+                height: f64::from(height) - 20.0,
+            }),
+            content_rect: Some(OverlayRect {
+                x: 12.0,
+                y: 42.0,
+                width: displayed_width,
+                height: f64::from(height) - 54.0,
+            }),
+        };
+        state.set_pane_presentation(request.clone()).unwrap();
+        let shown = state.status_snapshot();
+        assert_eq!(shown.panes[0].geometry.width, displayed_width);
+        assert_eq!(state.panes[&id].geometry, tiled);
+        assert_eq!(shown.panes[0].native_host, before.native_host);
+        assert_eq!(
+            shown.panes[0].external_native_state,
+            before.external_native_state
+        );
+        assert_eq!(
+            shown.presentation_input_at(2.0, 2.0),
+            crate::pane_presentation::PresentationInput::Renderer
+        );
+        assert_eq!(
+            shown.presentation_input_at(400.0, 200.0),
+            crate::pane_presentation::PresentationInput::Native(id.0.clone())
+        );
+        let mut restore = request;
+        restore.request_revision = 2;
+        restore.selected = None;
+        restore.overlay_rect = None;
+        restore.content_rect = None;
+        state.set_pane_presentation(restore).unwrap();
+        let restored = state.status_snapshot();
+        assert_eq!(restored.panes[0].geometry, tiled);
+        assert_eq!(restored.panes[0].native_host, before.native_host);
+        assert!(restored.pane_presentations.is_empty());
     }
 
     fn terminal_process() -> ProcessSpec {

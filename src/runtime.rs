@@ -6071,6 +6071,7 @@ struct RuntimeWaylandState {
     backend_output_size: Size<i32, Physical>,
     applied_output_rotation: OutputRotation,
     applied_root_geometry_generation: u64,
+    applied_pane_presentation_revisions: Vec<(String, String, u64)>,
     staged_root_geometry: Option<HostPresentationTransaction>,
     presentation_root_geometry: Option<HostPresentationTransaction>,
     active_root_geometry_consumers: Option<HostPresentationTransaction>,
@@ -7370,6 +7371,7 @@ impl RuntimeWaylandState {
             applied_output_rotation,
             applied_root_geometry_generation,
             staged_root_geometry: None,
+            applied_pane_presentation_revisions: Vec::new(),
             presentation_root_geometry: None,
             active_root_geometry_consumers,
             native_clip_program: None,
@@ -7725,10 +7727,16 @@ impl RuntimeWaylandState {
     fn apply_focus_route(&mut self) {
         let (requested_target, shell_overlay_focus_requested) = {
             let state = lock_state(&self.shared_state);
-            (
-                state.status_snapshot().runtime.active_focus_target,
-                state.shell_overlay_focus_requested(),
-            )
+            let status = state.status_snapshot();
+            let target = match status.runtime.active_focus_target.clone() {
+                Some(RuntimeFocusTarget::NativePane { pane_id })
+                    if !status.presentation_native_visible(&pane_id.0) =>
+                {
+                    Some(RuntimeFocusTarget::MainApp)
+                }
+                target => target,
+            };
+            (target, state.shell_overlay_focus_requested())
         };
         let requested_native_owner_disappeared = matches!(
             requested_target.as_ref(),
@@ -7874,7 +7882,11 @@ impl RuntimeWaylandState {
     }
 
     fn native_pane_surface_is_visible(&self, pane_id: &PaneId, mapped: bool) -> bool {
-        mapped && self.native_pane_is_keyboard_focused(pane_id)
+        mapped
+            && self.native_pane_is_keyboard_focused(pane_id)
+            && lock_state(&self.shared_state)
+                .status_snapshot()
+                .presentation_native_visible(&pane_id.0)
     }
 
     fn native_pane_accessory_rect(
@@ -8617,6 +8629,25 @@ impl RuntimeWaylandState {
         capture: OverlayCaptureCapability,
         status: &crate::model::StatusSnapshot,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        let presentation_input = status.presentation_input_at(pos.x, pos.y);
+        if presentation_input != crate::pane_presentation::PresentationInput::Normal
+            && (presentation_input == crate::pane_presentation::PresentationInput::Renderer
+                || overlay_region_capture_contains(
+                    &status.overlay_regions.regions,
+                    pos,
+                    capture.clone(),
+                ))
+        {
+            return self.main_toplevel.as_ref().map(|main| {
+                let size = self.runtime_output_size();
+                let rect = Rectangle::new((0, 0).into(), size);
+                let origin = self
+                    .role_surface_mapping(RuntimeSurfaceRole::MainApp, rect)
+                    .map(RoleSurfaceMapping::focus_origin)
+                    .unwrap_or_else(|| (0.0, 0.0).into());
+                (main.wl_surface().clone(), origin)
+            });
+        }
         let pane_rect = |pane_id: &PaneId| {
             status
                 .panes
@@ -8629,7 +8660,9 @@ impl RuntimeWaylandState {
             let RuntimeSurfaceRole::NativePane(pane_id) = &popup.owner_role else {
                 continue;
             };
-            if !self.native_pane_surface_is_visible(pane_id, popup.mapped) {
+            if !status.presentation_native_visible(&pane_id.0)
+                || !self.native_pane_surface_is_visible(pane_id, popup.mapped)
+            {
                 continue;
             }
             let local = self.popup_geometry_local(&popup.surface);
@@ -8667,7 +8700,9 @@ impl RuntimeWaylandState {
         }
 
         for accessory in self.native_pane_accessories.iter().rev() {
-            if !self.native_pane_surface_is_visible(&accessory.pane_id, accessory.mapped) {
+            if !status.presentation_native_visible(&accessory.pane_id.0)
+                || !self.native_pane_surface_is_visible(&accessory.pane_id, accessory.mapped)
+            {
                 continue;
             }
             let Some(rect) =
@@ -8738,6 +8773,9 @@ impl RuntimeWaylandState {
         }
 
         for (pane_id, native) in &self.native_pane_toplevels {
+            if !status.presentation_native_visible(&pane_id.0) {
+                continue;
+            }
             let Some(rect) = pane_rect(pane_id) else {
                 continue;
             };
@@ -9106,7 +9144,7 @@ impl RuntimeWaylandState {
     }
 
     fn sync_output_rotation_reconfigure_if_needed(&mut self) {
-        let (rotation, generation, active) = {
+        let (rotation, generation, active, presentation_revisions) = {
             let state = lock_state(&self.shared_state);
             let committed = state.root_geometry_projections();
             (
@@ -9125,13 +9163,17 @@ impl RuntimeWaylandState {
                         stage_runtime_root_geometry_consumers(&state, committed).ok()
                     }
                 }),
+                state.status_snapshot().presentation_revisions(),
             )
         };
-        if generation == self.applied_root_geometry_generation {
+        if generation == self.applied_root_geometry_generation
+            && presentation_revisions == self.applied_pane_presentation_revisions
+        {
             return;
         }
         self.applied_output_rotation = rotation;
         self.applied_root_geometry_generation = generation;
+        self.applied_pane_presentation_revisions = presentation_revisions;
         self.active_root_geometry_consumers = active;
         self.reconfigure_roles(self.backend_output_size.w, self.backend_output_size.h);
     }
@@ -9315,6 +9357,9 @@ impl RuntimeWaylandState {
         let mut native_pane_ids: Vec<_> = self.native_pane_toplevels.keys().cloned().collect();
         native_pane_ids.sort();
         for pane_id in native_pane_ids {
+            if !pinned_status.presentation_native_visible(&pane_id.0) {
+                continue;
+            }
             let Some(native) = self.native_pane_toplevels.get(&pane_id) else {
                 continue;
             };
@@ -9401,7 +9446,9 @@ impl RuntimeWaylandState {
         }
 
         for accessory in &self.native_pane_accessories {
-            if !self.native_pane_surface_is_visible(&accessory.pane_id, accessory.mapped) {
+            if !pinned_status.presentation_native_visible(&accessory.pane_id.0)
+                || !self.native_pane_surface_is_visible(&accessory.pane_id, accessory.mapped)
+            {
                 continue;
             }
             let Some(rect) =
@@ -9462,7 +9509,9 @@ impl RuntimeWaylandState {
             let RuntimeSurfaceRole::NativePane(ref pane_id) = popup.owner_role else {
                 continue;
             };
-            if !self.native_pane_surface_is_visible(pane_id, popup.mapped) {
+            if !pinned_status.presentation_native_visible(&pane_id.0)
+                || !self.native_pane_surface_is_visible(pane_id, popup.mapped)
+            {
                 continue;
             }
             let pane_origin = pinned_status
@@ -10004,6 +10053,9 @@ impl RuntimeWaylandState {
         let mut native_pane_ids: Vec<_> = self.native_pane_toplevels.keys().cloned().collect();
         native_pane_ids.sort();
         for pane_id in native_pane_ids {
+            if !status.presentation_native_visible(&pane_id.0) {
+                continue;
+            }
             let Some(native) = self.native_pane_toplevels.get(&pane_id) else {
                 continue;
             };
@@ -10026,7 +10078,9 @@ impl RuntimeWaylandState {
         }
 
         for accessory in &self.native_pane_accessories {
-            if !self.native_pane_surface_is_visible(&accessory.pane_id, accessory.mapped) {
+            if !status.presentation_native_visible(&accessory.pane_id.0)
+                || !self.native_pane_surface_is_visible(&accessory.pane_id, accessory.mapped)
+            {
                 continue;
             }
             if !self
@@ -10055,7 +10109,9 @@ impl RuntimeWaylandState {
                 continue;
             }
             if let RuntimeSurfaceRole::NativePane(pane_id) = &popup.owner_role {
-                if !self.native_pane_is_keyboard_focused(pane_id) {
+                if !status.presentation_native_visible(&pane_id.0)
+                    || !self.native_pane_is_keyboard_focused(pane_id)
+                {
                     continue;
                 }
             }
@@ -13959,6 +14015,89 @@ mod tests {
                 .iter()
                 .any(|member| member.id == popup_window_id && member.focused),
             "physical accessory click should focus the popup within its own pane group"
+        );
+        // Exercise the production visibility/hit path on the retained real
+        // Wayland popup. The renderer host role is synthetic in this socket-pair
+        // fixture; this proves native exclusion, not renderer pixel delivery.
+        let presentation = {
+            let mut state = lock_state(&shared_state);
+            state.set_runtime_surface_roles(Some(99), None, None);
+            let generation = crate::model::NativePanePresentationGeneration {
+                surface_id: "surface".into(),
+                surface_epoch: "surface:1".into(),
+                topology_epoch: 1,
+                geometry_revision: 1,
+                focus_revision: 1,
+                pane_instances: std::collections::BTreeMap::from([(
+                    pane_id.0.clone(),
+                    "dialog-pane-binding".into(),
+                )]),
+            };
+            state
+                .record_native_pane_presentation_generation(generation.clone())
+                .unwrap();
+            let size = state.status_snapshot().runtime;
+            let request = crate::pane_presentation::PresentationRequest {
+                version: 1,
+                request_revision: 1,
+                presentation_generation: generation,
+                selected: Some(crate::pane_presentation::SelectedPane::Renderer {
+                    renderer_pane_id: 8,
+                    pane_lineage_id: "renderer-lineage-8".into(),
+                }),
+                overlay_rect: Some(OverlayRect {
+                    x: 8.0,
+                    y: 8.0,
+                    width: f64::from(size.logical_surface_width.unwrap()) - 16.0,
+                    height: f64::from(size.logical_surface_height.unwrap()) - 16.0,
+                }),
+                content_rect: Some(OverlayRect {
+                    x: 10.0,
+                    y: 10.0,
+                    width: 200.0,
+                    height: 200.0,
+                }),
+            };
+            state.set_pane_presentation(request.clone()).unwrap();
+            request
+        };
+        let covered = lock_state(&shared_state).status_snapshot();
+        assert!(!wayland.native_pane_surface_is_visible(&pane_id, true));
+        assert!(
+            wayland
+                .surface_under_point_for_capture(
+                    popup_center,
+                    OverlayCaptureCapability::PointerButton,
+                    &covered,
+                )
+                .is_none(),
+            "covered real popup cannot receive native input"
+        );
+        assert!(wayland.popups.iter().any(|candidate| same_surface(
+            candidate.surface.wl_surface(),
+            popup.wl_surface()
+        ) && candidate.mapped));
+        assert!(
+            !lock_state(&shared_state).runtime_focus_native_pane_from_compositor(&pane_id, true)
+        );
+        let mut restore = presentation;
+        restore.request_revision = 2;
+        restore.selected = None;
+        restore.overlay_rect = None;
+        restore.content_rect = None;
+        lock_state(&shared_state)
+            .set_pane_presentation(restore)
+            .unwrap();
+        let restored = lock_state(&shared_state).status_snapshot();
+        assert!(wayland.native_pane_surface_is_visible(&pane_id, true));
+        assert!(
+            wayland
+                .surface_under_point_for_capture(
+                    popup_center,
+                    OverlayCaptureCapability::PointerButton,
+                    &restored,
+                )
+                .is_some_and(|(surface, _)| same_surface(&surface, popup.wl_surface()))
         );
         release_client.send(()).unwrap();
     }
