@@ -6785,6 +6785,7 @@ struct SurfaceBufferSnapshot {
 }
 
 struct HostSceneSurface {
+    presentation_clip: Option<crate::model::OverlayRect>,
     buffer: wl_buffer::WlBuffer,
     kind: SurfaceBufferKind,
     target: Rectangle<i32, Logical>,
@@ -10191,6 +10192,7 @@ impl RuntimeWaylandState {
                     main.wl_surface(),
                     (0, 0).into(),
                     mapping,
+                    None,
                     &mut surfaces,
                 );
             }
@@ -10202,6 +10204,7 @@ impl RuntimeWaylandState {
                     overlay.wl_surface(),
                     (0, 0).into(),
                     mapping,
+                    None,
                     &mut surfaces,
                 );
             }
@@ -10229,6 +10232,7 @@ impl RuntimeWaylandState {
                     native.wl_surface(),
                     (0, 0).into(),
                     mapping,
+                    status.presentation_native_content_rect(&pane_id.0),
                     &mut surfaces,
                 );
             }
@@ -10263,6 +10267,7 @@ impl RuntimeWaylandState {
                 accessory.surface.wl_surface(),
                 (0, 0).into(),
                 mapping,
+                status.presentation_native_content_rect(&accessory.pane_id.0),
                 &mut surfaces,
             );
         }
@@ -10341,6 +10346,12 @@ impl RuntimeWaylandState {
                 }
             };
             surfaces.push(HostSceneSurface {
+                presentation_clip: match &popup.owner_role {
+                    RuntimeSurfaceRole::NativePane(pane_id) => {
+                        status.presentation_native_content_rect(&pane_id.0)
+                    }
+                    _ => None,
+                },
                 buffer: snapshot.buffer.clone(),
                 kind: snapshot.kind,
                 target,
@@ -10358,6 +10369,7 @@ impl RuntimeWaylandState {
         surface: &WlSurface,
         base_loc: Point<i32, Logical>,
         mapping: RoleSurfaceMapping,
+        presentation_clip: Option<crate::model::OverlayRect>,
         surfaces: &mut Vec<HostSceneSurface>,
     ) {
         with_surface_tree_downward(
@@ -10383,6 +10395,7 @@ impl RuntimeWaylandState {
                     };
                     if let Some(size) = target_size {
                         surfaces.push(HostSceneSurface {
+                            presentation_clip,
                             buffer: snapshot.buffer.clone(),
                             kind: snapshot.kind,
                             target: mapping.map_rect(Rectangle::new(offset, size)),
@@ -10437,6 +10450,9 @@ impl RuntimeWaylandState {
                         &surface.buffer,
                         target_rect,
                         damage_rect,
+                        surface
+                            .presentation_clip
+                            .map(|clip| presentation_software_clip(root_geometry, clip)),
                         surface.native_materialization,
                         root_geometry.rotation,
                         target,
@@ -10915,10 +10931,63 @@ fn clear_host_scene_background(
     }
 }
 
+// Retain a conservative physical candidate box, then test each pixel center
+// against the pinned logical boundary. Rotation reverses half-open edges; a
+// rounded physical rectangle alone cannot preserve that exact membership.
+#[derive(Clone, Copy)]
+struct SoftwarePresentationClip {
+    root: crate::root_geometry::RootGeometrySnapshot,
+    logical: crate::model::OverlayRect,
+    physical: Rectangle<i32, Logical>,
+}
+
+impl SoftwarePresentationClip {
+    fn contains_pixel(self, x: i32, y: i32) -> bool {
+        let (x, y) = self
+            .root
+            .physical_to_logical(f64::from(x) + 0.5, f64::from(y) + 0.5);
+        x >= self.logical.x
+            && x < self.logical.x + self.logical.width
+            && y >= self.logical.y
+            && y < self.logical.y + self.logical.height
+    }
+}
+
+fn presentation_software_clip(
+    root: crate::root_geometry::RootGeometrySnapshot,
+    rect: crate::model::OverlayRect,
+) -> SoftwarePresentationClip {
+    let crop = root.physical_crop(crate::root_geometry::LogicalRect {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+    });
+    SoftwarePresentationClip {
+        root,
+        logical: rect,
+        physical: Rectangle::new((crop.x, crop.y).into(), (crop.width, crop.height).into()),
+    }
+}
+
+fn software_blit_coverage(
+    target_rect: Rectangle<i32, Logical>,
+    damage_rect: Option<Rectangle<i32, Logical>>,
+    presentation_clip: Option<Rectangle<i32, Logical>>,
+    output_w: i32,
+    output_h: i32,
+) -> Option<Rectangle<i32, Logical>> {
+    target_rect
+        .intersection(Rectangle::new((0, 0).into(), (output_w, output_h).into()))
+        .and_then(|rect| damage_rect.map_or(Some(rect), |damage| rect.intersection(damage)))
+        .and_then(|rect| presentation_clip.map_or(Some(rect), |clip| rect.intersection(clip)))
+}
+
 fn blit_shm_surface(
     buffer: &wl_buffer::WlBuffer,
     target_rect: Rectangle<i32, Logical>,
     damage_rect: Option<Rectangle<i32, Logical>>,
+    presentation_clip: Option<SoftwarePresentationClip>,
     native_materialization: Option<crate::root_geometry::NativeBufferProjection>,
     rotation: OutputRotation,
     target: &mut [u8],
@@ -10930,9 +10999,13 @@ fn blit_shm_surface(
         return false;
     }
 
-    let clipped = target_rect
-        .intersection(Rectangle::new((0, 0).into(), (output_w, output_h).into()))
-        .and_then(|rect| damage_rect.map_or(Some(rect), |damage| rect.intersection(damage)));
+    let clipped = software_blit_coverage(
+        target_rect,
+        damage_rect,
+        presentation_clip.map(|clip| clip.physical),
+        output_w,
+        output_h,
+    );
     let Some(clipped) = clipped else {
         return false;
     };
@@ -10976,6 +11049,14 @@ fn blit_shm_surface(
             }
             let dst_row = (dst_y_i32 as usize).saturating_mul(target_stride);
             for rel_x in clipped_left..clipped_right {
+                if presentation_clip.is_some_and(|clip| {
+                    !clip.contains_pixel(
+                        target_rect.loc.x + rel_x as i32,
+                        target_rect.loc.y + rel_y as i32,
+                    )
+                }) {
+                    continue;
+                }
                 let (sample_x, sample_y) = native_source_sample(
                     native_materialization,
                     rotation,
@@ -11894,6 +11975,13 @@ mod tests {
     fn spawn_real_shm_surface_tree(
         socket: UnixStream,
     ) -> (mpsc::Receiver<(u32, u32, u32)>, mpsc::Sender<()>) {
+        spawn_real_shm_surface_tree_with_popup_pattern(socket, false)
+    }
+
+    fn spawn_real_shm_surface_tree_with_popup_pattern(
+        socket: UnixStream,
+        patterned_popup: bool,
+    ) -> (mpsc::Receiver<(u32, u32, u32)>, mpsc::Sender<()>) {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -11935,8 +12023,24 @@ mod tests {
             for pixel in pixels[root_bytes..root_bytes + child_bytes].chunks_exact_mut(4) {
                 pixel.copy_from_slice(&[0x00, 0xff, 0x00, 0xff]);
             }
-            for pixel in pixels[root_bytes + child_bytes..].chunks_exact_mut(4) {
-                pixel.copy_from_slice(&[0xff, 0x00, 0x00, 0xff]);
+            for (index, pixel) in pixels[root_bytes + child_bytes..]
+                .chunks_exact_mut(4)
+                .enumerate()
+            {
+                pixel.copy_from_slice(&[
+                    0xff,
+                    if patterned_popup {
+                        (index % popup_width as usize) as u8
+                    } else {
+                        0
+                    },
+                    if patterned_popup {
+                        (index / popup_width as usize) as u8
+                    } else {
+                        0
+                    },
+                    0xff,
+                ]);
             }
             assert_eq!(
                 rustix::io::pwrite(&fd, &pixels, 0).expect("fixture pixels must write"),
@@ -14020,7 +14124,8 @@ mod tests {
                 Arc::new(super::RuntimeClientState::default()),
             )
             .unwrap();
-        let (surface_ids, release_client) = spawn_real_shm_surface_tree(client_socket);
+        let (surface_ids, release_client) =
+            spawn_real_shm_surface_tree_with_popup_pattern(client_socket, true);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 
         while !wayland.native_pane_toplevels.contains_key(&pane_id) {
@@ -14288,6 +14393,90 @@ mod tests {
                 )
                 .is_some_and(|(surface, _)| same_surface(&surface, popup.wl_surface()))
         );
+        // The software fallback uses the same retained SHM buffer, preserves
+        // its source mapping and cannot write beyond the selected clip.
+        let popup_snapshot = wayland
+            .host_surface_buffers
+            .get(&super::surface_key(popup.wl_surface()))
+            .unwrap();
+        let root = lock_state(&shared_state).root_geometry_snapshot().unwrap();
+        assert_eq!(root.rotation, OutputRotation::Deg0);
+        let clip = super::presentation_software_clip(
+            root,
+            OverlayRect {
+                x: 10.0 / root.factor,
+                y: 8.0 / root.factor,
+                width: 4.0 / root.factor,
+                height: 3.0 / root.factor,
+            },
+        );
+        let sentinel = [7_u8, 8, 9, 10];
+        let mut pixels = sentinel.repeat(20 * 20);
+        assert!(super::blit_shm_surface(
+            &popup_snapshot.buffer,
+            Rectangle::new((3, 5).into(), (18, 10).into()),
+            None,
+            Some(clip),
+            None,
+            OutputRotation::Deg0,
+            &mut pixels,
+            20 * 4,
+            20,
+            20
+        ));
+        for y in 0..20 {
+            for x in 0..20 {
+                let pixel = &pixels[(y * 20 + x) * 4..(y * 20 + x + 1) * 4];
+                let expected = if (10..14).contains(&x) && (8..11).contains(&y) {
+                    [0xff, (x - 3) as u8, (y - 5) as u8, 0]
+                } else {
+                    sentinel
+                };
+                assert_eq!(pixel, &expected, "SHM clip pixel({x},{y})");
+            }
+        }
+        // Inject only the selected projection into a pinned snapshot: this
+        // checks scene propagation, not production main-window route acceptance.
+        let mut selected_status = restored.clone();
+        let mut selected_request = presentation.clone();
+        selected_request.selected = Some(crate::pane_presentation::SelectedPane::Native {
+            renderer_pane_id: 8,
+            pane_lineage_id: "renderer-lineage-8".into(),
+            native_pane_id: pane_id.0.clone(),
+            native_pane_instance_id: "dialog-pane-binding".into(),
+        });
+        let selected_clip = selected_request.content_rect;
+        selected_status.pane_presentations = vec![selected_request];
+        let output = selected_status.runtime.clone();
+        let ordinary_scene = wayland.host_scene_surfaces(
+            output.logical_surface_width.unwrap(),
+            output.logical_surface_height.unwrap(),
+            &restored,
+        );
+        assert!(
+            !ordinary_scene.is_empty(),
+            "retained popup must enter the scene"
+        );
+        // This fixture's root/subsurface buffers do not establish production
+        // root materialization; the real popup is the scene evidence here.
+        assert!(
+            ordinary_scene
+                .iter()
+                .all(|surface| surface.presentation_clip.is_none())
+        );
+        let selected_scene = wayland.host_scene_surfaces(
+            output.logical_surface_width.unwrap(),
+            output.logical_surface_height.unwrap(),
+            &selected_status,
+        );
+        assert_eq!(selected_scene.len(), ordinary_scene.len());
+        for (selected, ordinary) in selected_scene.iter().zip(&ordinary_scene) {
+            assert_eq!(selected.presentation_clip, selected_clip);
+            assert_eq!(
+                selected.target, ordinary.target,
+                "clipping must retain child source placement"
+            );
+        }
         // Use real backend ObjectIds to prove incarnation fencing independently
         // of the protocol surface number. Host-role coordinates remain injected
         // fixture evidence here, not a production main-window acceptance claim.
@@ -14324,6 +14513,66 @@ mod tests {
             );
         }
         release_client.send(()).unwrap();
+    }
+
+    #[test]
+    fn pane_presentation_software_clip_preserves_fractional_half_open_rotation_edges() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
+        state.mark_runtime_resize(64, 40);
+        let base = state.root_geometry_snapshot().unwrap();
+        for rotation in [
+            OutputRotation::Deg0,
+            OutputRotation::Deg90,
+            OutputRotation::Deg180,
+            OutputRotation::Deg270,
+        ] {
+            for factor in [1.0, 1.3, 2.0] {
+                let mut root = base;
+                root.rotation = rotation;
+                root.factor = factor;
+                let oriented = root.oriented_physical_size_i32();
+                root.logical_size = crate::root_geometry::RootSizeF64 {
+                    width: f64::from(oriented.width) / factor,
+                    height: f64::from(oriented.height) / factor,
+                };
+                let logical = OverlayRect {
+                    x: 4.25,
+                    y: 5.25,
+                    width: 7.5,
+                    height: 4.5,
+                };
+                let clip = super::presentation_software_clip(root, logical);
+                for y in 0..40 {
+                    for x in 0..64 {
+                        let (lx, ly) =
+                            root.physical_to_logical(f64::from(x) + 0.5, f64::from(y) + 0.5);
+                        let expected = lx >= 4.25 && lx < 11.75 && ly >= 5.25 && ly < 9.75;
+                        let actual = clip.physical.contains((x, y)) && clip.contains_pixel(x, y);
+                        assert_eq!(
+                            actual, expected,
+                            "{rotation:?}, scale{factor}, pixel({x},{y})"
+                        );
+                    }
+                }
+            }
+        }
+        let target = Rectangle::new((-3, 2).into(), (20, 12).into());
+        let damage = Rectangle::new((4, 0).into(), (10, 12).into());
+        let clip = Rectangle::new((6, 7).into(), (10, 8).into());
+        assert_eq!(
+            super::software_blit_coverage(target, Some(damage), Some(clip), 12, 12),
+            Some(Rectangle::new((6, 7).into(), (6, 5).into()))
+        );
+        assert!(
+            super::software_blit_coverage(
+                target,
+                None,
+                Some(Rectangle::new((30, 30).into(), (4, 4).into())),
+                12,
+                12
+            )
+            .is_none()
+        );
     }
 
     #[test]
