@@ -1620,10 +1620,28 @@ impl CompositorState {
         {
             return Err("bound presentation host already belongs to another window".into());
         }
-        let current = self
+        // A renderer-only window has no native host/update transaction from
+        // which to obtain a cohort. Its validated sole-host route may establish
+        // empty presentation metadata, without applying any native host plan.
+        // Never use this path to omit a recorded or live native sibling.
+        let recorded = self
             .native_pane_presentation_generations
-            .get(&request.presentation_generation.surface_id)
-            .ok_or("pane presentation has no routed surface generation")?;
+            .get(&request.presentation_generation.surface_id);
+        let renderer_only = !retiring
+            && request.presentation_generation.pane_instances.is_empty()
+            && recorded.is_none_or(|generation| generation.pane_instances.is_empty())
+            && !matches!(request.selected, Some(SelectedPane::Native { .. }));
+        let current = if renderer_only {
+            if self.panes.values().any(pane_retains_overlay_regions) {
+                return Err("renderer-only presentation cannot omit live native panes".into());
+            }
+            self.validate_native_pane_presentation_generation(&request.presentation_generation)?;
+            request.presentation_generation.clone()
+        } else {
+            recorded
+                .ok_or("pane presentation has no routed surface generation")?
+                .clone()
+        };
         if let Some(SelectedPane::Native {
             native_pane_id,
             native_pane_instance_id,
@@ -1652,9 +1670,15 @@ impl CompositorState {
         }
         let accepted = self.pane_presentations.accept(
             request,
-            current,
+            &current,
             (f64::from(width), f64::from(height)),
         )?;
+        if renderer_only {
+            // Store only after the complete route, rectangle and replay checks
+            // accepted; failed requests cannot create a generation or owner.
+            self.native_pane_presentation_generations
+                .insert(current.surface_id.clone(), current);
+        }
         self.presentation_window_owner = Some(owner);
         Ok(accepted)
     }
@@ -3973,6 +3997,134 @@ mod tests {
         assert_eq!(restored.panes[0].geometry, tiled);
         assert_eq!(restored.panes[0].native_host, before.native_host);
         assert!(restored.pane_presentations.is_empty());
+    }
+
+    #[test]
+    fn pane_presentation_renderer_only_route_establishes_metadata_without_native_plan() {
+        let mut state = CompositorState::new(true, Box::new(FakeProcessController::default()));
+        state.mark_runtime_resize(1280, 720);
+        state.set_runtime_surface_roles(Some(99), None, None);
+        let (width, height) = state.runtime_logical_surface_size().unwrap();
+        let mut route = crate::pane_presentation::test_window_route(
+            "renderer-only",
+            f64::from(width),
+            f64::from(height),
+        );
+        route.host.root_geometry_generation = state.root_geometry_snapshot().unwrap().generation;
+        state.set_test_presentation_host(route.host.clone());
+        let request = PresentationRequest {
+            version: 1,
+            request_revision: 1,
+            window_route: route,
+            presentation_generation: NativePanePresentationGeneration {
+                surface_id: "renderer-only".into(),
+                surface_epoch: "renderer-epoch".into(),
+                topology_epoch: 1,
+                geometry_revision: 1,
+                focus_revision: 1,
+                pane_instances: BTreeMap::new(),
+            },
+            selected: Some(SelectedPane::Renderer {
+                renderer_pane_id: 1,
+                pane_lineage_id: "renderer-lineage".into(),
+            }),
+            overlay_rect: Some(OverlayRect {
+                x: 8.0,
+                y: 8.0,
+                width: 400.0,
+                height: 300.0,
+            }),
+            content_rect: Some(OverlayRect {
+                x: 10.0,
+                y: 10.0,
+                width: 396.0,
+                height: 296.0,
+            }),
+        };
+        let mut invalid = request.clone();
+        invalid.content_rect.as_mut().unwrap().width = 1000.0;
+        assert!(state.set_pane_presentation(invalid).is_err());
+        assert!(state.native_pane_presentation_generations.is_empty());
+        assert!(state.presentation_window_owner.is_none());
+        let ack = state.set_pane_presentation(request.clone()).unwrap();
+        assert_eq!(ack.presentation_generation, request.presentation_generation);
+        assert!(state.panes.is_empty());
+        assert!(state.pending_process_launches.is_empty());
+        assert_eq!(state.status_snapshot().pane_presentations.len(), 1);
+        let mut resized = request.clone();
+        resized.request_revision = 2;
+        resized.presentation_generation.geometry_revision = 2;
+        state.set_pane_presentation(resized.clone()).unwrap();
+        let shown = state.status_snapshot().pane_presentations;
+        let mut stale = request.clone();
+        stale.request_revision = 3;
+        assert!(
+            state
+                .set_pane_presentation(stale)
+                .unwrap_err()
+                .contains("stale")
+        );
+        assert_eq!(state.status_snapshot().pane_presentations, shown);
+        let mut old_restore = request.clone();
+        old_restore.request_revision = 3;
+        old_restore.selected = None;
+        old_restore.overlay_rect = None;
+        old_restore.content_rect = None;
+        assert!(
+            state.set_pane_presentation(old_restore).is_err(),
+            "old geometry cannot retire a newer selection"
+        );
+        let mut second_owner = resized.clone();
+        second_owner.request_revision = 3;
+        second_owner.window_route.window_id = "other-window".into();
+        assert!(
+            state
+                .set_pane_presentation(second_owner)
+                .unwrap_err()
+                .contains("another window")
+        );
+        let mut restore = resized.clone();
+        restore.request_revision = 4;
+        restore.selected = None;
+        restore.overlay_rect = None;
+        restore.content_rect = None;
+        state.set_pane_presentation(restore).unwrap();
+        assert!(state.status_snapshot().pane_presentations.is_empty());
+        assert!(
+            state.set_pane_presentation(resized.clone()).is_err(),
+            "late resize cannot undo Restore"
+        );
+        let native_id = PaneId::new("unclassified-live-native");
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                id: native_id.clone(),
+                content_id: Some("content".into()),
+                binding_id: Some("binding".into()),
+                launch_token: Some("token".into()),
+                revision: 1,
+                window_group: None,
+                geometry: PaneGeometry {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+                target: NativeTargetClass::Terminal,
+                process: terminal_process(),
+            }])
+            .unwrap();
+        state.launch_native_pane_hosts(vec![native_id]).unwrap();
+        resized.request_revision = 5;
+        let before = state.status_snapshot().panes;
+        assert!(
+            state
+                .set_pane_presentation(resized)
+                .unwrap_err()
+                .contains("omit live native")
+        );
+        assert_eq!(state.status_snapshot().panes, before);
+        assert!(state.status_snapshot().pane_presentations.is_empty());
     }
 
     #[test]

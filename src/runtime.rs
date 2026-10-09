@@ -14477,6 +14477,75 @@ mod tests {
                 "clipping must retain child source placement"
             );
         }
+        // Exercise an accepted native selection on the retained real popup.
+        // The main-host route basis remains injected; no GPU pixels are claimed.
+        let mut native_selection = presentation.clone();
+        native_selection.request_revision = 3;
+        native_selection.selected = Some(crate::pane_presentation::SelectedPane::Native {
+            renderer_pane_id: 8,
+            pane_lineage_id: "dialog-pane-lineage".into(),
+            native_pane_id: pane_id.0.clone(),
+            native_pane_instance_id: "dialog-pane-binding".into(),
+        });
+        lock_state(&shared_state)
+            .set_pane_presentation(native_selection.clone())
+            .unwrap();
+        let native_shown = lock_state(&shared_state).status_snapshot();
+        let pane_bounds = native_shown
+            .panes
+            .iter()
+            .find(|pane| pane.id == pane_id)
+            .unwrap()
+            .geometry;
+        let local_popup = wayland.popup_geometry_local(&popup);
+        let displayed_popup_center = (
+            pane_bounds.x + f64::from(local_popup.loc.x) + 9.0,
+            pane_bounds.y + f64::from(local_popup.loc.y) + 5.0,
+        )
+            .into();
+        assert!(
+            wayland
+                .surface_under_point_for_capture(
+                    displayed_popup_center,
+                    OverlayCaptureCapability::PointerButton,
+                    &native_shown
+                )
+                .is_some_and(|(surface, _)| same_surface(&surface, popup.wl_surface())),
+            "selected popup input must use displayed pane geometry"
+        );
+        assert!(
+            wayland
+                .surface_under_point_for_capture(
+                    (9.0, 9.0).into(),
+                    OverlayCaptureCapability::PointerButton,
+                    &native_shown
+                )
+                .is_none(),
+            "selected native backdrop cannot hit a retained popup"
+        );
+        let mut native_restore = native_selection;
+        native_restore.request_revision = 4;
+        native_restore.selected = None;
+        native_restore.overlay_rect = None;
+        native_restore.content_rect = None;
+        lock_state(&shared_state)
+            .set_pane_presentation(native_restore)
+            .unwrap();
+        let native_restored = lock_state(&shared_state).status_snapshot();
+        assert_eq!(
+            native_restored.panes, restored.panes,
+            "Restore cannot mutate tiled native geometry or lifecycle"
+        );
+        assert!(
+            wayland
+                .surface_under_point_for_capture(
+                    popup_center,
+                    OverlayCaptureCapability::PointerButton,
+                    &native_restored
+                )
+                .is_some_and(|(surface, _)| same_surface(&surface, popup.wl_surface())),
+            "Restore routes input to the same retained popup at its tiled position"
+        );
         // Use real backend ObjectIds to prove incarnation fencing independently
         // of the protocol surface number. Host-role coordinates remain injected
         // fixture evidence here, not a production main-window acceptance claim.

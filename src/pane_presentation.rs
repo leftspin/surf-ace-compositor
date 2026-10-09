@@ -203,6 +203,9 @@ impl PresentationLedger {
         {
             return Err("presentation generation does not match routed surface".into());
         }
+        if generation.pane_instances != current.pane_instances {
+            return Err("presentation omits or changes the routed native cohort".into());
+        }
         for (id, instance) in &generation.pane_instances {
             if current.pane_instances.get(id) != Some(instance) {
                 return Err("presentation contains a foreign native instance".into());
@@ -521,6 +524,39 @@ mod tests {
             }),
         }
     }
+    #[test]
+    fn pane_presentation_cannot_omit_recorded_native_sibling_from_renderer_selection() {
+        let native = request(1);
+        let mut ledger = PresentationLedger::default();
+        ledger
+            .accept(
+                native.clone(),
+                &native.presentation_generation,
+                (1000.0, 700.0),
+            )
+            .unwrap();
+        let mut renderer = native.clone();
+        renderer.request_revision = 2;
+        renderer.selected = Some(SelectedPane::Renderer {
+            renderer_pane_id: 2,
+            pane_lineage_id: "renderer-lineage".into(),
+        });
+        renderer
+            .presentation_generation
+            .pane_instances
+            .remove("s:9");
+        assert!(
+            ledger
+                .accept(renderer, &native.presentation_generation, (1000.0, 700.0))
+                .unwrap_err()
+                .contains("cohort")
+        );
+        assert_eq!(
+            ledger.current(&native.presentation_generation),
+            Some(&native)
+        );
+    }
+
     #[test]
     fn native_selection_occludes_later_id_and_backdrop_cannot_hit_sibling() {
         let req = request(1);
