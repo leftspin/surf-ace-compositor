@@ -3702,7 +3702,7 @@ mod tests {
             topology_epoch: 3,
             geometry_revision: 5,
             focus_revision: 8,
-            pane_instances: BTreeMap::from([(id.0.clone(), instance.clone())]),
+            pane_instances: BTreeMap::from([(id.0.clone(), "lineage-7".into())]),
         };
         state
             .record_native_pane_presentation_generation(generation.clone())
@@ -3732,6 +3732,16 @@ mod tests {
                 height: f64::from(height) - 54.0,
             }),
         };
+        let mut wrong_binding = request.clone();
+        if let Some(SelectedPane::Native {
+            native_pane_instance_id,
+            ..
+        }) = &mut wrong_binding.selected
+        {
+            *native_pane_instance_id = "foreign-live-binding".into();
+        }
+        assert!(state.set_pane_presentation(wrong_binding).is_err());
+        assert_eq!(state.status_snapshot().panes[0].geometry, tiled);
         state.set_pane_presentation(request.clone()).unwrap();
         let shown = state.status_snapshot();
         assert_eq!(shown.panes[0].geometry.width, displayed_width);

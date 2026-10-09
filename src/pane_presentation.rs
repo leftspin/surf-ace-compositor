@@ -82,12 +82,10 @@ impl PresentationLedger {
                         renderer_pane_id,
                         pane_lineage_id,
                         native_pane_id,
-                        native_pane_instance_id,
+                        native_pane_instance_id: _,
                     } => {
-                        if current.pane_instances.get(native_pane_id)
-                            != Some(native_pane_instance_id)
-                        {
-                            return Err("selected native instance is not current".into());
+                        if current.pane_instances.get(native_pane_id) != Some(pane_lineage_id) {
+                            return Err("selected native lineage is not current".into());
                         }
                         (*renderer_pane_id, pane_lineage_id)
                     }
@@ -160,13 +158,11 @@ impl PresentationLedger {
                 }
                 if let Some(SelectedPane::Native {
                     native_pane_id,
-                    native_pane_instance_id,
+                    pane_lineage_id,
                     ..
                 }) = &entry.selected
                 {
-                    if generation.pane_instances.get(native_pane_id)
-                        != Some(native_pane_instance_id)
-                    {
+                    if generation.pane_instances.get(native_pane_id) != Some(pane_lineage_id) {
                         return None;
                     }
                 }
@@ -313,8 +309,8 @@ mod tests {
                 geometry_revision: 3,
                 focus_revision: 4,
                 pane_instances: BTreeMap::from([
-                    ("s:1".into(), "instance-1".into()),
-                    ("s:9".into(), "instance-9".into()),
+                    ("s:1".into(), "lineage-1".into()),
+                    ("s:9".into(), "lineage-9".into()),
                 ]),
             },
             selected: Some(SelectedPane::Native {

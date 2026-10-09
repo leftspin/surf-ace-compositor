@@ -14030,7 +14030,7 @@ mod tests {
                 focus_revision: 1,
                 pane_instances: std::collections::BTreeMap::from([(
                     pane_id.0.clone(),
-                    "dialog-pane-binding".into(),
+                    "dialog-pane-lineage".into(),
                 )]),
             };
             state
