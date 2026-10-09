@@ -14501,16 +14501,17 @@ mod tests {
                 (rect.size.w * scale, rect.size.h * scale).into(),
             );
             let scene_rect = transform.transform_rect_in(source_rect, &scene_size);
-            let cursor_rect = super::cursor_rect_to_scanout(
-                rect,
-                scanout_size,
-                f64::from(scale),
-                rotation,
-            )
-            .expect("cursor rect should map into scanout bounds");
+            let cursor_rect =
+                super::cursor_rect_to_scanout(rect, scanout_size, f64::from(scale), rotation)
+                    .expect("cursor rect should map into scanout bounds");
 
             assert_eq!(
-                (cursor_rect.loc.x, cursor_rect.loc.y, cursor_rect.size.w, cursor_rect.size.h),
+                (
+                    cursor_rect.loc.x,
+                    cursor_rect.loc.y,
+                    cursor_rect.size.w,
+                    cursor_rect.size.h
+                ),
                 (
                     scene_rect.loc.x,
                     scene_rect.loc.y,
