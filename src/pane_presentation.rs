@@ -64,6 +64,24 @@ impl PresentationLedger {
         if request.version != CAPABILITY_VERSION || request.request_revision == 0 {
             return Err("unsupported presentation version or revision".into());
         }
+        // A caller can retire its exact acknowledged selection after local
+        // geometry/focus/topology advanced. This cannot select stale content,
+        // replace a newer generation, or remove the monotonic replay fence.
+        if request.selected.is_none()
+            && request.overlay_rect.is_none()
+            && request.content_rect.is_none()
+            && self
+                .entries
+                .get(&generation.surface_id)
+                .is_some_and(|previous| {
+                    previous.presentation_generation == *generation
+                        && request.request_revision > previous.request_revision
+                })
+        {
+            let accepted = ack(&request);
+            self.entries.insert(generation.surface_id.clone(), request);
+            return Ok(accepted);
+        }
         if generation.surface_id.is_empty()
             || generation.surface_epoch.is_empty()
             || !same_generation(generation, current)
@@ -447,6 +465,42 @@ mod tests {
                 .is_err()
         );
         assert_eq!(ledger.current(&generation), Some(&restore));
+    }
+    #[test]
+    fn exact_prior_generation_restore_retires_after_authority_advance_but_not_newer_selection() {
+        let req = request(1);
+        let generation = req.presentation_generation.clone();
+        let mut ledger = PresentationLedger::default();
+        ledger
+            .accept(req.clone(), &generation, (1000.0, 700.0))
+            .unwrap();
+        let mut advanced = generation.clone();
+        advanced.geometry_revision += 1;
+        advanced.focus_revision += 1;
+        let mut restore = req.clone();
+        restore.request_revision = 2;
+        restore.selected = None;
+        restore.overlay_rect = None;
+        restore.content_rect = None;
+        assert!(
+            ledger
+                .accept(restore.clone(), &advanced, (900.0, 600.0))
+                .is_ok()
+        );
+        assert!(
+            ledger
+                .active_requests(&BTreeMap::from([("s".into(), advanced.clone())]))
+                .is_empty()
+        );
+        assert!(ledger.accept(req, &advanced, (1000.0, 700.0)).is_err());
+        let mut newer = request(3);
+        newer.presentation_generation = advanced.clone();
+        ledger
+            .accept(newer.clone(), &advanced, (1000.0, 700.0))
+            .unwrap();
+        restore.request_revision = 4;
+        assert!(ledger.accept(restore, &advanced, (1000.0, 700.0)).is_err());
+        assert_eq!(ledger.current(&advanced), Some(&newer));
     }
     #[test]
     fn stale_identity_or_bad_geometry_cannot_replace_accepted_presentation() {
