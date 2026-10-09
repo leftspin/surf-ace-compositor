@@ -7882,11 +7882,23 @@ impl RuntimeWaylandState {
     }
 
     fn native_pane_surface_is_visible(&self, pane_id: &PaneId, mapped: bool) -> bool {
+        self.native_pane_surface_is_visible_for_status(
+            pane_id,
+            mapped,
+            &lock_state(&self.shared_state).status_snapshot(),
+        )
+    }
+
+    fn native_pane_surface_is_visible_for_status(
+        &self,
+        pane_id: &PaneId,
+        mapped: bool,
+        status: &crate::model::StatusSnapshot,
+    ) -> bool {
         mapped
-            && self.native_pane_is_keyboard_focused(pane_id)
-            && lock_state(&self.shared_state)
-                .status_snapshot()
-                .presentation_native_visible(&pane_id.0)
+            && matches!(&status.runtime.active_focus_target,
+            Some(RuntimeFocusTarget::NativePane { pane_id: focused }) if focused == pane_id)
+            && status.presentation_native_visible(&pane_id.0)
     }
 
     fn native_pane_accessory_rect(
@@ -7894,8 +7906,28 @@ impl RuntimeWaylandState {
         pane_id: &PaneId,
         surface: &ToplevelSurface,
     ) -> Option<Rectangle<i32, Logical>> {
-        let pane = self.native_pane_rect(pane_id)?;
-        let output = self.runtime_output_size();
+        self.native_pane_accessory_rect_for_status(
+            pane_id,
+            surface,
+            &lock_state(&self.shared_state).status_snapshot(),
+        )
+    }
+
+    fn native_pane_accessory_rect_for_status(
+        &self,
+        pane_id: &PaneId,
+        surface: &ToplevelSurface,
+        status: &crate::model::StatusSnapshot,
+    ) -> Option<Rectangle<i32, Logical>> {
+        let pane = status
+            .panes
+            .iter()
+            .find(|pane| &pane.id == pane_id)
+            .map(|pane| rectangle_from_pane_geometry(pane.geometry))?;
+        let output = Size::<i32, Logical>::new(
+            status.runtime.logical_surface_width?,
+            status.runtime.logical_surface_height?,
+        );
         let requested_size = surface.current_state().size.unwrap_or_else(|| {
             Size::new(
                 ((pane.size.w as f64 * 1.4).ceil() as i32)
@@ -7915,6 +7947,55 @@ impl RuntimeWaylandState {
         let x = (pane.loc.x + (pane.size.w - size.w) / 2).clamp(0, max_x);
         let y = (pane.loc.y + (pane.size.h - size.h) / 2).clamp(0, max_y);
         Some(Rectangle::new((x, y).into(), size))
+    }
+
+    fn presentation_clip_native_members(
+        &self,
+        status: &crate::model::StatusSnapshot,
+        pane_id: &PaneId,
+        elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
+        target_height_px: f32,
+    ) -> Result<Vec<SurfAceRenderElement>, String> {
+        let Some(rect) = status.presentation_native_content_rect(&pane_id.0) else {
+            return Ok(elements
+                .into_iter()
+                .map(SurfAceRenderElement::from)
+                .collect());
+        };
+        let mut projection = self
+            .presentation_root_geometry
+            .as_ref()
+            .or(self.active_root_geometry_consumers.as_ref())
+            .and_then(|geometry| {
+                geometry
+                    .native_materializations
+                    .iter()
+                    .find(|(candidate, _)| candidate == pane_id)
+                    .map(|(_, projection)| *projection)
+            })
+            .ok_or("selected native member has no pinned root projection")?;
+        projection.logical_clip = crate::root_geometry::LogicalRect {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        };
+        let program = self
+            .native_clip_program
+            .as_ref()
+            .ok_or("selected native member has no clip shader")?;
+        // Accessories/popups retain their placement and texture sampling; only
+        // the selected presentation's content boundary clips their pixels.
+        Ok(materialize_native_surface_elements(
+            elements,
+            None,
+            projection,
+            program,
+            target_height_px,
+        )
+        .into_iter()
+        .map(SurfAceRenderElement::from)
+        .collect())
     }
 
     fn native_pane_window_id_for_surface(
@@ -8661,7 +8742,7 @@ impl RuntimeWaylandState {
                 continue;
             };
             if !status.presentation_native_visible(&pane_id.0)
-                || !self.native_pane_surface_is_visible(pane_id, popup.mapped)
+                || !self.native_pane_surface_is_visible_for_status(pane_id, popup.mapped, status)
             {
                 continue;
             }
@@ -8677,7 +8758,11 @@ impl RuntimeWaylandState {
                                 && same_surface(accessory.surface.wl_surface(), &parent)
                         })
                         .and_then(|accessory| {
-                            self.native_pane_accessory_rect(pane_id, &accessory.surface)
+                            self.native_pane_accessory_rect_for_status(
+                                pane_id,
+                                &accessory.surface,
+                                status,
+                            )
                         })
                         .map(|rect| rect.loc)
                 })
@@ -8701,13 +8786,19 @@ impl RuntimeWaylandState {
 
         for accessory in self.native_pane_accessories.iter().rev() {
             if !status.presentation_native_visible(&accessory.pane_id.0)
-                || !self.native_pane_surface_is_visible(&accessory.pane_id, accessory.mapped)
+                || !self.native_pane_surface_is_visible_for_status(
+                    &accessory.pane_id,
+                    accessory.mapped,
+                    status,
+                )
             {
                 continue;
             }
-            let Some(rect) =
-                self.native_pane_accessory_rect(&accessory.pane_id, &accessory.surface)
-            else {
+            let Some(rect) = self.native_pane_accessory_rect_for_status(
+                &accessory.pane_id,
+                &accessory.surface,
+                status,
+            ) else {
                 continue;
             };
             let hit = pos.x >= rect.loc.x as f64
@@ -9447,13 +9538,19 @@ impl RuntimeWaylandState {
 
         for accessory in &self.native_pane_accessories {
             if !pinned_status.presentation_native_visible(&accessory.pane_id.0)
-                || !self.native_pane_surface_is_visible(&accessory.pane_id, accessory.mapped)
+                || !self.native_pane_surface_is_visible_for_status(
+                    &accessory.pane_id,
+                    accessory.mapped,
+                    &pinned_status,
+                )
             {
                 continue;
             }
-            let Some(rect) =
-                self.native_pane_accessory_rect(&accessory.pane_id, &accessory.surface)
-            else {
+            let Some(rect) = self.native_pane_accessory_rect_for_status(
+                &accessory.pane_id,
+                &accessory.surface,
+                &pinned_status,
+            ) else {
                 continue;
             };
             if self
@@ -9471,14 +9568,23 @@ impl RuntimeWaylandState {
                 ));
                 continue;
             }
-            native_pane_accessory_elements.extend(render_elements_from_surface_tree(
+            let elements = render_elements_from_surface_tree(
                 renderer,
                 accessory.surface.wl_surface(),
                 mapping.render_element_location(),
                 mapping.render_element_scale(),
                 1.0,
                 Kind::Unspecified,
-            ));
+            );
+            match self.presentation_clip_native_members(
+                &pinned_status,
+                &accessory.pane_id,
+                elements,
+                render_output_size_before_transform(self).h as f32,
+            ) {
+                Ok(elements) => native_pane_accessory_elements.extend(elements),
+                Err(error) => capture.failure = Some(error),
+            }
         }
 
         for popup in &self.popups {
@@ -9510,7 +9616,11 @@ impl RuntimeWaylandState {
                 continue;
             };
             if !pinned_status.presentation_native_visible(&pane_id.0)
-                || !self.native_pane_surface_is_visible(pane_id, popup.mapped)
+                || !self.native_pane_surface_is_visible_for_status(
+                    pane_id,
+                    popup.mapped,
+                    &pinned_status,
+                )
             {
                 continue;
             }
@@ -9527,8 +9637,11 @@ impl RuntimeWaylandState {
                     &accessory.pane_id == pane_id
                         && same_surface(accessory.surface.wl_surface(), &parent)
                 }) {
-                    if let Some(rect) = self.native_pane_accessory_rect(pane_id, &accessory.surface)
-                    {
+                    if let Some(rect) = self.native_pane_accessory_rect_for_status(
+                        pane_id,
+                        &accessory.surface,
+                        &pinned_status,
+                    ) {
                         base = rect.loc;
                     }
                 }
@@ -9540,14 +9653,23 @@ impl RuntimeWaylandState {
                 continue;
             }
             let popup_geo = self.popup_geometry_local(&popup.surface);
-            native_pane_popup_elements.extend(render_elements_from_surface_tree(
+            let elements = render_elements_from_surface_tree(
                 renderer,
                 popup.surface.wl_surface(),
                 Point::from((base.x + popup_geo.loc.x, base.y + popup_geo.loc.y)),
                 1.0,
                 1.0,
                 Kind::Unspecified,
-            ));
+            );
+            match self.presentation_clip_native_members(
+                &pinned_status,
+                pane_id,
+                elements,
+                render_output_size_before_transform(self).h as f32,
+            ) {
+                Ok(elements) => native_pane_popup_elements.extend(elements),
+                Err(error) => capture.failure = Some(error),
+            }
         }
 
         let debug_border_regions = overlay_region_status
@@ -9558,11 +9680,11 @@ impl RuntimeWaylandState {
         // Smithay expects top-to-bottom order; otherwise an opaque main surface
         // can cull the overlay before it is drawn. The compositor cursor is
         // drawn in the final output pass so it is not clipped by scene surfaces.
-        capture.push(
+        capture.push_elements(
             RenderElementSource::NativePanePopup,
             native_pane_popup_elements,
         );
-        capture.push(
+        capture.push_elements(
             RenderElementSource::NativePaneAccessory,
             native_pane_accessory_elements,
         );
@@ -10079,7 +10201,11 @@ impl RuntimeWaylandState {
 
         for accessory in &self.native_pane_accessories {
             if !status.presentation_native_visible(&accessory.pane_id.0)
-                || !self.native_pane_surface_is_visible(&accessory.pane_id, accessory.mapped)
+                || !self.native_pane_surface_is_visible_for_status(
+                    &accessory.pane_id,
+                    accessory.mapped,
+                    status,
+                )
             {
                 continue;
             }
@@ -10089,9 +10215,11 @@ impl RuntimeWaylandState {
             {
                 continue;
             }
-            let Some(rect) =
-                self.native_pane_accessory_rect(&accessory.pane_id, &accessory.surface)
-            else {
+            let Some(rect) = self.native_pane_accessory_rect_for_status(
+                &accessory.pane_id,
+                &accessory.surface,
+                status,
+            ) else {
                 continue;
             };
             let mapping =
@@ -10110,7 +10238,7 @@ impl RuntimeWaylandState {
             }
             if let RuntimeSurfaceRole::NativePane(pane_id) = &popup.owner_role {
                 if !status.presentation_native_visible(&pane_id.0)
-                    || !self.native_pane_is_keyboard_focused(pane_id)
+                    || !self.native_pane_surface_is_visible_for_status(pane_id, true, status)
                 {
                     continue;
                 }
@@ -10162,9 +10290,11 @@ impl RuntimeWaylandState {
                                     && same_surface(accessory.surface.wl_surface(), &parent)
                             })
                         {
-                            if let Some(rect) =
-                                self.native_pane_accessory_rect(pane_id, &accessory.surface)
-                            {
+                            if let Some(rect) = self.native_pane_accessory_rect_for_status(
+                                pane_id,
+                                &accessory.surface,
+                                status,
+                            ) {
                                 base = rect.loc;
                             }
                         }
@@ -13978,6 +14108,20 @@ mod tests {
                 .is_some_and(|(surface, _)| same_surface(&surface, popup.wl_surface())),
             "mapped popup should become hit-testable only after its pane is focused"
         );
+        lock_state(&shared_state).set_runtime_focus_target(Some(RuntimeFocusTarget::MainApp));
+        assert!(
+            wayland
+                .surface_under_point_for_capture(
+                    popup_center,
+                    OverlayCaptureCapability::PointerButton,
+                    &visible_input_status
+                )
+                .is_some_and(|(surface, _)| same_surface(&surface, popup.wl_surface())),
+            "a pinned input operation must not mix later focus state into its popup hit path"
+        );
+        lock_state(&shared_state).set_runtime_focus_target(Some(RuntimeFocusTarget::NativePane {
+            pane_id: pane_id.clone(),
+        }));
         wayland.forward_pointer_motion(popup_center, 10);
         wayland.forward_pointer_button(0x110, ButtonState::Pressed, 11);
         let keyboard_focus = wayland

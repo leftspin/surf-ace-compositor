@@ -3771,6 +3771,90 @@ mod tests {
         assert!(restored.pane_presentations.is_empty());
     }
 
+    #[test]
+    fn pane_presentation_two_windows_keep_clip_and_occlusion_scoped_and_shield_ambiguous_input() {
+        let state = CompositorState::new(true, Box::new(FakeProcessController::default()));
+        let mut status = state.status_snapshot();
+        let request = |surface: &str, x: f64| {
+            let selected = format!("{surface}:1");
+            PresentationRequest {
+                version: 1,
+                request_revision: 1,
+                presentation_generation: NativePanePresentationGeneration {
+                    surface_id: surface.into(),
+                    surface_epoch: format!("{surface}:epoch"),
+                    topology_epoch: 1,
+                    geometry_revision: 1,
+                    focus_revision: 1,
+                    pane_instances: BTreeMap::from([
+                        (selected.clone(), "lineage-1".into()),
+                        (format!("{surface}:2"), "lineage-2".into()),
+                    ]),
+                },
+                selected: Some(SelectedPane::Native {
+                    renderer_pane_id: 1,
+                    pane_lineage_id: "lineage-1".into(),
+                    native_pane_id: selected,
+                    native_pane_instance_id: format!("{surface}:binding"),
+                }),
+                overlay_rect: Some(OverlayRect {
+                    x,
+                    y: 10.0,
+                    width: 400.0,
+                    height: 500.0,
+                }),
+                content_rect: Some(OverlayRect {
+                    x: x + 2.0,
+                    y: 12.0,
+                    width: 396.0,
+                    height: 496.0,
+                }),
+            }
+        };
+        let a = request("window-a", 10.0);
+        let b = request("window-b", 510.0);
+        status.pane_presentations = vec![a.clone(), b.clone()];
+        assert_eq!(
+            status.presentation_native_content_rect("window-a:1"),
+            a.content_rect
+        );
+        assert_eq!(
+            status.presentation_native_content_rect("window-b:1"),
+            b.content_rect
+        );
+        assert_eq!(status.presentation_native_content_rect("window-a:2"), None);
+        assert!(status.presentation_native_visible("window-a:1"));
+        assert!(status.presentation_native_visible("window-b:1"));
+        assert!(!status.presentation_native_visible("window-a:2"));
+        assert!(!status.presentation_native_visible("window-b:2"));
+        assert!(status.presentation_native_visible("unrelated-window:1"));
+        for point in [(20.0, 20.0), (520.0, 20.0), (0.0, 0.0), (900.0, 690.0)] {
+            assert_eq!(
+                status.presentation_input_at(point.0, point.1),
+                crate::pane_presentation::PresentationInput::Renderer,
+                "multiple unproven host coordinate spaces cannot deliver native input"
+            );
+        }
+        status.pane_presentations.remove(0);
+        assert!(
+            status.presentation_native_visible("window-a:2"),
+            "restoring A cannot retain A's occlusion"
+        );
+        assert!(
+            !status.presentation_native_visible("window-b:2"),
+            "restoring A cannot restore B's covered sibling"
+        );
+        assert_eq!(status.presentation_native_content_rect("window-a:1"), None);
+        assert_eq!(
+            status.presentation_native_content_rect("window-b:1"),
+            b.content_rect
+        );
+        assert!(
+            status.capabilities.is_empty(),
+            "policy test does not advertise validated host routing"
+        );
+    }
+
     fn terminal_process() -> ProcessSpec {
         ProcessSpec {
             command: "foot".to_string(),

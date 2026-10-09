@@ -243,6 +243,16 @@ impl PresentationRequest {
 }
 
 impl StatusSnapshot {
+    pub fn presentation_native_content_rect(&self, pane_id: &str) -> Option<OverlayRect> {
+        self.pane_presentations
+            .iter()
+            .find_map(|request| match &request.selected {
+                Some(SelectedPane::Native { native_pane_id, .. }) if native_pane_id == pane_id => {
+                    request.content_rect
+                }
+                _ => None,
+            })
+    }
     pub fn presentation_input_at(&self, x: f64, y: f64) -> PresentationInput {
         match self.pane_presentations.as_slice() {
             [] => PresentationInput::Normal,
