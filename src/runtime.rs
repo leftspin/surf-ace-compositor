@@ -5717,9 +5717,9 @@ fn cursor_rect_to_scanout(
     let raw_h = scanout_size.h as f64;
     let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)].map(|(x, y)| match rotation {
         OutputRotation::Deg0 => (x * scale, y * scale),
-        OutputRotation::Deg90 => (raw_w - y * scale, x * scale),
+        OutputRotation::Deg90 => (y * scale, raw_h - x * scale),
         OutputRotation::Deg180 => (raw_w - x * scale, raw_h - y * scale),
-        OutputRotation::Deg270 => (y * scale, raw_h - x * scale),
+        OutputRotation::Deg270 => (raw_w - y * scale, x * scale),
     });
     let min_x = corners
         .iter()
@@ -14468,28 +14468,58 @@ mod tests {
         assert_eq!(
             super::cursor_rect_to_scanout(rect, scanout_size, 2.0, OutputRotation::Deg90),
             Some(Rectangle::<i32, Physical>::new(
-                (3720, 20).into(),
+                (40, 2080).into(),
                 (80, 60).into()
             ))
         );
         assert_eq!(
             super::cursor_rect_to_scanout(rect, scanout_size, 2.0, OutputRotation::Deg270),
             Some(Rectangle::<i32, Physical>::new(
-                (40, 2080).into(),
+                (3720, 20).into(),
                 (80, 60).into()
             ))
         );
     }
 
     #[test]
-    fn deg90_cursor_mapping_is_inverse_of_capture_rotation() {
+    fn software_cursor_scanout_pixels_match_scene_transform_at_every_rotation() {
         let scanout_size = Size::<i32, Physical>::from((3840, 2160));
-        let rect = Rectangle::<i32, Logical>::new((10, 20).into(), (30, 40).into());
-        let mapped = super::cursor_rect_to_scanout(rect, scanout_size, 2.0, OutputRotation::Deg90)
-            .expect("deg90 cursor rect should map into scanout bounds");
+        let rect = Rectangle::<i32, Logical>::new((123, 211).into(), (17, 23).into());
+        let transform_output_size = Size::<i32, BufferCoords>::from((3840, 2160));
+        let scale = 2;
 
-        assert_eq!(mapped.loc, (3720, 20).into());
-        assert_eq!(mapped.size, (80, 60).into());
+        for rotation in [
+            OutputRotation::Deg0,
+            OutputRotation::Deg90,
+            OutputRotation::Deg180,
+            OutputRotation::Deg270,
+        ] {
+            let transform = scene_texture_transform(rotation);
+            let scene_size = transform.transform_size(transform_output_size);
+            let source_rect = Rectangle::<i32, BufferCoords>::new(
+                (rect.loc.x * scale, rect.loc.y * scale).into(),
+                (rect.size.w * scale, rect.size.h * scale).into(),
+            );
+            let scene_rect = transform.transform_rect_in(source_rect, &scene_size);
+            let cursor_rect = super::cursor_rect_to_scanout(
+                rect,
+                scanout_size,
+                f64::from(scale),
+                rotation,
+            )
+            .expect("cursor rect should map into scanout bounds");
+
+            assert_eq!(
+                (cursor_rect.loc.x, cursor_rect.loc.y, cursor_rect.size.w, cursor_rect.size.h),
+                (
+                    scene_rect.loc.x,
+                    scene_rect.loc.y,
+                    scene_rect.size.w,
+                    scene_rect.size.h,
+                ),
+                "{rotation:?} software cursor must cover the same scanout pixels as its scene rect"
+            );
+        }
     }
 
     #[test]
@@ -14882,7 +14912,7 @@ mod tests {
         );
         assert_eq!(
             wayland_state.map_physical_pointer_point_to_logical((3839.0, 2159.0).into()),
-            Point::<f64, Logical>::from((1079.5, 0.5))
+            Point::<f64, Logical>::from((0.5, 1919.5))
         );
     }
 

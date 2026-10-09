@@ -493,9 +493,9 @@ impl RootGeometrySnapshot {
         let height = self.physical_size_px.height as f64;
         let (x, y) = match self.rotation {
             OutputRotation::Deg0 => (px / self.factor, py / self.factor),
-            OutputRotation::Deg90 => (py / self.factor, (width - px) / self.factor),
+            OutputRotation::Deg90 => ((height - py) / self.factor, px / self.factor),
             OutputRotation::Deg180 => ((width - px) / self.factor, (height - py) / self.factor),
-            OutputRotation::Deg270 => ((height - py) / self.factor, px / self.factor),
+            OutputRotation::Deg270 => (py / self.factor, (width - px) / self.factor),
         };
         (
             clamp_half_open(x, self.logical_size.width),
@@ -587,9 +587,9 @@ impl RootGeometrySnapshot {
         let height = self.physical_size_px.height as f64;
         match self.rotation {
             OutputRotation::Deg0 => (ox * self.factor, oy * self.factor),
-            OutputRotation::Deg90 => (width - oy * self.factor, ox * self.factor),
+            OutputRotation::Deg90 => (oy * self.factor, height - ox * self.factor),
             OutputRotation::Deg180 => (width - ox * self.factor, height - oy * self.factor),
-            OutputRotation::Deg270 => (oy * self.factor, height - ox * self.factor),
+            OutputRotation::Deg270 => (width - oy * self.factor, ox * self.factor),
         }
     }
 }
@@ -840,8 +840,8 @@ mod tests {
             (
                 OutputRotation::Deg90,
                 PhysicalPixelRect {
-                    x: 3747,
-                    y: 13,
+                    x: 26,
+                    y: 2016,
                     width: 67,
                     height: 131,
                 },
@@ -858,8 +858,8 @@ mod tests {
             (
                 OutputRotation::Deg270,
                 PhysicalPixelRect {
-                    x: 26,
-                    y: 2016,
+                    x: 3747,
+                    y: 13,
                     width: 67,
                     height: 131,
                 },
@@ -879,17 +879,57 @@ mod tests {
     fn input_transform_applies_scale_and_rotation_once() {
         let expected = [
             (OutputRotation::Deg0, (10.384615384615, 20.384615384615)),
-            (OutputRotation::Deg90, (20.384615384615, 2943.461538461538)),
+            (OutputRotation::Deg90, (1641.153846153846, 10.384615384615)),
             (
                 OutputRotation::Deg180,
                 (2943.461538461538, 1641.153846153846),
             ),
-            (OutputRotation::Deg270, (1641.153846153846, 10.384615384615)),
+            (OutputRotation::Deg270, (20.384615384615, 2943.461538461538)),
         ];
         for (rotation, golden) in expected {
             let actual = snapshot(rotation).physical_to_logical(13.5, 26.5);
             assert!((actual.0 - golden.0).abs() < 1e-9);
             assert!((actual.1 - golden.1).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn root_geometry_and_absolute_input_follow_the_rendered_scene_rotation() {
+        use crate::output_rotation_model::OutputRotationModel;
+        use smithay::utils::{Buffer as BufferCoords, Point, Size};
+
+        let point = (137.25, 211.5);
+        let factor = 2.0;
+        let physical_size = Size::<f64, BufferCoords>::from((3840.0, 2160.0));
+
+        for rotation in [
+            OutputRotation::Deg0,
+            OutputRotation::Deg90,
+            OutputRotation::Deg180,
+            OutputRotation::Deg270,
+        ] {
+            let transform = OutputRotationModel::new(rotation).scene_texture_transform();
+            let scene_size = transform.transform_size(physical_size);
+            let scene_point = transform.transform_point_in(
+                Point::<f64, BufferCoords>::from((point.0 * factor, point.1 * factor)),
+                &scene_size,
+            );
+            let snapshot = RootGeometrySnapshot::new(
+                3840,
+                2160,
+                factor,
+                DisplayScaleSource::Config,
+                rotation,
+                1,
+            )
+            .unwrap();
+
+            let scanout_point = snapshot.logical_to_physical(point.0, point.1);
+            assert_eq!(scanout_point, (scene_point.x, scene_point.y));
+
+            let input_point = snapshot.physical_to_logical(scanout_point.0, scanout_point.1);
+            assert!((input_point.0 - point.0).abs() < 1e-9, "{rotation:?}");
+            assert!((input_point.1 - point.1).abs() < 1e-9, "{rotation:?}");
         }
     }
 
