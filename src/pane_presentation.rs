@@ -143,10 +143,53 @@ impl PresentationLedger {
     pub fn clear_surface(&mut self, surface_id: &str) {
         self.entries.remove(surface_id);
     }
+
+    pub fn active_requests(
+        &self,
+        generations: &BTreeMap<String, NativePanePresentationGeneration>,
+    ) -> Vec<PresentationRequest> {
+        generations
+            .values()
+            .filter_map(|generation| {
+                let entry = self.entries.get(&generation.surface_id)?;
+                if entry.selected.is_none()
+                    || entry.presentation_generation.surface_epoch != generation.surface_epoch
+                    || entry.presentation_generation.topology_epoch != generation.topology_epoch
+                {
+                    return None;
+                }
+                if let Some(SelectedPane::Native {
+                    native_pane_id,
+                    native_pane_instance_id,
+                    ..
+                }) = &entry.selected
+                {
+                    if generation.pane_instances.get(native_pane_id)
+                        != Some(native_pane_instance_id)
+                    {
+                        return None;
+                    }
+                }
+                let mut projected = entry.clone();
+                // A retained sibling can acquire native content without changing topology.
+                // Visibility must cover the current cohort, not only the initial cohort.
+                projected.presentation_generation.pane_instances =
+                    generation.pane_instances.clone();
+                Some(projected)
+            })
+            .collect()
+    }
 }
 
 impl PresentationRequest {
     pub fn native_visible(&self, pane_id: &str) -> bool {
+        if !self
+            .presentation_generation
+            .pane_instances
+            .contains_key(pane_id)
+        {
+            return true;
+        }
         match &self.selected {
             None => true,
             Some(SelectedPane::Native { native_pane_id, .. }) => native_pane_id == pane_id,
@@ -269,6 +312,48 @@ mod tests {
         assert!(!req.native_visible("s:1") && !req.native_visible("s:9"));
         assert_eq!(req.input_at(400.0, 300.0), PresentationInput::Renderer);
         assert_eq!(req.input_at(2.0, 2.0), PresentationInput::Renderer);
+    }
+    #[test]
+    fn retained_selection_covers_new_native_sibling_without_affecting_other_window() {
+        let req = request(1);
+        let mut current = req.presentation_generation.clone();
+        let mut ledger = PresentationLedger::default();
+        ledger.accept(req, &current, (1000.0, 700.0)).unwrap();
+        current.geometry_revision += 1;
+        current.focus_revision += 1;
+        current
+            .pane_instances
+            .insert("s:3".into(), "new-instance".into());
+        let active = ledger.active_requests(&BTreeMap::from([("s".into(), current)]));
+        assert_eq!(active.len(), 1);
+        assert!(active[0].native_visible("s:1"));
+        assert!(!active[0].native_visible("s:3"));
+        assert!(active[0].native_visible("other-window:3"));
+    }
+    #[test]
+    fn topology_or_selected_instance_replacement_clears_display_projection() {
+        let req = request(1);
+        let current = req.presentation_generation.clone();
+        let mut ledger = PresentationLedger::default();
+        ledger.accept(req, &current, (1000.0, 700.0)).unwrap();
+        let mut changed = current.clone();
+        changed.topology_epoch += 1;
+        assert!(
+            ledger
+                .active_requests(&BTreeMap::from([("s".into(), changed)]))
+                .is_empty()
+        );
+        let mut changed = current;
+        changed
+            .pane_instances
+            .insert("s:1".into(), "replacement-instance".into());
+        assert!(
+            ledger
+                .active_requests(&BTreeMap::from([("s".into(), changed)]))
+                .is_empty()
+        );
+        ledger.clear_surface("s");
+        assert!(ledger.entries.is_empty());
     }
     #[test]
     fn restore_tombstone_rejects_delayed_selection_and_conflicting_replay() {

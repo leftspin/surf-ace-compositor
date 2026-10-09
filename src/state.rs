@@ -15,6 +15,9 @@ use crate::model::{
 use crate::output_rotation_memory::OutputRotationMemory;
 use crate::output_rotation_model::OutputRotationModel;
 use crate::overlay_role_policy::{OverlayRolePolicy, OverlayRolePolicyError};
+use crate::pane_presentation::{
+    PresentationAck, PresentationLedger, PresentationRequest, SelectedPane,
+};
 use crate::process_manager::{ProcessController, ProcessControllerEvent, ProcessRequestId};
 use crate::root_geometry::{
     CommittedRootGeometry, LogicalRect, RootGeometryAuthority, RootGeometryError,
@@ -162,6 +165,7 @@ pub struct CompositorState {
     topology_epoch: String,
     overlay_role_policy: OverlayRolePolicy,
     native_pane_presentation_generations: BTreeMap<String, NativePanePresentationGeneration>,
+    pane_presentations: PresentationLedger,
     native_pane_window_group_requests: BTreeMap<PaneId, NativePaneWindowGroupRequest>,
     runtime: RuntimeStatus,
     configured_sun_schedule_profile: Option<NodeSunScheduleProfile>,
@@ -646,6 +650,7 @@ impl CompositorState {
         self.runtime.active_focus_target = None;
         self.runtime.active_focus_generation = None;
         self.native_pane_presentation_generations.clear();
+        self.pane_presentations = PresentationLedger::default();
     }
 
     fn clear_host_runtime_route_status(&mut self) {
@@ -707,6 +712,7 @@ impl CompositorState {
             topology_epoch: "topology-0".to_string(),
             overlay_role_policy: OverlayRolePolicy::default(),
             native_pane_presentation_generations: BTreeMap::new(),
+            pane_presentations: PresentationLedger::default(),
             native_pane_window_group_requests: BTreeMap::new(),
             runtime: RuntimeStatus::default(),
             configured_sun_schedule_profile: None,
@@ -1500,6 +1506,41 @@ impl CompositorState {
             }
         }
         Ok(())
+    }
+
+    pub fn set_pane_presentation(
+        &mut self,
+        request: PresentationRequest,
+    ) -> Result<PresentationAck, String> {
+        if self.runtime.main_app_surface_id.is_none() {
+            return Err("pane presentation requires a bound main-app surface".into());
+        }
+        let current = self
+            .native_pane_presentation_generations
+            .get(&request.presentation_generation.surface_id)
+            .ok_or("pane presentation has no routed surface generation")?;
+        if let Some(SelectedPane::Native {
+            native_pane_id,
+            native_pane_instance_id,
+            ..
+        }) = &request.selected
+        {
+            let id = PaneId::new(native_pane_id.clone());
+            let pane = self
+                .panes
+                .get(&id)
+                .ok_or("selected native pane is absent")?;
+            if !pane_retains_overlay_regions(pane)
+                || pane_instance_id(&id, pane) != *native_pane_instance_id
+            {
+                return Err("selected native pane instance is not live".into());
+            }
+        }
+        let (width, height) = self
+            .runtime_logical_surface_size()
+            .ok_or("missing logical surface size")?;
+        self.pane_presentations
+            .accept(request, current, (f64::from(width), f64::from(height)))
     }
 
     pub fn record_native_pane_presentation_generation(
@@ -2788,6 +2829,14 @@ impl CompositorState {
         let native_pane_window_groups = self.native_pane_window_groups_status();
 
         StatusSnapshot {
+            // Advertise only after the rendering and input consumers are wired.
+            capabilities: BTreeMap::new(),
+            pane_presentations: if self.runtime.main_app_surface_id.is_some() {
+                self.pane_presentations
+                    .active_requests(&self.native_pane_presentation_generations)
+            } else {
+                Vec::new()
+            },
             host_mode_active: self.host_mode_active,
             output_rotation: self.output_rotation,
             display_scale: self

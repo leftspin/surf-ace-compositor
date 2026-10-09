@@ -68,6 +68,10 @@ pub struct RuntimeAppBindingDiagnostics {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlRequest {
+    #[serde(rename = "pane_presentation.set")]
+    PanePresentationSet {
+        request: crate::pane_presentation::PresentationRequest,
+    },
     GetStatus,
     GetHostMode,
     #[serde(rename = "main_app.bind")]
@@ -217,6 +221,8 @@ impl Eq for RuntimeControlCommand {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ControlResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_presentation: Option<crate::pane_presentation::PresentationAck>,
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -243,6 +249,7 @@ impl ControlResponse {
             capture_path: None,
             geometry: None,
             runtime_app_binding: None,
+            pane_presentation: None,
         }
     }
 
@@ -254,6 +261,7 @@ impl ControlResponse {
             capture_path: None,
             geometry: None,
             runtime_app_binding: None,
+            pane_presentation: None,
         }
     }
 
@@ -265,6 +273,7 @@ impl ControlResponse {
             capture_path: Some(path),
             geometry,
             runtime_app_binding: None,
+            pane_presentation: None,
         }
     }
 
@@ -279,6 +288,7 @@ impl ControlResponse {
             capture_path: None,
             geometry: None,
             runtime_app_binding: Some(diagnostics),
+            pane_presentation: None,
         }
     }
 }
@@ -485,6 +495,16 @@ fn handle_request_with_capture(
     screen_capture: &ScreenCaptureStore,
 ) -> ControlResponse {
     let result = match request {
+        ControlRequest::PanePresentationSet { request } => {
+            return match state.set_pane_presentation(request) {
+                Ok(ack) => {
+                    let mut response = ControlResponse::ok(Some(state.status_snapshot()));
+                    response.pane_presentation = Some(ack);
+                    response
+                }
+                Err(error) => ControlResponse::err(error),
+            };
+        }
         ControlRequest::GetStatus | ControlRequest::GetHostMode => {
             state.poll_processes();
             Ok(Some(state.status_snapshot()))
@@ -869,6 +889,51 @@ fn current_unix_seconds() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pane_presentation_wire_request_is_explicit_and_rejects_unknown_fields() {
+        let wire = serde_json::json!({
+            "type": "pane_presentation.set", "request": {"version": 1, "request_revision": 1,
+            "presentation_generation": {
+                "surface_id": "s", "surface_epoch": "s:1", "topology_epoch": 2,
+                "geometry_revision": 3, "focus_revision": 4, "pane_instances": {}
+            },
+            "selected": null, "overlay_rect": null, "content_rect": null}
+        });
+        let parsed: ControlRequest = serde_json::from_value(wire.clone()).unwrap();
+        assert!(matches!(parsed, ControlRequest::PanePresentationSet { .. }));
+        assert_eq!(serde_json::to_value(parsed).unwrap(), wire);
+        let mut unsupported = wire;
+        unsupported["request"]["ignored_presentation"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<ControlRequest>(unsupported).is_err());
+    }
+    #[test]
+    fn pane_presentation_without_bound_host_is_rejected_without_advertising_support() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
+        let request = crate::pane_presentation::PresentationRequest {
+            version: 1,
+            request_revision: 1,
+            presentation_generation: NativePanePresentationGeneration {
+                surface_id: "s".into(),
+                surface_epoch: "s:1".into(),
+                topology_epoch: 2,
+                geometry_revision: 3,
+                focus_revision: 4,
+                pane_instances: BTreeMap::new(),
+            },
+            selected: None,
+            overlay_rect: None,
+            content_rect: None,
+        };
+        assert!(
+            state
+                .set_pane_presentation(request)
+                .unwrap_err()
+                .contains("bound main-app")
+        );
+        let status = state.status_snapshot();
+        assert!(status.pane_presentations.is_empty());
+        assert!(status.capabilities.is_empty());
+    }
     use crate::model::{
         CompositorOverlayKind, EnvironmentAppearance, ExternalNativeLifecycleState,
         HostRuntimeStartTrigger, MainAppLaunchIntent, MainAppSurfaceBinding, NativePaneHostRequest,
