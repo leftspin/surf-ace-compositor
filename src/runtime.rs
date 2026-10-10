@@ -5717,9 +5717,9 @@ fn cursor_rect_to_scanout(
     let raw_h = scanout_size.h as f64;
     let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)].map(|(x, y)| match rotation {
         OutputRotation::Deg0 => (x * scale, y * scale),
-        OutputRotation::Deg90 => (raw_w - y * scale, x * scale),
+        OutputRotation::Deg90 => (y * scale, raw_h - x * scale),
         OutputRotation::Deg180 => (raw_w - x * scale, raw_h - y * scale),
-        OutputRotation::Deg270 => (y * scale, raw_h - x * scale),
+        OutputRotation::Deg270 => (raw_w - y * scale, x * scale),
     });
     let min_x = corners
         .iter()
@@ -10836,9 +10836,9 @@ fn native_source_sample(
     let raw_v = (rel_y as f64 + 0.5) / dst_h as f64;
     let (oriented_u, oriented_v) = match rotation {
         OutputRotation::Deg0 => (raw_u, raw_v),
-        OutputRotation::Deg90 => (raw_v, 1.0 - raw_u),
+        OutputRotation::Deg90 => (1.0 - raw_v, raw_u),
         OutputRotation::Deg180 => (1.0 - raw_u, 1.0 - raw_v),
-        OutputRotation::Deg270 => (1.0 - raw_v, raw_u),
+        OutputRotation::Deg270 => (raw_v, 1.0 - raw_u),
     };
     let (source_x, source_y, source_width, source_height) =
         native_materialization.map_or((0.0, 0.0, src_w as f64, src_h as f64), |projection| {
@@ -14468,28 +14468,59 @@ mod tests {
         assert_eq!(
             super::cursor_rect_to_scanout(rect, scanout_size, 2.0, OutputRotation::Deg90),
             Some(Rectangle::<i32, Physical>::new(
-                (3720, 20).into(),
+                (40, 2080).into(),
                 (80, 60).into()
             ))
         );
         assert_eq!(
             super::cursor_rect_to_scanout(rect, scanout_size, 2.0, OutputRotation::Deg270),
             Some(Rectangle::<i32, Physical>::new(
-                (40, 2080).into(),
+                (3720, 20).into(),
                 (80, 60).into()
             ))
         );
     }
 
     #[test]
-    fn deg90_cursor_mapping_is_inverse_of_capture_rotation() {
+    fn software_cursor_scanout_pixels_match_scene_transform_at_every_rotation() {
         let scanout_size = Size::<i32, Physical>::from((3840, 2160));
-        let rect = Rectangle::<i32, Logical>::new((10, 20).into(), (30, 40).into());
-        let mapped = super::cursor_rect_to_scanout(rect, scanout_size, 2.0, OutputRotation::Deg90)
-            .expect("deg90 cursor rect should map into scanout bounds");
+        let rect = Rectangle::<i32, Logical>::new((123, 211).into(), (17, 23).into());
+        let transform_output_size = Size::<i32, BufferCoords>::from((3840, 2160));
+        let scale = 2;
 
-        assert_eq!(mapped.loc, (3720, 20).into());
-        assert_eq!(mapped.size, (80, 60).into());
+        for rotation in [
+            OutputRotation::Deg0,
+            OutputRotation::Deg90,
+            OutputRotation::Deg180,
+            OutputRotation::Deg270,
+        ] {
+            let transform = scene_texture_transform(rotation);
+            let scene_size = transform.transform_size(transform_output_size);
+            let source_rect = Rectangle::<i32, BufferCoords>::new(
+                (rect.loc.x * scale, rect.loc.y * scale).into(),
+                (rect.size.w * scale, rect.size.h * scale).into(),
+            );
+            let scene_rect = transform.transform_rect_in(source_rect, &scene_size);
+            let cursor_rect =
+                super::cursor_rect_to_scanout(rect, scanout_size, f64::from(scale), rotation)
+                    .expect("cursor rect should map into scanout bounds");
+
+            assert_eq!(
+                (
+                    cursor_rect.loc.x,
+                    cursor_rect.loc.y,
+                    cursor_rect.size.w,
+                    cursor_rect.size.h
+                ),
+                (
+                    scene_rect.loc.x,
+                    scene_rect.loc.y,
+                    scene_rect.size.w,
+                    scene_rect.size.h,
+                ),
+                "{rotation:?} software cursor must cover the same scanout pixels as its scene rect"
+            );
+        }
     }
 
     #[test]
@@ -14882,7 +14913,7 @@ mod tests {
         );
         assert_eq!(
             wayland_state.map_physical_pointer_point_to_logical((3839.0, 2159.0).into()),
-            Point::<f64, Logical>::from((1079.5, 0.5))
+            Point::<f64, Logical>::from((0.5, 1919.5))
         );
     }
 
@@ -15203,6 +15234,142 @@ mod tests {
                 assert!(y > projection.fractional_phase_y);
                 assert!(y < projection.fractional_phase_y + 50.75 * 1.3);
             }
+        }
+    }
+
+    #[test]
+    fn production_sampler_matches_asymmetric_content_under_cursor_for_all_rotations_at_scale_two() {
+        let physical_size = Size::<i32, Physical>::from((3840, 2160));
+        let display_scale = 2.0;
+        let surface = crate::root_geometry::LogicalRect {
+            x: 100.0,
+            y: 200.0,
+            width: 4.0,
+            height: 6.0,
+        };
+        let pointer = Point::<f64, Logical>::from((101.25, 202.25));
+        let source_size = (8_usize, 12_usize);
+        let source_pixels: Vec<_> = (0..source_size.1)
+            .flat_map(|y| {
+                (0..source_size.0).map(move |x| {
+                    (
+                        x as u8,
+                        y as u8,
+                        x.wrapping_mul(37).wrapping_add(y.wrapping_mul(13)) as u8,
+                    )
+                })
+            })
+            .collect();
+        let rotation_config = serde_json::json!({
+            "root4": { "display_scale_factor": display_scale }
+        });
+
+        for rotation in [
+            OutputRotation::Deg0,
+            OutputRotation::Deg90,
+            OutputRotation::Deg180,
+            OutputRotation::Deg270,
+        ] {
+            let mut geometry =
+                crate::root_geometry::RootGeometryAuthority::from_config(Some(&rotation_config))
+                    .unwrap();
+            let root = geometry
+                .initialize(physical_size.w, physical_size.h, rotation)
+                .unwrap();
+            let logical_size = root.logical_size_i32();
+            let (scanout_x, scanout_y) = root.logical_to_physical(pointer.x, pointer.y);
+            let pixel_x = scanout_x.floor() as i32;
+            let pixel_y = scanout_y.floor() as i32;
+            assert!((scanout_x - (f64::from(pixel_x) + 0.5)).abs() < 1e-9);
+            assert!((scanout_y - (f64::from(pixel_y) + 0.5)).abs() < 1e-9);
+
+            let tip =
+                Point::<i32, Logical>::from((pointer.x.round() as i32, pointer.y.round() as i32));
+            let cursor_tip =
+                super::software_cursor_rects(pointer, logical_size.width, logical_size.height)
+                    .into_iter()
+                    .find_map(|(rect, color)| {
+                        (color == super::SoftwareCursorColor::White
+                            && tip.x >= rect.loc.x
+                            && tip.x < rect.loc.x + rect.size.w
+                            && tip.y >= rect.loc.y
+                            && tip.y < rect.loc.y + rect.size.h)
+                            .then_some(rect)
+                    })
+                    .expect("the white cursor tip must cover the rounded pointer location");
+            let cursor_scanout =
+                super::cursor_rect_to_scanout(cursor_tip, physical_size, display_scale, rotation)
+                    .expect("the cursor tip should map into the scanout");
+            let root_crop = root.physical_crop(crate::root_geometry::LogicalRect {
+                x: f64::from(tip.x),
+                y: f64::from(tip.y),
+                width: 1.0,
+                height: 1.0,
+            });
+            let cursor_tip_scanout = Rectangle::<i32, Physical>::new(
+                (root_crop.x, root_crop.y).into(),
+                (root_crop.width, root_crop.height).into(),
+            );
+            let surface_crop = root.physical_crop(surface);
+            let surface_scanout = Rectangle::<i32, Physical>::new(
+                (surface_crop.x, surface_crop.y).into(),
+                (surface_crop.width, surface_crop.height).into(),
+            );
+
+            assert_eq!(
+                cursor_scanout, cursor_tip_scanout,
+                "{rotation:?} cursor/root crop"
+            );
+            assert_eq!(
+                (surface_scanout.size.w, surface_scanout.size.h),
+                match rotation {
+                    OutputRotation::Deg0 | OutputRotation::Deg180 => (8, 12),
+                    OutputRotation::Deg90 | OutputRotation::Deg270 => (12, 8),
+                },
+                "{rotation:?} surface crop must follow the root transform"
+            );
+            for rect in [cursor_scanout, cursor_tip_scanout] {
+                assert!(pixel_x >= rect.loc.x && pixel_x < rect.loc.x + rect.size.w);
+                assert!(pixel_y >= rect.loc.y && pixel_y < rect.loc.y + rect.size.h);
+            }
+            assert!(pixel_x >= surface_scanout.loc.x);
+            assert!(pixel_x < surface_scanout.loc.x + surface_scanout.size.w);
+            assert!(pixel_y >= surface_scanout.loc.y);
+            assert!(pixel_y < surface_scanout.loc.y + surface_scanout.size.h);
+
+            let (sample_x, sample_y) = native_source_sample(
+                None,
+                rotation,
+                (pixel_x - surface_scanout.loc.x) as usize,
+                (pixel_y - surface_scanout.loc.y) as usize,
+                surface_scanout.size.w as usize,
+                surface_scanout.size.h as usize,
+                source_size.0,
+                source_size.1,
+            );
+            let expected_source = (
+                (pointer.x - surface.x) * display_scale,
+                (pointer.y - surface.y) * display_scale,
+            );
+            assert!(
+                (sample_x - expected_source.0).abs() < 1e-9,
+                "{rotation:?} source x"
+            );
+            assert!(
+                (sample_y - expected_source.1).abs() < 1e-9,
+                "{rotation:?} source y"
+            );
+
+            // Each source texel has an asymmetric coordinate-derived color so
+            // a quarter-turn reversal selects a visibly different texel.
+            let sampled_texel = source_pixels
+                [sample_y.floor() as usize * source_size.0 + sample_x.floor() as usize];
+            let expected_texel = source_pixels[expected_source.1.floor() as usize * source_size.0
+                + expected_source.0.floor() as usize];
+            assert_eq!(
+                sampled_texel, expected_texel,
+                "{rotation:?} sampled content must stay under the cursor tip"
+            );
         }
     }
 
