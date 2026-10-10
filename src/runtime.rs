@@ -15270,10 +15270,9 @@ mod tests {
             OutputRotation::Deg180,
             OutputRotation::Deg270,
         ] {
-            let mut geometry = crate::root_geometry::RootGeometryAuthority::from_config(Some(
-                &rotation_config,
-            ))
-            .unwrap();
+            let mut geometry =
+                crate::root_geometry::RootGeometryAuthority::from_config(Some(&rotation_config))
+                    .unwrap();
             let root = geometry
                 .initialize(physical_size.w, physical_size.h, rotation)
                 .unwrap();
@@ -15284,32 +15283,23 @@ mod tests {
             assert!((scanout_x - (f64::from(pixel_x) + 0.5)).abs() < 1e-9);
             assert!((scanout_y - (f64::from(pixel_y) + 0.5)).abs() < 1e-9);
 
-            let tip = Point::<i32, Logical>::from((
-                pointer.x.round() as i32,
-                pointer.y.round() as i32,
-            ));
-            let cursor_tip = super::software_cursor_rects(
-                pointer,
-                logical_size.width,
-                logical_size.height,
-            )
-                .into_iter()
-                .find_map(|(rect, color)| {
-                    (color == super::SoftwareCursorColor::White
-                        && tip.x >= rect.loc.x
-                        && tip.x < rect.loc.x + rect.size.w
-                        && tip.y >= rect.loc.y
-                        && tip.y < rect.loc.y + rect.size.h)
-                    .then_some(rect)
-                })
-                .expect("the white cursor tip must cover the rounded pointer location");
-            let cursor_scanout = super::cursor_rect_to_scanout(
-                cursor_tip,
-                physical_size,
-                display_scale,
-                rotation,
-            )
-            .expect("the cursor tip should map into the scanout");
+            let tip =
+                Point::<i32, Logical>::from((pointer.x.round() as i32, pointer.y.round() as i32));
+            let cursor_tip =
+                super::software_cursor_rects(pointer, logical_size.width, logical_size.height)
+                    .into_iter()
+                    .find_map(|(rect, color)| {
+                        (color == super::SoftwareCursorColor::White
+                            && tip.x >= rect.loc.x
+                            && tip.x < rect.loc.x + rect.size.w
+                            && tip.y >= rect.loc.y
+                            && tip.y < rect.loc.y + rect.size.h)
+                            .then_some(rect)
+                    })
+                    .expect("the white cursor tip must cover the rounded pointer location");
+            let cursor_scanout =
+                super::cursor_rect_to_scanout(cursor_tip, physical_size, display_scale, rotation)
+                    .expect("the cursor tip should map into the scanout");
             let root_crop = root.physical_crop(crate::root_geometry::LogicalRect {
                 x: f64::from(tip.x),
                 y: f64::from(tip.y),
@@ -15372,16 +15362,12 @@ mod tests {
 
             // Each source texel has an asymmetric coordinate-derived color so
             // a quarter-turn reversal selects a visibly different texel.
-            let sampled_texel = source_pixels[
-                sample_y.floor() as usize * source_size.0 + sample_x.floor() as usize
-            ];
-            let expected_texel = source_pixels[
-                expected_source.1.floor() as usize * source_size.0
-                    + expected_source.0.floor() as usize
-            ];
+            let sampled_texel = source_pixels
+                [sample_y.floor() as usize * source_size.0 + sample_x.floor() as usize];
+            let expected_texel = source_pixels[expected_source.1.floor() as usize * source_size.0
+                + expected_source.0.floor() as usize];
             assert_eq!(
-                sampled_texel,
-                expected_texel,
+                sampled_texel, expected_texel,
                 "{rotation:?} sampled content must stay under the cursor tip"
             );
         }
