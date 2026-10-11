@@ -8359,6 +8359,45 @@ impl RuntimeWaylandState {
         self.promote_pending_toplevels();
         self.sync_runtime_status_with_roles();
         self.apply_focus_route();
+        self.refresh_active_root_geometry_consumers_for_current_panes();
+    }
+
+    fn refresh_active_root_geometry_consumers_for_current_panes(&mut self) {
+        if self.presentation_root_geometry.is_some() || self.staged_root_geometry.is_some() {
+            return;
+        }
+
+        let refreshed = {
+            let state = lock_state(&self.shared_state);
+            let Some(committed) = state.root_geometry_projections() else {
+                return;
+            };
+            if self
+                .active_root_geometry_consumers
+                .as_ref()
+                .is_none_or(|active| {
+                    active.committed.snapshot.generation != committed.snapshot.generation
+                })
+            {
+                return;
+            }
+            #[cfg(test)]
+            {
+                stage_runtime_root_geometry_consumers(&state, committed, None)
+            }
+            #[cfg(not(test))]
+            {
+                stage_runtime_root_geometry_consumers(&state, committed)
+            }
+        };
+
+        match refreshed {
+            Ok(consumers) => self.active_root_geometry_consumers = Some(consumers),
+            Err(error) => eprintln!(
+                "root4 native pane attachment could not refresh active consumers: {}",
+                error.code()
+            ),
+        }
     }
 
     fn assign_overlay_role_or_queue(&mut self, surface: ToplevelSurface) {
@@ -11369,6 +11408,7 @@ mod tests {
     use smithay::backend::renderer::element::Element;
     use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as XdgDecorationMode;
     use smithay::reexports::wayland_server::Display;
+    use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
     use smithay::reexports::calloop::EventLoop;
     use smithay::reexports::drm as drm_api;
     use smithay::reexports::drm::control::Mode as DrmMode;
@@ -11797,6 +11837,82 @@ mod tests {
                 ))
                 .expect("fixture ids must publish");
             release_rx.recv().expect("server must finish tree proof");
+        });
+        (ready_rx, release_tx)
+    }
+
+    fn spawn_real_shm_toplevel(
+        socket: UnixStream,
+        width: i32,
+        height: i32,
+        pixel: [u8; 4],
+    ) -> (mpsc::Receiver<u32>, mpsc::Sender<()>) {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let connection = Connection::from_socket(socket).expect("client socket must connect");
+            let (globals, mut queue) = registry_queue_init::<SurfaceTreeClient>(&connection)
+                .expect("fixture globals must roundtrip");
+            let qh = queue.handle();
+            let compositor = globals
+                .bind::<wl_compositor::WlCompositor, _, _>(&qh, 1..=6, ())
+                .expect("wl_compositor must exist");
+            let shm = globals
+                .bind::<wl_shm::WlShm, _, _>(&qh, 1..=1, ())
+                .expect("wl_shm must exist");
+            let wm_base = globals
+                .bind::<xdg_wm_base::XdgWmBase, _, _>(&qh, 1..=6, ())
+                .expect("xdg_wm_base must exist");
+            let surface = compositor.create_surface(&qh, ());
+            let surface_id = surface.id().protocol_id();
+            let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+            let _toplevel = xdg_surface.get_toplevel(&qh, ());
+            surface.commit();
+            connection
+                .flush()
+                .expect("toplevel initial commit must flush");
+
+            let mut client_state = SurfaceTreeClient::default();
+            while !client_state.configured {
+                queue
+                    .blocking_dispatch(&mut client_state)
+                    .expect("native pane fixture must receive configure");
+            }
+
+            let byte_len = (width * height * 4) as usize;
+            let fd = rustix::fs::memfd_create(
+                "t316-dynamic-native-pane",
+                rustix::fs::MemfdFlags::CLOEXEC,
+            )
+            .expect("fixture memfd must allocate");
+            rustix::fs::ftruncate(&fd, byte_len as u64).expect("fixture memfd must size");
+            let pixels = pixel.repeat((width * height) as usize);
+            assert_eq!(
+                rustix::io::pwrite(&fd, &pixels, 0).expect("fixture pixels must write"),
+                byte_len
+            );
+            let pool = shm.create_pool(fd.as_fd(), byte_len as i32, &qh, ());
+            let buffer = pool.create_buffer(
+                0,
+                width,
+                height,
+                width * 4,
+                wl_shm::Format::Argb8888,
+                &qh,
+                (),
+            );
+            surface.attach(Some(&buffer), 0, 0);
+            surface.damage_buffer(0, 0, width, height);
+            surface.commit();
+            connection
+                .flush()
+                .expect("native pane buffer commit must flush");
+            ready_tx
+                .send(surface_id)
+                .expect("test must receive the pane surface ID");
+            release_rx
+                .recv()
+                .expect("server must finish the native pane proof");
         });
         (ready_rx, release_tx)
     }
@@ -13751,6 +13867,124 @@ mod tests {
                 pane_id: PaneId::new("pane-a")
             }
         );
+    }
+
+    #[test]
+    fn dynamically_attached_native_pane_is_in_active_render_snapshot() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
+        state.mark_runtime_resize(200, 100);
+        let shared_state = Arc::new(Mutex::new(state));
+        let mut display: Display<RuntimeWaylandState> = Display::new().unwrap();
+        let mut display_handle = display.handle();
+        let mut wayland =
+            RuntimeWaylandState::new(display_handle.clone(), Arc::clone(&shared_state)).unwrap();
+        let initial_generation = wayland
+            .active_root_geometry_consumers
+            .as_ref()
+            .expect("test host must have active root geometry")
+            .committed
+            .snapshot
+            .generation;
+        assert!(
+            wayland
+                .active_root_geometry_consumers
+                .as_ref()
+                .unwrap()
+                .topology
+                .panes
+                .is_empty(),
+            "the root geometry snapshot starts before the dynamic pane exists"
+        );
+
+        let pane_id = PaneId::new("surface:diagnostic-pane");
+        lock_state(&shared_state)
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
+                id: pane_id.clone(),
+                content_id: Some("diagnostic-content".to_string()),
+                binding_id: Some("diagnostic-binding".to_string()),
+                launch_token: None,
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 10.0,
+                    y: 5.0,
+                    width: 20.0,
+                    height: 10.0,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+                target: NativeTargetClass::Terminal,
+                process: ProcessSpec {
+                    command: "diagnostic-pane-fixture".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: Default::default(),
+                },
+            }])
+            .expect("dynamic native pane request must be accepted");
+
+        let (server_socket, client_socket) = UnixStream::pair().unwrap();
+        let server_client = display_handle
+            .insert_client(
+                server_socket,
+                Arc::new(super::RuntimeClientState::default()),
+            )
+            .unwrap();
+        let (buffer_ready, release_client) =
+            spawn_real_shm_toplevel(client_socket, 40, 20, [0x33, 0x22, 0x11, 0xff]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let pane_surface = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "real client must offer its dynamic native pane toplevel"
+            );
+            display.dispatch_clients(&mut wayland).unwrap();
+            if !wayland.pending_toplevels.is_empty() {
+                let native = wayland.pending_toplevels.remove(0);
+                wayland.assign_native_pane_role(native, pane_id.clone(), std::process::id());
+            }
+            display.flush_clients().unwrap();
+            if let Ok(surface_id) = buffer_ready.try_recv() {
+                let surface: WlSurface = server_client
+                    .object_from_protocol_id(&display_handle, surface_id)
+                    .expect("server must recover the real native pane surface");
+                if wayland
+                    .host_surface_buffers
+                    .contains_key(&super::surface_key(&surface))
+                {
+                    break surface;
+                }
+            }
+            std::thread::yield_now();
+        };
+        release_client
+            .send(())
+            .expect("native pane client must finish its buffer proof");
+
+        let active = wayland
+            .active_root_geometry_consumers
+            .as_ref()
+            .expect("active root geometry must remain installed");
+        assert_eq!(active.committed.snapshot.generation, initial_generation);
+        assert!(active.topology.panes.iter().any(|pane| pane.id == pane_id));
+        assert!(
+            active
+                .native_materializations
+                .iter()
+                .any(|(id, projection)| id == &pane_id
+                    && projection.width_px == 40
+                    && projection.height_px == 20)
+        );
+        let snapshot = wayland
+            .host_surface_buffers
+            .get(&super::surface_key(&pane_surface))
+            .expect("first native pane buffer must be retained");
+        assert_eq!(snapshot.root_geometry_generation, Some(initial_generation));
+
+        let mut scanout = vec![0; 200 * 100 * 4];
+        let composed = wayland.compose_host_scene(&mut scanout, 200 * 4, 200, 100);
+        assert_eq!(composed.composed_surfaces, 1);
+        let pixel_index = (15 * 200 + 25) * 4;
+        assert_eq!(&scanout[pixel_index..pixel_index + 3], &[0x33, 0x22, 0x11]);
     }
 
     #[test]
