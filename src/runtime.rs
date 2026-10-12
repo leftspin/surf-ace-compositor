@@ -11846,10 +11846,14 @@ mod tests {
         width: i32,
         height: i32,
         pixel: [u8; 4],
-    ) -> (mpsc::Receiver<u32>, mpsc::Sender<()>) {
+    ) -> (
+        mpsc::Receiver<u32>,
+        mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        std::thread::spawn(move || {
+        let client_thread = std::thread::spawn(move || {
             let connection = Connection::from_socket(socket).expect("client socket must connect");
             let (globals, mut queue) = registry_queue_init::<SurfaceTreeClient>(&connection)
                 .expect("fixture globals must roundtrip");
@@ -11911,10 +11915,10 @@ mod tests {
                 .send(surface_id)
                 .expect("test must receive the pane surface ID");
             release_rx
-                .recv()
+                .recv_timeout(std::time::Duration::from_secs(30))
                 .expect("server must finish the native pane proof");
         });
-        (ready_rx, release_tx)
+        (ready_rx, release_tx, client_thread)
     }
 
     #[derive(Default)]
@@ -13929,36 +13933,43 @@ mod tests {
                 Arc::new(super::RuntimeClientState::default()),
             )
             .unwrap();
-        let (buffer_ready, release_client) =
+        let (buffer_ready, release_client, client_thread) =
             spawn_real_shm_toplevel(client_socket, 40, 20, [0x33, 0x22, 0x11, 0xff]);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let pane_surface = loop {
+        while wayland.pending_toplevels.is_empty() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "real client must offer its dynamic native pane toplevel"
             );
             display.dispatch_clients(&mut wayland).unwrap();
-            if !wayland.pending_toplevels.is_empty() {
-                let native = wayland.pending_toplevels.remove(0);
-                wayland.assign_native_pane_role(native, pane_id.clone(), std::process::id());
-            }
             display.flush_clients().unwrap();
-            if let Ok(surface_id) = buffer_ready.try_recv() {
-                let surface: WlSurface = server_client
-                    .object_from_protocol_id(&display_handle, surface_id)
-                    .expect("server must recover the real native pane surface");
-                if wayland
-                    .host_surface_buffers
-                    .contains_key(&super::surface_key(&surface))
-                {
-                    break surface;
-                }
-            }
             std::thread::yield_now();
-        };
-        release_client
-            .send(())
-            .expect("native pane client must finish its buffer proof");
+        }
+        let native = wayland.pending_toplevels.remove(0);
+        wayland.assign_native_pane_role(native, pane_id.clone(), std::process::id());
+        display.flush_clients().unwrap();
+
+        // The client flushes its attach/commit and sends its surface ID after it
+        // receives configure. Do not dispatch those requests yet: this forces
+        // readiness to arrive before the server observes the first buffer.
+        let surface_id = buffer_ready
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .expect("real client must submit and report its first buffer");
+        let pane_surface: WlSurface = server_client
+            .object_from_protocol_id(&display_handle, surface_id)
+            .expect("server must recover the real native pane surface");
+        let pane_surface_key = super::surface_key(&pane_surface);
+        assert!(
+            !wayland.host_surface_buffers.contains_key(&pane_surface_key),
+            "readiness is reported before the server dispatches the first buffer commit"
+        );
+
+        display.dispatch_clients(&mut wayland).unwrap();
+        display.flush_clients().unwrap();
+        assert!(
+            wayland.host_surface_buffers.contains_key(&pane_surface_key),
+            "the server must retain the first buffer after dispatching its commit"
+        );
 
         let active = wayland
             .active_root_geometry_consumers
@@ -13985,6 +13996,13 @@ mod tests {
         assert_eq!(composed.composed_surfaces, 1);
         let pixel_index = (15 * 200 + 25) * 4;
         assert_eq!(&scanout[pixel_index..pixel_index + 3], &[0x33, 0x22, 0x11]);
+
+        release_client
+            .send(())
+            .expect("native pane client must finish its buffer proof");
+        client_thread
+            .join()
+            .expect("native pane client fixture must exit cleanly");
     }
 
     #[test]
