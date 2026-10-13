@@ -16224,8 +16224,8 @@ mod tests {
             projection,
         ));
         assert!(native_surface_buffer_matches_projection(
-            Some(Size::new(100, 50)),
-            Some(Size::new(100, 50)),
+            Some(Size::new(101, 51)),
+            Some(Size::new(101, 51)),
             projection,
         ));
         assert!(native_surface_buffer_matches_projection(
