@@ -11838,8 +11838,8 @@ mod tests {
     use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, delegate_noop};
     use wayland_client::globals::registry_queue_init;
     use wayland_client::protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_registry, wl_region, wl_shm, wl_shm_pool,
-        wl_pointer, wl_seat, wl_subcompositor, wl_subsurface, wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_output, wl_pointer, wl_registry, wl_region,
+        wl_seat, wl_shm, wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
     };
     use wayland_protocols::xdg::shell::client::{
         xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
@@ -12414,8 +12414,9 @@ mod tests {
             destination: Option<(i32, i32)>,
             committed: mpsc::Sender<()>,
         },
-        UpdateBufferScale {
+        UpdateBufferState {
             buffer_scale: i32,
+            buffer_transform: wl_output::Transform,
             committed: mpsc::Sender<()>,
         },
         Finish,
@@ -12583,20 +12584,23 @@ mod tests {
                             .send(())
                             .expect("test must receive viewport commit acknowledgement");
                     }
-                    RealShmToplevelCommand::UpdateBufferScale {
+                    RealShmToplevelCommand::UpdateBufferState {
                         buffer_scale,
+                        buffer_transform,
                         committed,
                     } => {
-                        // Surface scale is double-buffered too. Deliberately
-                        // commit it without attaching the retained wl_buffer.
+                        // Scale and transform are double-buffered too.
+                        // Deliberately commit them without attaching the
+                        // retained wl_buffer.
                         surface.set_buffer_scale(buffer_scale);
+                        surface.set_buffer_transform(buffer_transform);
                         surface.commit();
                         connection
                             .flush()
-                            .expect("no-attach scale commit must flush");
+                            .expect("no-attach buffer-state commit must flush");
                         committed
                             .send(())
-                            .expect("test must receive scale commit acknowledgement");
+                            .expect("test must receive buffer-state commit acknowledgement");
                     }
                     RealShmToplevelCommand::Finish => break,
                 }
@@ -15009,29 +15013,42 @@ mod tests {
             OutputRotation::Deg180,
         );
 
-        // A no-attach scale commit advances SurfaceAttributes, but Smithay
-        // retains the attached buffer's scale/transform until a new buffer is
-        // attached. CPU sampling must continue to match that renderer state.
+        // A no-attach scale/transform commit advances SurfaceAttributes, but
+        // Smithay retains the attached buffer's conversion metadata until a
+        // new buffer is attached. CPU sampling must continue to match it.
         let (scale_committed, scale_ack) = mpsc::channel();
         client_commands
-            .send(RealShmToplevelCommand::UpdateBufferScale {
+            .send(RealShmToplevelCommand::UpdateBufferState {
                 buffer_scale: 1,
+                buffer_transform: wl_output::Transform::_90,
                 committed: scale_committed,
             })
-            .expect("native pane fixture must submit a no-attach scale change");
+            .expect("native pane fixture must submit no-attach scale/transform changes");
         scale_ack
             .recv_timeout(std::time::Duration::from_secs(30))
-            .expect("client must flush scale commit without attaching a buffer");
+            .expect("client must flush buffer-state commit without attaching a buffer");
         display.dispatch_clients(&mut wayland).unwrap();
         display.flush_clients().unwrap();
 
-        let committed_scale = smithay::wayland::compositor::with_states(&pane_surface, |states| {
-            let mut attributes = states.cached_state.get::<super::SurfaceAttributes>();
-            attributes.current().buffer_scale
-        });
+        let committed_attributes =
+            smithay::wayland::compositor::with_states(&pane_surface, |states| {
+                let mut attributes = states.cached_state.get::<super::SurfaceAttributes>();
+                (
+                    attributes.current().buffer_scale,
+                    attributes.current().buffer_transform,
+                )
+            });
         let renderer_sampling = super::renderer_surface_snapshot(&pane_surface)
             .expect("the renderer must retain sampling state for its current buffer");
-        assert_eq!(committed_scale, 1, "the client committed buffer_scale=1");
+        assert_eq!(
+            committed_attributes.0, 1,
+            "the client committed buffer_scale=1"
+        );
+        assert_eq!(
+            committed_attributes.1,
+            smithay::reexports::wayland_server::protocol::wl_output::Transform::_90,
+            "the client committed a quarter-turn buffer transform"
+        );
         assert_eq!(renderer_sampling.buffer_scale, 2);
         assert_eq!(renderer_sampling.buffer_transform, Transform::Normal);
         let scale_changed = wayland
