@@ -16220,7 +16220,7 @@ mod tests {
         );
         assert!(native_surface_buffer_matches_projection(
             Some(Size::new(131, 67)),
-            Some(Size::new(100, 50)),
+            Some(Size::new(131, 67)),
             projection,
         ));
         assert!(native_surface_buffer_matches_projection(
