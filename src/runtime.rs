@@ -12551,6 +12551,10 @@ mod tests {
                             (),
                         );
                         surface.set_buffer_scale(buffer_scale);
+                        // Replacement-buffer cases start from the fixture's
+                        // normal transform even if an earlier no-attach test
+                        // deliberately changed committed surface metadata.
+                        surface.set_buffer_transform(wl_output::Transform::Normal);
                         surface.attach(Some(&buffer), 0, 0);
                         surface.damage_buffer(0, 0, width, height);
                         surface.commit();
