@@ -14648,6 +14648,10 @@ mod tests {
             snapshot.damage, None,
             "a buffer committed before its pane projection is known must redraw its full footprint"
         );
+        // Keep the software cursor outside this panel's physical footprint so
+        // the pixel-by-pixel assertion observes only native-pane sampling.
+        wayland.pointer_location = (0.0, 0.0).into();
+        wayland.pointer_location_initialized = true;
         let pixel_x = capture_rect.x + capture_rect.width / 2;
         let pixel_y = capture_rect.y + capture_rect.height / 2;
         let pixel_index = (pixel_y as usize * 200 + pixel_x as usize) * 4;
