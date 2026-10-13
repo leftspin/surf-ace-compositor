@@ -1181,8 +1181,33 @@ fn activate_root_geometry_stage(
     stage_store: &mut impl RootGeometryStageStore,
     publish: impl FnOnce(&mut CompositorState),
 ) -> Option<HostPresentationTransaction> {
-    let prepared = wayland_state.staged_root_geometry.take()?;
+    let mut prepared = wayland_state.staged_root_geometry.take()?;
     let mut state = lock_state(shared_state);
+    // Pane plans can change while a root-geometry flip is pending.  Role
+    // assignment deliberately does not rebuild consumers while the staged
+    // generation is pinned, so reconcile the consumer snapshot at the commit
+    // boundary before publishing it as active.
+    let refreshed = {
+        #[cfg(test)]
+        {
+            stage_runtime_root_geometry_consumers(&state, prepared.committed, None)
+        }
+        #[cfg(not(test))]
+        {
+            stage_runtime_root_geometry_consumers(&state, prepared.committed)
+        }
+    };
+    match refreshed {
+        Ok(current) => {
+            prepared = current;
+        }
+        Err(error) => {
+            eprintln!(
+                "root4 pane consumers could not be refreshed at transaction commit: {}",
+                error.code()
+            );
+        }
+    }
     state.mark_runtime_root4_dimensions_committed(
         prepared.committed.snapshot.physical_size_px.width,
         prepared.committed.snapshot.physical_size_px.height,
@@ -1202,6 +1227,12 @@ fn activate_root_geometry_stage(
     wayland_state.active_root_geometry_consumers = Some(prepared.clone());
     wayland_state.applied_output_rotation = prepared.committed.snapshot.rotation;
     wayland_state.applied_root_geometry_generation = prepared.committed.snapshot.generation;
+    drop(state);
+    let reconfigure_native_roles =
+        refresh_native_pane_buffers_for_root_generation(wayland_state, &prepared);
+    if reconfigure_native_roles {
+        wayland_state.stage_role_configures();
+    }
     Some(prepared)
 }
 
@@ -6783,6 +6814,52 @@ struct SurfaceBufferSnapshot {
     root_geometry_generation: Option<u64>,
 }
 
+fn surface_buffer_matches_root_geometry_generation(
+    buffer: Option<&SurfaceBufferSnapshot>,
+    pinned_generation: Option<u64>,
+    expected_size: Size<i32, Logical>,
+) -> bool {
+    buffer.is_some_and(|buffer| {
+        buffer.root_geometry_generation == pinned_generation && buffer.size == Some(expected_size)
+    })
+}
+
+fn refresh_native_pane_buffers_for_root_generation(
+    wayland_state: &mut RuntimeWaylandState,
+    active: &HostPresentationTransaction,
+) -> bool {
+    let generation = active.committed.snapshot.generation;
+    let mut reconfigure_roles = false;
+    for (pane_id, toplevel) in &wayland_state.native_pane_toplevels {
+        let Some(projection) = active
+            .native_materializations
+            .iter()
+            .find(|(candidate, _)| candidate == pane_id)
+            .map(|(_, projection)| *projection)
+        else {
+            continue;
+        };
+        let surface_id = surface_key(toplevel.wl_surface());
+        let Some(buffer) = wayland_state.host_surface_buffers.get(&surface_id) else {
+            reconfigure_roles = true;
+            continue;
+        };
+        if buffer.size != Some(Size::new(projection.width_px, projection.height_px)) {
+            wayland_state.host_surface_buffers.remove(&surface_id);
+            reconfigure_roles = true;
+            continue;
+        }
+        let buffer = wayland_state
+            .host_surface_buffers
+            .get_mut(&surface_id)
+            .expect("the compatible native pane buffer must remain retained");
+        buffer.native_materialization = Some(projection);
+        buffer.damage = None;
+        buffer.root_geometry_generation = Some(generation);
+    }
+    reconfigure_roles
+}
+
 struct HostSceneSurface {
     buffer: wl_buffer::WlBuffer,
     kind: SurfaceBufferKind,
@@ -7107,14 +7184,20 @@ impl RuntimeWaylandState {
             return true;
         };
         let generation = staged.committed.snapshot.generation;
-        staged.native_materializations.iter().all(|(pane_id, _)| {
-            let Some(toplevel) = self.native_pane_toplevels.get(pane_id) else {
-                return true;
-            };
-            self.host_surface_buffers
-                .get(&surface_key(toplevel.wl_surface()))
-                .is_some_and(|buffer| buffer.root_geometry_generation == Some(generation))
-        })
+        staged
+            .native_materializations
+            .iter()
+            .all(|(pane_id, projection)| {
+                let Some(toplevel) = self.native_pane_toplevels.get(pane_id) else {
+                    return true;
+                };
+                surface_buffer_matches_root_geometry_generation(
+                    self.host_surface_buffers
+                        .get(&surface_key(toplevel.wl_surface())),
+                    Some(generation),
+                    Size::new(projection.width_px, projection.height_px),
+                )
+            })
     }
 
     fn root_geometry_projections(&self) -> Option<crate::root_geometry::CommittedRootGeometry> {
@@ -9365,19 +9448,30 @@ impl RuntimeWaylandState {
             else {
                 continue;
             };
-            let Some(mapping) = self.native_pane_surface_mapping(&pane_id, geometry) else {
-                continue;
-            };
-            let pinned_generation = self
+            let Some(root_geometry) = self
                 .presentation_root_geometry
                 .as_ref()
                 .or(self.active_root_geometry_consumers.as_ref())
-                .map(|root| root.committed.snapshot.generation);
-            if self
-                .host_surface_buffers
-                .get(&surface_key(native.wl_surface()))
-                .is_none_or(|buffer| buffer.root_geometry_generation != pinned_generation)
-            {
+            else {
+                continue;
+            };
+            let Some(native_projection) = root_geometry
+                .native_materializations
+                .iter()
+                .find(|(candidate, _)| candidate == &pane_id)
+                .map(|(_, projection)| *projection)
+            else {
+                continue;
+            };
+            let Some(mapping) = self.native_pane_surface_mapping(&pane_id, geometry) else {
+                continue;
+            };
+            if !surface_buffer_matches_root_geometry_generation(
+                self.host_surface_buffers
+                    .get(&surface_key(native.wl_surface())),
+                Some(root_geometry.committed.snapshot.generation),
+                Size::new(native_projection.width_px, native_projection.height_px),
+            ) {
                 continue;
             }
             if let Err(err) = import_surface_tree(renderer, native.wl_surface()) {
@@ -9394,20 +9488,7 @@ impl RuntimeWaylandState {
                 1.0,
                 Kind::Unspecified,
             );
-            let native_projection = self
-                .presentation_root_geometry
-                .as_ref()
-                .or(self.active_root_geometry_consumers.as_ref())
-                .and_then(|geometry| {
-                    geometry
-                        .native_materializations
-                        .iter()
-                        .find(|(candidate, _)| candidate == &pane_id)
-                        .map(|(_, projection)| *projection)
-                });
-            if let (Some(projection), Some(clip_program)) =
-                (native_projection, self.native_clip_program.as_ref())
-            {
+            if let Some(clip_program) = self.native_clip_program.as_ref() {
                 let target_height_px = render_output_size_before_transform(self).h as f32;
                 let root_element_id = Id::from_wayland_resource(native.wl_surface());
                 let root_element_present =
@@ -9427,15 +9508,13 @@ impl RuntimeWaylandState {
                     materialize_native_surface_elements(
                         elements,
                         Some(&root_element_id),
-                        projection,
+                        native_projection,
                         clip_program,
                         target_height_px,
                     )
                     .into_iter()
                     .map(SurfAceRenderElement::from),
                 );
-            } else if native_projection.is_none() {
-                native_pane_elements.extend(elements);
             }
         }
 
@@ -10054,6 +10133,29 @@ impl RuntimeWaylandState {
             else {
                 continue;
             };
+            let Some(root_geometry) = self
+                .presentation_root_geometry
+                .as_ref()
+                .or(self.active_root_geometry_consumers.as_ref())
+            else {
+                continue;
+            };
+            let Some(projection) = root_geometry
+                .native_materializations
+                .iter()
+                .find(|(candidate, _)| candidate == &pane_id)
+                .map(|(_, projection)| *projection)
+            else {
+                continue;
+            };
+            if !surface_buffer_matches_root_geometry_generation(
+                self.host_surface_buffers
+                    .get(&surface_key(native.wl_surface())),
+                Some(root_geometry.committed.snapshot.generation),
+                Size::new(projection.width_px, projection.height_px),
+            ) {
+                continue;
+            }
             if let Some(mapping) = self.native_pane_surface_mapping(&pane_id, geometry) {
                 self.collect_surface_tree_surfaces(
                     native.wl_surface(),
@@ -11651,6 +11753,7 @@ mod tests {
     #[derive(Default)]
     struct SurfaceTreeClient {
         configured: bool,
+        configure_count: u32,
     }
 
     impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListContents>
@@ -11706,6 +11809,7 @@ mod tests {
             if let xdg_surface::Event::Configure { serial } = event {
                 proxy.ack_configure(serial);
                 state.configured = true;
+                state.configure_count = state.configure_count.saturating_add(1);
             }
         }
     }
@@ -11841,6 +11945,16 @@ mod tests {
         (ready_rx, release_tx)
     }
 
+    enum RealShmToplevelCommand {
+        ReplaceBuffer {
+            width: i32,
+            height: i32,
+            pixel: [u8; 4],
+            wait_for_configure: bool,
+        },
+        Finish,
+    }
+
     fn spawn_real_shm_toplevel(
         socket: UnixStream,
         width: i32,
@@ -11848,11 +11962,11 @@ mod tests {
         pixel: [u8; 4],
     ) -> (
         mpsc::Receiver<u32>,
-        mpsc::Sender<()>,
+        mpsc::Sender<RealShmToplevelCommand>,
         std::thread::JoinHandle<()>,
     ) {
         let (ready_tx, ready_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::channel();
         let client_thread = std::thread::spawn(move || {
             let connection = Connection::from_socket(socket).expect("client socket must connect");
             let (globals, mut queue) = registry_queue_init::<SurfaceTreeClient>(&connection)
@@ -11911,14 +12025,63 @@ mod tests {
             connection
                 .flush()
                 .expect("native pane buffer commit must flush");
+            let mut buffer_leases = vec![(pool, buffer)];
             ready_tx
                 .send(surface_id)
                 .expect("test must receive the pane surface ID");
-            release_rx
-                .recv_timeout(std::time::Duration::from_secs(30))
-                .expect("server must finish the native pane proof");
+            while let Ok(command) = command_rx.recv() {
+                match command {
+                    RealShmToplevelCommand::ReplaceBuffer {
+                        width,
+                        height,
+                        pixel,
+                        wait_for_configure,
+                    } => {
+                        let configure_count = client_state.configure_count;
+                        if wait_for_configure {
+                            while client_state.configure_count == configure_count {
+                                queue
+                                    .blocking_dispatch(&mut client_state)
+                                    .expect("resized native pane must receive configure");
+                            }
+                        }
+                        let byte_len = (width * height * 4) as usize;
+                        let fd = rustix::fs::memfd_create(
+                            "pinned-native-pane-replacement",
+                            rustix::fs::MemfdFlags::CLOEXEC,
+                        )
+                        .expect("replacement fixture memfd must allocate");
+                        rustix::fs::ftruncate(&fd, byte_len as u64)
+                            .expect("replacement fixture memfd must size");
+                        let pixels = pixel.repeat((width * height) as usize);
+                        assert_eq!(
+                            rustix::io::pwrite(&fd, &pixels, 0)
+                                .expect("replacement fixture pixels must write"),
+                            byte_len
+                        );
+                        let pool = shm.create_pool(fd.as_fd(), byte_len as i32, &qh, ());
+                        let buffer = pool.create_buffer(
+                            0,
+                            width,
+                            height,
+                            width * 4,
+                            wl_shm::Format::Argb8888,
+                            &qh,
+                            (),
+                        );
+                        surface.attach(Some(&buffer), 0, 0);
+                        surface.damage_buffer(0, 0, width, height);
+                        surface.commit();
+                        connection
+                            .flush()
+                            .expect("replacement native pane buffer must flush");
+                        buffer_leases.push((pool, buffer));
+                    }
+                    RealShmToplevelCommand::Finish => break,
+                }
+            }
         });
-        (ready_rx, release_tx, client_thread)
+        (ready_rx, command_tx, client_thread)
     }
 
     #[derive(Default)]
@@ -13874,14 +14037,28 @@ mod tests {
     }
 
     #[test]
-    fn dynamically_attached_native_pane_is_in_active_render_snapshot() {
+    fn dynamically_attached_native_pane_is_reconciled_at_pinned_root_commit() {
         let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
         state.mark_runtime_resize(200, 100);
+        let staged = state
+            .prepare_root4_rotation(crate::model::OutputRotation::Deg180)
+            .unwrap();
+        let staged_generation = staged.snapshot.generation;
+        let staged_consumers = stage_runtime_root_geometry_consumers(&state, staged, None).unwrap();
+        assert!(staged_consumers.topology.panes.is_empty());
         let shared_state = Arc::new(Mutex::new(state));
         let mut display: Display<RuntimeWaylandState> = Display::new().unwrap();
         let mut display_handle = display.handle();
         let mut wayland =
             RuntimeWaylandState::new(display_handle.clone(), Arc::clone(&shared_state)).unwrap();
+        let mut stage_store = DeterministicStageStore::default();
+        install_root_geometry_stage(&mut wayland, &mut stage_store, staged_consumers);
+        let matching_flip = PresentationToken(42);
+        wayland
+            .staged_root_geometry
+            .as_mut()
+            .unwrap()
+            .mark_flip_queued(matching_flip, 1);
         let initial_generation = wayland
             .active_root_geometry_consumers
             .as_ref()
@@ -13933,7 +14110,7 @@ mod tests {
                 Arc::new(super::RuntimeClientState::default()),
             )
             .unwrap();
-        let (buffer_ready, release_client, client_thread) =
+        let (buffer_ready, client_commands, client_thread) =
             spawn_real_shm_toplevel(client_socket, 40, 20, [0x33, 0x22, 0x11, 0xff]);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while wayland.pending_toplevels.is_empty() {
@@ -13948,6 +14125,11 @@ mod tests {
         let native = wayland.pending_toplevels.remove(0);
         wayland.assign_native_pane_role(native, pane_id.clone(), std::process::id());
         display.flush_clients().unwrap();
+        assert_eq!(
+            wayland.staged_root_geometry.as_ref().unwrap().pending_flip,
+            Some(matching_flip),
+            "the native pane is attached while the root transaction awaits its exact flip"
+        );
 
         // The client flushes its attach/commit and sends its surface ID after it
         // receives configure. Do not dispatch those requests yet: this forces
@@ -13959,46 +14141,345 @@ mod tests {
             .object_from_protocol_id(&display_handle, surface_id)
             .expect("server must recover the real native pane surface");
         let pane_surface_key = super::surface_key(&pane_surface);
-        assert!(
-            !wayland.host_surface_buffers.contains_key(&pane_surface_key),
-            "readiness is reported before the server dispatches the first buffer commit"
-        );
+        assert!(!wayland.host_surface_buffers.contains_key(&pane_surface_key));
 
+        // Dispatch the first buffer while the transaction is still pinned.
+        // Its pane materialization is absent from that immutable generation,
+        // so the buffer must not be considered renderable under that root.
         display.dispatch_clients(&mut wayland).unwrap();
         display.flush_clients().unwrap();
+        let pinned_buffer = wayland
+            .host_surface_buffers
+            .get(&pane_surface_key)
+            .expect("the first pane buffer must be captured during the pinned transaction");
+        assert_eq!(
+            pinned_buffer.root_geometry_generation, None,
+            "a buffer committed against the pinned pre-pane snapshot has no pane generation"
+        );
         assert!(
-            wayland.host_surface_buffers.contains_key(&pane_surface_key),
-            "the server must retain the first buffer after dispatching its commit"
+            !super::surface_buffer_matches_root_geometry_generation(
+                Some(pinned_buffer),
+                Some(staged_generation),
+                Size::new(40, 20),
+            ),
+            "the render-element path must reject the buffer before matching flip activation"
         );
 
+        assert!(
+            wayland
+                .staged_root_geometry
+                .as_mut()
+                .unwrap()
+                .take_completed_flip(&[matching_flip]),
+            "only the matching KMS presentation token activates the pinned geometry"
+        );
+        let activated =
+            activate_root_geometry_stage(&shared_state, &mut wayland, &mut stage_store, |_| {})
+                .expect("matching presentation must activate the staged root geometry");
+        assert_eq!(activated.committed.snapshot.generation, staged_generation);
+        assert_ne!(staged_generation, initial_generation);
+        assert_eq!(
+            stage_store.events,
+            [("begin", staged_generation), ("commit", staged_generation)]
+        );
         let active = wayland
             .active_root_geometry_consumers
             .as_ref()
-            .expect("active root geometry must remain installed");
-        assert_eq!(active.committed.snapshot.generation, initial_generation);
+            .expect("activated root geometry must be installed");
+        assert_eq!(active.committed.snapshot.generation, staged_generation);
         assert!(active.topology.panes.iter().any(|pane| pane.id == pane_id));
         assert!(
             active
                 .native_materializations
                 .iter()
-                .any(|(id, projection)| id == &pane_id
-                    && projection.width_px == 40
-                    && projection.height_px == 20)
+                .any(|(id, projection)| {
+                    id == &pane_id && projection.width_px == 40 && projection.height_px == 20
+                })
         );
+        assert!(active.viewports.iter().any(|(id, viewport)| {
+            id == &pane_id && viewport.root_geometry_generation == staged_generation
+        }));
+        assert!(active.captures.iter().any(|(id, _)| id == &pane_id));
+        assert!(
+            lock_state(&shared_state)
+                .status_snapshot()
+                .panes
+                .iter()
+                .any(|pane| pane.id == pane_id
+                    && pane.viewport.as_ref().is_some_and(|viewport| {
+                        viewport.root_geometry_generation == staged_generation
+                    }))
+        );
+
+        let committed_buffer = wayland
+            .host_surface_buffers
+            .get(&pane_surface_key)
+            .expect("the pinned-generation buffer remains retained after activation");
+        assert_eq!(
+            committed_buffer.root_geometry_generation,
+            Some(staged_generation),
+            "a dimension-compatible pinned buffer is rebound to the committed generation"
+        );
+        assert!(
+            super::surface_buffer_matches_root_geometry_generation(
+                Some(committed_buffer),
+                Some(staged_generation),
+                Size::new(40, 20),
+            ),
+            "the render-element path accepts the rebound buffer in the committed generation"
+        );
+
         let snapshot = wayland
             .host_surface_buffers
             .get(&super::surface_key(&pane_surface))
             .expect("first native pane buffer must be retained");
-        assert_eq!(snapshot.root_geometry_generation, Some(initial_generation));
+        assert!(snapshot.native_materialization.is_some());
+        assert_eq!(snapshot.root_geometry_generation, Some(staged_generation));
+        assert!(super::surface_buffer_matches_root_geometry_generation(
+            Some(snapshot),
+            Some(staged_generation),
+            Size::new(40, 20),
+        ));
 
         let mut scanout = vec![0; 200 * 100 * 4];
         let composed = wayland.compose_host_scene(&mut scanout, 200 * 4, 200, 100);
         assert_eq!(composed.composed_surfaces, 1);
-        let pixel_index = (15 * 200 + 25) * 4;
+        let capture = active
+            .captures
+            .iter()
+            .find(|(id, _)| id == &pane_id)
+            .map(|(_, capture)| capture)
+            .expect("the active pane capture must use the committed geometry");
+        assert_eq!(
+            capture.physical_pixel_rect,
+            crate::root_geometry::PhysicalPixelRect {
+                x: 20,
+                y: 10,
+                width: 40,
+                height: 20,
+            },
+            "the rotated pane keeps its pre-rotation physical footprint"
+        );
+        let pixel_x = capture.physical_pixel_rect.x + capture.physical_pixel_rect.width / 2;
+        let pixel_y = capture.physical_pixel_rect.y + capture.physical_pixel_rect.height / 2;
+        let pixel_index = (pixel_y as usize * 200 + pixel_x as usize) * 4;
         assert_eq!(&scanout[pixel_index..pixel_index + 3], &[0x33, 0x22, 0x11]);
 
-        release_client
-            .send(())
+        // A second pending flip pins the existing pane projection. Replace
+        // its buffer against that generation, then resize the same pane before
+        // the flip commits. The already-G buffer must not survive activation
+        // when its dimensions no longer match the refreshed projection.
+        let resized_stage = {
+            let state = lock_state(&shared_state);
+            let prepared = state
+                .prepare_root4_rotation(OutputRotation::Deg180)
+                .unwrap();
+            stage_runtime_root_geometry_consumers(&state, prepared, None).unwrap()
+        };
+        let resized_generation = resized_stage.committed.snapshot.generation;
+        let pinned_projection = resized_stage
+            .native_materializations
+            .iter()
+            .find(|(id, _)| id == &pane_id)
+            .map(|(_, projection)| *projection)
+            .expect("the second transaction must pin the existing pane projection");
+        let pinned_size = Size::new(pinned_projection.width_px, pinned_projection.height_px);
+        let resized_committed = resized_stage.committed;
+        install_root_geometry_stage(&mut wayland, &mut stage_store, resized_stage);
+        let resized_flip = PresentationToken(43);
+        wayland
+            .staged_root_geometry
+            .as_mut()
+            .unwrap()
+            .mark_flip_queued(resized_flip, 1);
+        display.flush_clients().unwrap();
+        client_commands
+            .send(RealShmToplevelCommand::ReplaceBuffer {
+                width: pinned_size.w,
+                height: pinned_size.h,
+                pixel: [0x44, 0x55, 0x66, 0xff],
+                // This orientation keeps the pane's pinned dimensions equal
+                // to its prior size, so no xdg configure is required before
+                // submitting the generation-G buffer.
+                wait_for_configure: false,
+            })
+            .expect("native pane fixture must submit a buffer for the pinned generation");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while wayland
+            .host_surface_buffers
+            .get(&pane_surface_key)
+            .is_none_or(|buffer| buffer.root_geometry_generation != Some(resized_generation))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the replacement buffer must be captured against the second pinned generation"
+            );
+            display.dispatch_clients(&mut wayland).unwrap();
+            display.flush_clients().unwrap();
+            std::thread::yield_now();
+        }
+        let already_pinned = wayland
+            .host_surface_buffers
+            .get(&pane_surface_key)
+            .expect("the second-generation buffer must remain pending until activation");
+        assert_eq!(already_pinned.size, Some(pinned_size));
+        assert!(super::surface_buffer_matches_root_geometry_generation(
+            Some(already_pinned),
+            Some(resized_generation),
+            pinned_size,
+        ));
+
+        let resized_geometry = {
+            let mut state = lock_state(&shared_state);
+            let mut geometry = state
+                .status_snapshot()
+                .panes
+                .iter()
+                .find(|pane| pane.id == pane_id)
+                .expect("the same native pane must remain in the plan")
+                .geometry;
+            geometry.x -= geometry.width / 2.0;
+            geometry.y -= geometry.height / 2.0;
+            geometry.width *= 2.0;
+            geometry.height *= 2.0;
+            state
+                .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                    window_group: None,
+                    id: pane_id.clone(),
+                    content_id: Some("diagnostic-content".to_string()),
+                    binding_id: Some("diagnostic-binding".to_string()),
+                    launch_token: None,
+                    revision: 2,
+                    geometry,
+                    target: NativeTargetClass::Terminal,
+                    process: ProcessSpec {
+                        command: "diagnostic-pane-fixture".to_string(),
+                        args: Vec::new(),
+                        cwd: None,
+                        env: Default::default(),
+                    },
+                }])
+                .expect("same-pane resize must update the plan during the pending flip");
+            geometry
+        };
+        assert!(resized_geometry.width > 20.0 && resized_geometry.height > 10.0);
+        let refreshed_projection = {
+            let state = lock_state(&shared_state);
+            stage_runtime_root_geometry_consumers(&state, resized_committed, None)
+                .unwrap()
+                .native_materializations
+                .into_iter()
+                .find(|(id, _)| id == &pane_id)
+                .map(|(_, projection)| projection)
+                .expect("the resized pane must have a refreshed materialization")
+        };
+        let refreshed_size = Size::new(
+            refreshed_projection.width_px,
+            refreshed_projection.height_px,
+        );
+        assert_ne!(refreshed_size, pinned_size);
+        assert!(
+            !super::surface_buffer_matches_root_geometry_generation(
+                Some(already_pinned),
+                Some(resized_generation),
+                refreshed_size,
+            ),
+            "matching generation alone must not accept the old-size pane material"
+        );
+
+        assert!(
+            wayland
+                .staged_root_geometry
+                .as_mut()
+                .unwrap()
+                .take_completed_flip(&[resized_flip]),
+            "the second exact presentation token must activate the resized pane geometry"
+        );
+        let resized_active =
+            activate_root_geometry_stage(&shared_state, &mut wayland, &mut stage_store, |_| {})
+                .expect("the second matching presentation must activate");
+        assert_eq!(
+            resized_active.committed.snapshot.generation,
+            resized_generation
+        );
+        let active_projection = resized_active
+            .native_materializations
+            .iter()
+            .find(|(id, _)| id == &pane_id)
+            .map(|(_, projection)| *projection)
+            .expect("the committed resized pane must retain its projection");
+        assert_eq!(
+            Size::new(active_projection.width_px, active_projection.height_px),
+            refreshed_size
+        );
+        assert!(
+            !wayland.host_surface_buffers.contains_key(&pane_surface_key),
+            "an incompatible retained buffer must be discarded at generation activation"
+        );
+        display.flush_clients().unwrap();
+
+        let mut fallback_scanout = vec![0; 200 * 100 * 4];
+        let without_stale = wayland.compose_host_scene(&mut fallback_scanout, 200 * 4, 200, 100);
+        assert_eq!(without_stale.attempted_surfaces, 0);
+        assert_eq!(without_stale.composed_surfaces, 0);
+
+        client_commands
+            .send(RealShmToplevelCommand::ReplaceBuffer {
+                width: active_projection.width_px,
+                height: active_projection.height_px,
+                pixel: [0x77, 0x55, 0x33, 0xff],
+                wait_for_configure: true,
+            })
+            .expect("native pane fixture must submit a replacement for the refreshed size");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while wayland
+            .host_surface_buffers
+            .get(&pane_surface_key)
+            .is_none_or(|buffer| {
+                buffer.root_geometry_generation != Some(resized_generation)
+                    || buffer.size != Some(refreshed_size)
+            })
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the matching replacement buffer must recover pane presentation"
+            );
+            display.dispatch_clients(&mut wayland).unwrap();
+            display.flush_clients().unwrap();
+            std::thread::yield_now();
+        }
+        let replacement = wayland
+            .host_surface_buffers
+            .get(&pane_surface_key)
+            .expect("the matching replacement buffer must be retained");
+        assert!(replacement.native_materialization.is_some());
+        assert!(super::surface_buffer_matches_root_geometry_generation(
+            Some(replacement),
+            Some(resized_generation),
+            refreshed_size,
+        ));
+        let recovered = wayland.compose_host_scene(&mut fallback_scanout, 200 * 4, 200, 100);
+        assert_eq!(recovered.attempted_surfaces, 1);
+        assert_eq!(recovered.composed_surfaces, 1);
+        let resized_capture = resized_active
+            .captures
+            .iter()
+            .find(|(id, _)| id == &pane_id)
+            .map(|(_, capture)| capture)
+            .expect("the resized pane must retain its capture geometry");
+        let recovered_x =
+            resized_capture.physical_pixel_rect.x + resized_capture.physical_pixel_rect.width / 2;
+        let recovered_y =
+            resized_capture.physical_pixel_rect.y + resized_capture.physical_pixel_rect.height / 2;
+        let recovered_pixel = (recovered_y as usize * 200 + recovered_x as usize) * 4;
+        assert_eq!(
+            &fallback_scanout[recovered_pixel..recovered_pixel + 3],
+            &[0x77, 0x55, 0x33],
+            "the fallback must show only the replacement material at the refreshed capture"
+        );
+
+        client_commands
+            .send(RealShmToplevelCommand::Finish)
             .expect("native pane client must finish its buffer proof");
         client_thread
             .join()
