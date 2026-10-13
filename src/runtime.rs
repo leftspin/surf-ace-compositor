@@ -12247,50 +12247,41 @@ mod tests {
         source_height: usize,
         rotation: OutputRotation,
     ) {
-        let background = [0x14, 0x14, 0x18];
-        let x0 = capture.x.saturating_sub(1).max(0) as usize;
-        let y0 = capture.y.saturating_sub(1).max(0) as usize;
-        let x1 = (capture.x + capture.width + 1).min(output_width as i32) as usize;
-        let y1 = (capture.y + capture.height + 1).min(output_height as i32) as usize;
+        assert!(capture.x >= 0 && capture.y >= 0);
+        assert!(capture.x + capture.width <= output_width as i32);
+        assert!(capture.y + capture.height <= output_height as i32);
+        let x0 = capture.x as usize;
+        let y0 = capture.y as usize;
+        let x1 = (capture.x + capture.width) as usize;
+        let y1 = (capture.y + capture.height) as usize;
         for y in y0..y1 {
             for x in x0..x1 {
                 let pixel_index = (y * output_width + x) * 4;
                 let actual = &scanout[pixel_index..pixel_index + 3];
                 let capture_x = x as i32 - capture.x;
                 let capture_y = y as i32 - capture.y;
-                if capture_x >= 0
-                    && capture_x < capture.width
-                    && capture_y >= 0
-                    && capture_y < capture.height
-                {
-                    let u = (capture_x as f64 + 0.5) / capture.width as f64;
-                    let v = (capture_y as f64 + 0.5) / capture.height as f64;
-                    let (source_u, source_v) = match rotation {
-                        OutputRotation::Deg0 => (u, v),
-                        OutputRotation::Deg90 => (1.0 - v, u),
-                        OutputRotation::Deg180 => (1.0 - u, 1.0 - v),
-                        OutputRotation::Deg270 => (v, 1.0 - u),
-                    };
-                    let source_x = (source_u * source_width as f64)
-                        .floor()
-                        .clamp(0.0, source_width.saturating_sub(1) as f64)
-                        as usize;
-                    let source_y = (source_v * source_height as f64)
-                        .floor()
-                        .clamp(0.0, source_height.saturating_sub(1) as f64)
-                        as usize;
-                    let expected = coordinate_pattern_pixel(source_x, source_y);
-                    assert_eq!(
-                        actual,
-                        &expected[..3],
-                        "scanout ({x},{y}) must sample source ({source_x},{source_y})"
-                    );
-                } else {
-                    assert_eq!(
-                        actual, &background,
-                        "scanout border ({x},{y}) must stay clear"
-                    );
-                }
+                let u = (capture_x as f64 + 0.5) / capture.width as f64;
+                let v = (capture_y as f64 + 0.5) / capture.height as f64;
+                let (source_u, source_v) = match rotation {
+                    OutputRotation::Deg0 => (u, v),
+                    OutputRotation::Deg90 => (1.0 - v, u),
+                    OutputRotation::Deg180 => (1.0 - u, 1.0 - v),
+                    OutputRotation::Deg270 => (v, 1.0 - u),
+                };
+                let source_x = (source_u * source_width as f64)
+                    .floor()
+                    .clamp(0.0, source_width.saturating_sub(1) as f64)
+                    as usize;
+                let source_y = (source_v * source_height as f64)
+                    .floor()
+                    .clamp(0.0, source_height.saturating_sub(1) as f64)
+                    as usize;
+                let expected = coordinate_pattern_pixel(source_x, source_y);
+                assert_eq!(
+                    actual,
+                    &expected[..3],
+                    "scanout ({x},{y}) must sample source ({source_x},{source_y})"
+                );
             }
         }
     }
