@@ -6526,15 +6526,6 @@ fn remap_rect_to_materialized_destination(
     .intersection(Rectangle::from_size(destination_size))
 }
 
-fn native_materialized_source_rect(
-    projection: crate::root_geometry::NativeBufferProjection,
-) -> Rectangle<f64, BufferCoords> {
-    Rectangle::new(
-        (0.0, 0.0).into(),
-        (projection.width_px as f64, projection.height_px as f64).into(),
-    )
-}
-
 fn native_materialized_destination_rect(
     projection: crate::root_geometry::NativeBufferProjection,
 ) -> Rectangle<i32, Physical> {
@@ -6571,11 +6562,11 @@ impl Element for NativeMaterializedRenderElement {
     }
 
     fn src(&self) -> Rectangle<f64, BufferCoords> {
-        if self.materialize_root {
-            native_materialized_source_rect(self.projection)
-        } else {
-            self.element.src()
-        }
+        // The client buffer may use either the pane's configured logical size
+        // or the output's physical size. Always sample its actual view; using
+        // the output projection as source coordinates reads past logical-size
+        // buffers and can leave a native pane blank.
+        self.element.src()
     }
 
     fn transform(&self) -> Transform {
@@ -6808,6 +6799,7 @@ struct SurfaceBufferSnapshot {
     buffer: wl_buffer::WlBuffer,
     kind: SurfaceBufferKind,
     size: Option<Size<i32, Logical>>,
+    surface_size: Option<Size<i32, Logical>>,
     dmabuf: Option<SurfaceDmabufInfo>,
     native_materialization: Option<crate::root_geometry::NativeBufferProjection>,
     damage: Option<crate::root_geometry::PhysicalPixelRect>,
@@ -6817,11 +6809,35 @@ struct SurfaceBufferSnapshot {
 fn surface_buffer_matches_root_geometry_generation(
     buffer: Option<&SurfaceBufferSnapshot>,
     pinned_generation: Option<u64>,
-    expected_size: Size<i32, Logical>,
+    expected_projection: crate::root_geometry::NativeBufferProjection,
 ) -> bool {
     buffer.is_some_and(|buffer| {
-        buffer.root_geometry_generation == pinned_generation && buffer.size == Some(expected_size)
+        buffer.root_geometry_generation == pinned_generation
+            && buffer.native_materialization == Some(expected_projection)
+            && native_surface_buffer_matches_projection(
+                buffer.size,
+                buffer.surface_size,
+                expected_projection,
+            )
     })
+}
+
+fn native_surface_configure_size(
+    projection: crate::root_geometry::NativeBufferProjection,
+) -> Size<i32, Logical> {
+    Size::new(
+        projection.logical_clip.width.ceil().max(1.0) as i32,
+        projection.logical_clip.height.ceil().max(1.0) as i32,
+    )
+}
+
+fn native_surface_buffer_matches_projection(
+    buffer_size: Option<Size<i32, Logical>>,
+    surface_size: Option<Size<i32, Logical>>,
+    projection: crate::root_geometry::NativeBufferProjection,
+) -> bool {
+    buffer_size == Some(Size::new(projection.width_px, projection.height_px))
+        || surface_size == Some(native_surface_configure_size(projection))
 }
 
 fn refresh_native_pane_buffers_for_root_generation(
@@ -6844,7 +6860,7 @@ fn refresh_native_pane_buffers_for_root_generation(
             reconfigure_roles = true;
             continue;
         };
-        if buffer.size != Some(Size::new(projection.width_px, projection.height_px)) {
+        if !native_surface_buffer_matches_projection(buffer.size, buffer.surface_size, projection) {
             wayland_state.host_surface_buffers.remove(&surface_id);
             reconfigure_roles = true;
             continue;
@@ -7195,7 +7211,7 @@ impl RuntimeWaylandState {
                     self.host_surface_buffers
                         .get(&surface_key(toplevel.wl_surface())),
                     Some(generation),
-                    Size::new(projection.width_px, projection.height_px),
+                    *projection,
                 )
             })
     }
@@ -9470,7 +9486,7 @@ impl RuntimeWaylandState {
                 self.host_surface_buffers
                     .get(&surface_key(native.wl_surface())),
                 Some(root_geometry.committed.snapshot.generation),
-                Size::new(native_projection.width_px, native_projection.height_px),
+                native_projection,
             ) {
                 continue;
             }
@@ -9856,16 +9872,19 @@ impl RuntimeWaylandState {
     }
 
     fn capture_surface_buffer_commit(&mut self, surface: &WlSurface) {
-        let assignment = smithay::wayland::compositor::with_states(surface, |states| {
-            let mut guard = states.cached_state.get::<SurfaceAttributes>();
-            match guard.current().buffer.as_ref() {
-                Some(smithay::wayland::compositor::BufferAssignment::NewBuffer(buffer)) => {
-                    Some(Some(buffer.clone()))
-                }
-                Some(smithay::wayland::compositor::BufferAssignment::Removed) => Some(None),
-                None => None,
-            }
-        });
+        let (assignment, buffer_scale, buffer_transform) =
+            smithay::wayland::compositor::with_states(surface, |states| {
+                let mut guard = states.cached_state.get::<SurfaceAttributes>();
+                let current = guard.current();
+                let assignment = match current.buffer.as_ref() {
+                    Some(smithay::wayland::compositor::BufferAssignment::NewBuffer(buffer)) => {
+                        Some(Some(buffer.clone()))
+                    }
+                    Some(smithay::wayland::compositor::BufferAssignment::Removed) => Some(None),
+                    None => None,
+                };
+                (assignment, current.buffer_scale, current.buffer_transform)
+            });
 
         let id = surface_key(surface);
         // Every wl_surface commit is material to the accepted operation: in
@@ -9974,14 +9993,23 @@ impl RuntimeWaylandState {
                         );
                     }
                 }
-                if let (Some((projection, _)), Some(buffer_size)) = (native_materialization, size)
-                    && (buffer_size.w != projection.width_px
-                        || buffer_size.h != projection.height_px)
+                let surface_size = size.and_then(|buffer_size| {
+                    (buffer_scale > 0).then(|| {
+                        Size::<i32, BufferCoords>::new(buffer_size.w, buffer_size.h)
+                            .to_logical(buffer_scale as f64, buffer_transform)
+                    })
+                });
+                if let Some((projection, _)) = native_materialization
+                    && !native_surface_buffer_matches_projection(size, surface_size, projection)
                 {
                     self.host_surface_buffers.remove(&id);
                     eprintln!(
-                        "root4 native buffer rejected: expected {}x{}, received {}x{}",
-                        projection.width_px, projection.height_px, buffer_size.w, buffer_size.h
+                        "root4 native buffer rejected: output projection {}x{}, surface {}x{}, buffer {:?}",
+                        projection.width_px,
+                        projection.height_px,
+                        native_surface_configure_size(projection).w,
+                        native_surface_configure_size(projection).h,
+                        size
                     );
                     return;
                 }
@@ -9991,6 +10019,7 @@ impl RuntimeWaylandState {
                         buffer,
                         kind,
                         size,
+                        surface_size,
                         dmabuf,
                         native_materialization: native_materialization.map(|value| value.0),
                         damage,
@@ -10152,7 +10181,7 @@ impl RuntimeWaylandState {
                 self.host_surface_buffers
                     .get(&surface_key(native.wl_surface())),
                 Some(root_geometry.committed.snapshot.generation),
-                Size::new(projection.width_px, projection.height_px),
+                projection,
             ) {
                 continue;
             }
@@ -11477,7 +11506,7 @@ mod tests {
         materialize_native_surface_elements,
         copy_renderer_pixels_to_dumb,
         direct_present_supported_for_rotation, native_materialized_destination_rect,
-        native_materialized_local_clip, native_materialized_source_rect, native_source_sample,
+        native_materialized_local_clip, native_source_sample,
         overlay_scanout_format_supports_alpha,
         parse_shell_overlay_toggle_shortcut, pid_matches_or_descends_from,
         render_output_size_before_transform, scene_texture_transform, screen_capture_src_flipped,
@@ -11754,6 +11783,7 @@ mod tests {
     struct SurfaceTreeClient {
         configured: bool,
         configure_count: u32,
+        toplevel_size: Option<(i32, i32)>,
     }
 
     impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListContents>
@@ -11779,8 +11809,22 @@ mod tests {
     delegate_noop!(SurfaceTreeClient: ignore wl_callback::WlCallback);
     delegate_noop!(SurfaceTreeClient: ignore wl_region::WlRegion);
     delegate_noop!(SurfaceTreeClient: ignore xdg_positioner::XdgPositioner);
-    delegate_noop!(SurfaceTreeClient: ignore xdg_toplevel::XdgToplevel);
     delegate_noop!(SurfaceTreeClient: ignore xdg_popup::XdgPopup);
+
+    impl Dispatch<xdg_toplevel::XdgToplevel, ()> for SurfaceTreeClient {
+        fn event(
+            state: &mut Self,
+            _proxy: &xdg_toplevel::XdgToplevel,
+            event: xdg_toplevel::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            if let xdg_toplevel::Event::Configure { width, height, .. } = event {
+                state.toplevel_size = Some((width, height));
+            }
+        }
+    }
 
     impl Dispatch<xdg_wm_base::XdgWmBase, ()> for SurfaceTreeClient {
         fn event(
@@ -11961,7 +12005,7 @@ mod tests {
         height: i32,
         pixel: [u8; 4],
     ) -> (
-        mpsc::Receiver<u32>,
+        mpsc::Receiver<(u32, (i32, i32))>,
         mpsc::Sender<RealShmToplevelCommand>,
         std::thread::JoinHandle<()>,
     ) {
@@ -11996,6 +12040,10 @@ mod tests {
                     .blocking_dispatch(&mut client_state)
                     .expect("native pane fixture must receive configure");
             }
+            let configured_size = client_state
+                .toplevel_size
+                .expect("native pane fixture must receive its configured surface size");
+            assert_eq!(configured_size, (width, height));
 
             let byte_len = (width * height * 4) as usize;
             let fd = rustix::fs::memfd_create(
@@ -12027,7 +12075,7 @@ mod tests {
                 .expect("native pane buffer commit must flush");
             let mut buffer_leases = vec![(pool, buffer)];
             ready_tx
-                .send(surface_id)
+                .send((surface_id, configured_size))
                 .expect("test must receive the pane surface ID");
             while let Ok(command) = command_rx.recv() {
                 match command {
@@ -12044,6 +12092,11 @@ mod tests {
                                     .blocking_dispatch(&mut client_state)
                                     .expect("resized native pane must receive configure");
                             }
+                            assert_eq!(
+                                client_state.toplevel_size,
+                                Some((width, height)),
+                                "replacement must use the latest xdg_toplevel configure size"
+                            );
                         }
                         let byte_len = (width * height * 4) as usize;
                         let fd = rustix::fs::memfd_create(
@@ -12396,6 +12449,11 @@ mod tests {
             },
             scale_factor: 1.3,
         };
+        let root_source_rect = raw_elements
+            .iter()
+            .find(|element| element.id() == &root_element_id)
+            .expect("real root source must exist")
+            .src();
         let mut materialized = materialize_native_surface_elements(
             raw_elements,
             Some(&root_element_id),
@@ -12443,6 +12501,11 @@ mod tests {
         assert_eq!(
             root_element.geometry(1.0.into()),
             Rectangle::new((13, 26).into(), (131, 67).into())
+        );
+        assert_eq!(
+            root_element.src(),
+            root_source_rect,
+            "native materialization must sample the client's actual source buffer"
         );
         assert_eq!(
             root_element
@@ -14044,6 +14107,14 @@ mod tests {
             .prepare_root4_rotation(crate::model::OutputRotation::Deg180)
             .unwrap();
         let staged_generation = staged.snapshot.generation;
+        let pane_projection = staged
+            .snapshot
+            .native_buffer(crate::root_geometry::LogicalRect {
+                x: 10.0,
+                y: 5.0,
+                width: 20.0,
+                height: 10.0,
+            });
         let staged_consumers = stage_runtime_root_geometry_consumers(&state, staged, None).unwrap();
         assert!(staged_consumers.topology.panes.is_empty());
         let shared_state = Arc::new(Mutex::new(state));
@@ -14111,7 +14182,7 @@ mod tests {
             )
             .unwrap();
         let (buffer_ready, client_commands, client_thread) =
-            spawn_real_shm_toplevel(client_socket, 40, 20, [0x33, 0x22, 0x11, 0xff]);
+            spawn_real_shm_toplevel(client_socket, 20, 10, [0x33, 0x22, 0x11, 0xff]);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while wayland.pending_toplevels.is_empty() {
             assert!(
@@ -14134,9 +14205,14 @@ mod tests {
         // The client flushes its attach/commit and sends its surface ID after it
         // receives configure. Do not dispatch those requests yet: this forces
         // readiness to arrive before the server observes the first buffer.
-        let surface_id = buffer_ready
+        let (surface_id, configured_size) = buffer_ready
             .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
             .expect("real client must submit and report its first buffer");
+        assert_eq!(
+            configured_size,
+            (20, 10),
+            "the scale-1 Wayland client receives pane logical dimensions"
+        );
         let pane_surface: WlSurface = server_client
             .object_from_protocol_id(&display_handle, surface_id)
             .expect("server must recover the real native pane surface");
@@ -14160,7 +14236,7 @@ mod tests {
             !super::surface_buffer_matches_root_geometry_generation(
                 Some(pinned_buffer),
                 Some(staged_generation),
-                Size::new(40, 20),
+                pane_projection,
             ),
             "the render-element path must reject the buffer before matching flip activation"
         );
@@ -14187,6 +14263,12 @@ mod tests {
             .as_ref()
             .expect("activated root geometry must be installed");
         assert_eq!(active.committed.snapshot.generation, staged_generation);
+        let active_projection = active
+            .native_materializations
+            .iter()
+            .find(|(id, _)| id == &pane_id)
+            .map(|(_, projection)| *projection)
+            .expect("active root geometry must project the dynamic pane");
         assert!(active.topology.panes.iter().any(|pane| pane.id == pane_id));
         assert!(
             active
@@ -14220,11 +14302,13 @@ mod tests {
             Some(staged_generation),
             "a dimension-compatible pinned buffer is rebound to the committed generation"
         );
+        assert_eq!(committed_buffer.size, Some(Size::new(20, 10)));
+        assert_eq!(committed_buffer.surface_size, Some(Size::new(20, 10)));
         assert!(
             super::surface_buffer_matches_root_geometry_generation(
                 Some(committed_buffer),
                 Some(staged_generation),
-                Size::new(40, 20),
+                active_projection,
             ),
             "the render-element path accepts the rebound buffer in the committed generation"
         );
@@ -14238,7 +14322,7 @@ mod tests {
         assert!(super::surface_buffer_matches_root_geometry_generation(
             Some(snapshot),
             Some(staged_generation),
-            Size::new(40, 20),
+            active_projection,
         ));
 
         let mut scanout = vec![0; 200 * 100 * 4];
@@ -14295,8 +14379,8 @@ mod tests {
         display.flush_clients().unwrap();
         client_commands
             .send(RealShmToplevelCommand::ReplaceBuffer {
-                width: pinned_size.w,
-                height: pinned_size.h,
+                width: 20,
+                height: 10,
                 pixel: [0x44, 0x55, 0x66, 0xff],
                 // This orientation keeps the pane's pinned dimensions equal
                 // to its prior size, so no xdg configure is required before
@@ -14322,11 +14406,11 @@ mod tests {
             .host_surface_buffers
             .get(&pane_surface_key)
             .expect("the second-generation buffer must remain pending until activation");
-        assert_eq!(already_pinned.size, Some(pinned_size));
+        assert_eq!(already_pinned.size, Some(Size::new(20, 10)));
         assert!(super::surface_buffer_matches_root_geometry_generation(
             Some(already_pinned),
             Some(resized_generation),
-            pinned_size,
+            pinned_projection,
         ));
 
         let resized_geometry = {
@@ -14382,7 +14466,7 @@ mod tests {
             !super::surface_buffer_matches_root_geometry_generation(
                 Some(already_pinned),
                 Some(resized_generation),
-                refreshed_size,
+                refreshed_projection,
             ),
             "matching generation alone must not accept the old-size pane material"
         );
@@ -14423,10 +14507,14 @@ mod tests {
         assert_eq!(without_stale.attempted_surfaces, 0);
         assert_eq!(without_stale.composed_surfaces, 0);
 
+        let resized_client_size = Size::new(
+            refreshed_projection.logical_clip.width.ceil().max(1.0) as i32,
+            refreshed_projection.logical_clip.height.ceil().max(1.0) as i32,
+        );
         client_commands
             .send(RealShmToplevelCommand::ReplaceBuffer {
-                width: active_projection.width_px,
-                height: active_projection.height_px,
+                width: resized_client_size.w,
+                height: resized_client_size.h,
                 pixel: [0x77, 0x55, 0x33, 0xff],
                 wait_for_configure: true,
             })
@@ -14437,7 +14525,7 @@ mod tests {
             .get(&pane_surface_key)
             .is_none_or(|buffer| {
                 buffer.root_geometry_generation != Some(resized_generation)
-                    || buffer.size != Some(refreshed_size)
+                    || buffer.size != Some(resized_client_size)
             })
         {
             assert!(
@@ -14452,11 +14540,12 @@ mod tests {
             .host_surface_buffers
             .get(&pane_surface_key)
             .expect("the matching replacement buffer must be retained");
+        assert_eq!(replacement.size, Some(resized_client_size));
         assert!(replacement.native_materialization.is_some());
         assert!(super::surface_buffer_matches_root_geometry_generation(
             Some(replacement),
             Some(resized_generation),
-            refreshed_size,
+            active_projection,
         ));
         let recovered = wayland.compose_host_scene(&mut fallback_scanout, 200 * 4, 200, 100);
         assert_eq!(recovered.attempted_surfaces, 1);
@@ -16107,7 +16196,7 @@ mod tests {
     }
 
     #[test]
-    fn production_gles_native_materialization_keeps_one_source_texel_per_physical_pixel() {
+    fn native_pane_buffers_accept_configured_logical_or_projected_physical_size() {
         let projection = crate::root_geometry::NativeBufferProjection {
             origin_x: 13,
             origin_y: 26,
@@ -16125,9 +16214,41 @@ mod tests {
         };
 
         assert_eq!(
-            native_materialized_source_rect(projection),
-            Rectangle::<f64, BufferCoords>::new((0.0, 0.0).into(), (131.0, 67.0).into())
+            native_surface_configure_size(projection),
+            Size::new(101, 51)
         );
+        assert!(native_surface_buffer_matches_projection(
+            Some(Size::new(131, 67)),
+            Some(Size::new(100, 50)),
+            projection,
+        ));
+        assert!(native_surface_buffer_matches_projection(
+            Some(Size::new(100, 50)),
+            Some(Size::new(100, 50)),
+            projection,
+        ));
+        assert!(native_surface_buffer_matches_projection(
+            Some(Size::new(131, 67)),
+            None,
+            projection,
+        ));
+        assert!(!native_surface_buffer_matches_projection(
+            Some(Size::new(99, 50)),
+            Some(Size::new(99, 50)),
+            projection,
+        ));
+        assert!(!native_surface_buffer_matches_projection(
+            Some(Size::new(100, 50)),
+            Some(Size::new(100, 50)),
+            crate::root_geometry::NativeBufferProjection {
+                logical_clip: crate::root_geometry::LogicalRect {
+                    width: 101.0,
+                    height: 51.0,
+                    ..projection.logical_clip
+                },
+                ..projection
+            },
+        ));
         assert_eq!(
             native_materialized_destination_rect(projection),
             Rectangle::<i32, Physical>::new((13, 26).into(), (131, 67).into())
