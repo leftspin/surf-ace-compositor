@@ -9996,7 +9996,7 @@ impl RuntimeWaylandState {
                 let surface_size = size.and_then(|buffer_size| {
                     (buffer_scale > 0).then(|| {
                         Size::<i32, BufferCoords>::new(buffer_size.w, buffer_size.h)
-                            .to_logical(buffer_scale as f64, buffer_transform)
+                            .to_logical(buffer_scale, buffer_transform.into())
                     })
                 });
                 if let Some((projection, _)) = native_materialization
@@ -11507,6 +11507,7 @@ mod tests {
         copy_renderer_pixels_to_dumb,
         direct_present_supported_for_rotation, native_materialized_destination_rect,
         native_materialized_local_clip, native_source_sample,
+        native_surface_buffer_matches_projection, native_surface_configure_size,
         overlay_scanout_format_supports_alpha,
         parse_shell_overlay_toggle_shortcut, pid_matches_or_descends_from,
         render_output_size_before_transform, scene_texture_transform, screen_capture_src_flipped,
@@ -14367,7 +14368,7 @@ mod tests {
             .find(|(id, _)| id == &pane_id)
             .map(|(_, projection)| *projection)
             .expect("the second transaction must pin the existing pane projection");
-        let pinned_size = Size::new(pinned_projection.width_px, pinned_projection.height_px);
+        let pinned_size = (pinned_projection.width_px, pinned_projection.height_px);
         let resized_committed = resized_stage.committed;
         install_root_geometry_stage(&mut wayland, &mut stage_store, resized_stage);
         let resized_flip = PresentationToken(43);
@@ -14457,7 +14458,7 @@ mod tests {
                 .map(|(_, projection)| projection)
                 .expect("the resized pane must have a refreshed materialization")
         };
-        let refreshed_size = Size::new(
+        let refreshed_size = (
             refreshed_projection.width_px,
             refreshed_projection.height_px,
         );
@@ -14493,7 +14494,7 @@ mod tests {
             .map(|(_, projection)| *projection)
             .expect("the committed resized pane must retain its projection");
         assert_eq!(
-            Size::new(active_projection.width_px, active_projection.height_px),
+            (active_projection.width_px, active_projection.height_px),
             refreshed_size
         );
         assert!(
