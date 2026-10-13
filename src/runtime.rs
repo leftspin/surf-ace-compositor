@@ -10098,7 +10098,7 @@ impl RuntimeWaylandState {
                     })
                 });
                 let damage = native_materialization.and_then(|(projection, root)| {
-                    let surface_size = surface_size?;
+                    surface_size?;
                     let surface_view = surface_view?;
                     let buffer_size =
                         size.map(|size| Size::<i32, BufferCoords>::new(size.w, size.h));
@@ -14654,9 +14654,8 @@ mod tests {
             "the rotated pane keeps its pre-rotation physical footprint"
         );
         assert_eq!(
-            snapshot.damage,
-            Some(capture_rect),
-            "logical-buffer damage must cover the same projected scanout footprint"
+            snapshot.damage, None,
+            "a buffer committed before its pane projection is known must redraw its full footprint"
         );
         let pixel_x = capture_rect.x + capture_rect.width / 2;
         let pixel_y = capture_rect.y + capture_rect.height / 2;
@@ -14819,6 +14818,16 @@ mod tests {
             display.flush_clients().unwrap();
             std::thread::yield_now();
         }
+
+        let restored_logical = wayland
+            .host_surface_buffers
+            .get(&pane_surface_key)
+            .expect("the active-generation logical buffer must be retained");
+        assert_eq!(
+            restored_logical.damage,
+            Some(capture_rect),
+            "logical-buffer damage must normalize through the active surface view"
+        );
 
         // A second pending flip pins the existing pane projection. Replace
         // its buffer against that generation, then resize the same pane before
