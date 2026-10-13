@@ -6901,12 +6901,28 @@ enum SurfaceCommitDamage {
     Buffer(Rectangle<i32, BufferCoords>),
 }
 
-fn renderer_surface_view(surface: &WlSurface) -> Option<SurfaceView> {
+#[derive(Clone, Copy)]
+struct RendererSurfaceSnapshot {
+    view: SurfaceView,
+    logical_buffer_size: Size<i32, Logical>,
+    buffer_scale: i32,
+    buffer_transform: Transform,
+}
+
+fn renderer_surface_snapshot(surface: &WlSurface) -> Option<RendererSurfaceSnapshot> {
     smithay::wayland::compositor::with_states(surface, |states| {
         states
             .data_map
             .get::<RendererSurfaceStateUserData>()
-            .and_then(|surface_state| surface_state.lock().ok()?.view())
+            .and_then(|surface_state| {
+                let surface_state = surface_state.lock().ok()?;
+                Some(RendererSurfaceSnapshot {
+                    view: surface_state.view()?,
+                    logical_buffer_size: surface_state.buffer_size()?,
+                    buffer_scale: surface_state.buffer_scale(),
+                    buffer_transform: surface_state.buffer_transform(),
+                })
+            })
     })
 }
 
@@ -10027,7 +10043,8 @@ impl RuntimeWaylandState {
         // viewport state by this handler. The assignment and damage above are
         // copied first because the handler consumes them from SurfaceAttributes.
         on_commit_buffer_handler::<Self>(surface);
-        let surface_view = renderer_surface_view(surface);
+        let renderer_surface = renderer_surface_snapshot(surface);
+        let surface_view = renderer_surface.map(|state| state.view);
 
         let id = surface_key(surface);
         // Every wl_surface commit is material to the accepted operation: in
@@ -10169,6 +10186,15 @@ impl RuntimeWaylandState {
                 self.host_surface_buffers.remove(&id);
             }
             None => {
+                // Smithay only adopts buffer_scale and buffer_transform when
+                // a new buffer is attached. A no-attach commit can advance the
+                // cached SurfaceAttributes without changing the renderer's
+                // retained conversion metadata, so read all CPU sampling
+                // fields from the renderer snapshot as one coherent state.
+                let Some(renderer_surface) = renderer_surface else {
+                    self.host_surface_buffers.remove(&id);
+                    return;
+                };
                 // Viewporter state is double-buffered independently of buffer
                 // attachment. Smithay refreshes SurfaceView on every commit,
                 // so keep the retained CPU-fallback snapshot in step with the
@@ -10179,12 +10205,10 @@ impl RuntimeWaylandState {
                     .host_surface_buffers
                     .get(&id)
                     .and_then(|snapshot| snapshot.size);
-                let surface_size = retained_size.and_then(|buffer_size| {
-                    (buffer_scale > 0).then(|| {
-                        Size::<i32, BufferCoords>::new(buffer_size.w, buffer_size.h)
-                            .to_logical(buffer_scale, buffer_transform)
-                    })
-                });
+                let surface_size = retained_size.map(|_| renderer_surface.logical_buffer_size);
+                let surface_view = Some(renderer_surface.view);
+                let buffer_scale = renderer_surface.buffer_scale;
+                let buffer_transform = renderer_surface.buffer_transform;
                 if let Some((projection, _)) = native_materialization
                     && !native_surface_buffer_matches_projection(
                         retained_size,
@@ -12390,6 +12414,10 @@ mod tests {
             destination: Option<(i32, i32)>,
             committed: mpsc::Sender<()>,
         },
+        UpdateBufferScale {
+            buffer_scale: i32,
+            committed: mpsc::Sender<()>,
+        },
         Finish,
     }
 
@@ -12554,6 +12582,21 @@ mod tests {
                         committed
                             .send(())
                             .expect("test must receive viewport commit acknowledgement");
+                    }
+                    RealShmToplevelCommand::UpdateBufferScale {
+                        buffer_scale,
+                        committed,
+                    } => {
+                        // Surface scale is double-buffered too. Deliberately
+                        // commit it without attaching the retained wl_buffer.
+                        surface.set_buffer_scale(buffer_scale);
+                        surface.commit();
+                        connection
+                            .flush()
+                            .expect("no-attach scale commit must flush");
+                        committed
+                            .send(())
+                            .expect("test must receive scale commit acknowledgement");
                     }
                     RealShmToplevelCommand::Finish => break,
                 }
@@ -14956,6 +14999,68 @@ mod tests {
         assert_eq!(cropped_result.composed_surfaces, 1);
         assert_coordinate_pattern_viewport_scanout(
             &cropped_scanout,
+            200,
+            100,
+            capture_rect,
+            40,
+            20,
+            2,
+            (10.0, 0.0, 10.0, 10.0),
+            OutputRotation::Deg180,
+        );
+
+        // A no-attach scale commit advances SurfaceAttributes, but Smithay
+        // retains the attached buffer's scale/transform until a new buffer is
+        // attached. CPU sampling must continue to match that renderer state.
+        let (scale_committed, scale_ack) = mpsc::channel();
+        client_commands
+            .send(RealShmToplevelCommand::UpdateBufferScale {
+                buffer_scale: 1,
+                committed: scale_committed,
+            })
+            .expect("native pane fixture must submit a no-attach scale change");
+        scale_ack
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("client must flush scale commit without attaching a buffer");
+        display.dispatch_clients(&mut wayland).unwrap();
+        display.flush_clients().unwrap();
+
+        let committed_scale = smithay::wayland::compositor::with_states(&pane_surface, |states| {
+            let mut attributes = states.cached_state.get::<super::SurfaceAttributes>();
+            attributes.current().buffer_scale
+        });
+        let renderer_sampling = super::renderer_surface_snapshot(&pane_surface)
+            .expect("the renderer must retain sampling state for its current buffer");
+        assert_eq!(committed_scale, 1, "the client committed buffer_scale=1");
+        assert_eq!(renderer_sampling.buffer_scale, 2);
+        assert_eq!(renderer_sampling.buffer_transform, Transform::Normal);
+        let scale_changed = wayland
+            .host_surface_buffers
+            .get(&pane_surface_key)
+            .expect("no-attach scale commit must retain the existing wl_buffer");
+        assert_eq!(scale_changed.buffer.id(), retained_buffer_id);
+        assert_eq!(scale_changed.buffer_scale, renderer_sampling.buffer_scale);
+        assert_eq!(
+            scale_changed.buffer_transform,
+            renderer_sampling.buffer_transform
+        );
+        assert_eq!(
+            scale_changed.surface_size,
+            Some(renderer_sampling.logical_buffer_size),
+            "CPU surface dimensions must come from the same retained renderer state"
+        );
+        assert_eq!(scale_changed.surface_view, Some(renderer_sampling.view));
+        assert_eq!(
+            scale_changed.root_geometry_generation,
+            Some(staged_generation),
+            "the metadata refresh must preserve pinned-generation eligibility"
+        );
+        let mut scale_changed_scanout = vec![0; 200 * 100 * 4];
+        let scale_changed_result =
+            wayland.compose_host_scene(&mut scale_changed_scanout, 200 * 4, 200, 100);
+        assert_eq!(scale_changed_result.composed_surfaces, 1);
+        assert_coordinate_pattern_viewport_scanout(
+            &scale_changed_scanout,
             200,
             100,
             capture_rect,
