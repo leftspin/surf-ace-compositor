@@ -35,8 +35,8 @@ use smithay::backend::renderer::gles::{
     GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform, UniformName, UniformType,
 };
 use smithay::backend::renderer::utils::{
-    CommitCounter, DamageSet, OpaqueRegions, RendererSurfaceStateUserData, draw_render_elements,
-    import_surface_tree, on_commit_buffer_handler,
+    CommitCounter, DamageSet, OpaqueRegions, RendererSurfaceStateUserData, SurfaceView,
+    draw_render_elements, import_surface_tree, on_commit_buffer_handler,
 };
 use smithay::backend::renderer::{
     Bind, Color32F, ExportMem, Frame, ImportDma, Offscreen, Renderer, Texture, TextureMapping,
@@ -6552,6 +6552,92 @@ fn native_materialized_local_clip(
     Rectangle::new((x0, y0).into(), (x1 - x0, y1 - y0).into())
 }
 
+fn native_surface_rect_to_scanout_damage(
+    rect: crate::root_geometry::LogicalRect,
+    surface_view: SurfaceView,
+    projection: crate::root_geometry::NativeBufferProjection,
+    root: crate::root_geometry::RootGeometrySnapshot,
+) -> Option<crate::root_geometry::PhysicalPixelRect> {
+    if surface_view.dst.w <= 0 || surface_view.dst.h <= 0 {
+        return None;
+    }
+    let x0 = rect.x.max(0.0);
+    let y0 = rect.y.max(0.0);
+    let x1 = (rect.x + rect.width).min(surface_view.dst.w as f64);
+    let y1 = (rect.y + rect.height).min(surface_view.dst.h as f64);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let scale_x = projection.logical_clip.width / surface_view.dst.w as f64;
+    let scale_y = projection.logical_clip.height / surface_view.dst.h as f64;
+    Some(root.physical_crop(crate::root_geometry::LogicalRect {
+        x: projection.logical_clip.x + x0 * scale_x,
+        y: projection.logical_clip.y + y0 * scale_y,
+        width: (x1 - x0) * scale_x,
+        height: (y1 - y0) * scale_y,
+    }))
+}
+
+fn native_surface_rect_to_view_damage(
+    rect: crate::root_geometry::LogicalRect,
+    surface_view: SurfaceView,
+) -> Option<crate::root_geometry::LogicalRect> {
+    if surface_view.src.size.w <= 0.0
+        || surface_view.src.size.h <= 0.0
+        || surface_view.dst.w <= 0
+        || surface_view.dst.h <= 0
+    {
+        return None;
+    }
+    let x0 = rect.x.max(surface_view.src.loc.x);
+    let y0 = rect.y.max(surface_view.src.loc.y);
+    let x1 = (rect.x + rect.width).min(surface_view.src.loc.x + surface_view.src.size.w);
+    let y1 = (rect.y + rect.height).min(surface_view.src.loc.y + surface_view.src.size.h);
+    (x1 > x0 && y1 > y0).then(|| crate::root_geometry::LogicalRect {
+        x: (x0 - surface_view.src.loc.x) * surface_view.dst.w as f64 / surface_view.src.size.w,
+        y: (y0 - surface_view.src.loc.y) * surface_view.dst.h as f64 / surface_view.src.size.h,
+        width: (x1 - x0) * surface_view.dst.w as f64 / surface_view.src.size.w,
+        height: (y1 - y0) * surface_view.dst.h as f64 / surface_view.src.size.h,
+    })
+}
+
+fn native_buffer_damage_to_surface_rect(
+    rect: Rectangle<i32, BufferCoords>,
+    buffer_size: Size<i32, BufferCoords>,
+    buffer_scale: i32,
+    buffer_transform: Transform,
+) -> Option<crate::root_geometry::LogicalRect> {
+    if buffer_scale <= 0 {
+        return None;
+    }
+    let transformed = buffer_transform
+        .invert()
+        .transform_rect_in(rect, &buffer_size);
+    let scale = buffer_scale as f64;
+    Some(crate::root_geometry::LogicalRect {
+        x: transformed.loc.x as f64 / scale,
+        y: transformed.loc.y as f64 / scale,
+        width: transformed.size.w as f64 / scale,
+        height: transformed.size.h as f64 / scale,
+    })
+}
+
+fn union_physical_damage(
+    left: crate::root_geometry::PhysicalPixelRect,
+    right: crate::root_geometry::PhysicalPixelRect,
+) -> crate::root_geometry::PhysicalPixelRect {
+    let x0 = left.x.min(right.x);
+    let y0 = left.y.min(right.y);
+    let x1 = (left.x + left.width).max(right.x + right.width);
+    let y1 = (left.y + left.height).max(right.y + right.height);
+    crate::root_geometry::PhysicalPixelRect {
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
+    }
+}
+
 impl Element for NativeMaterializedRenderElement {
     fn id(&self) -> &Id {
         self.element.id()
@@ -6800,10 +6886,28 @@ struct SurfaceBufferSnapshot {
     kind: SurfaceBufferKind,
     size: Option<Size<i32, Logical>>,
     surface_size: Option<Size<i32, Logical>>,
+    surface_view: Option<SurfaceView>,
+    buffer_scale: i32,
+    buffer_transform: Transform,
     dmabuf: Option<SurfaceDmabufInfo>,
     native_materialization: Option<crate::root_geometry::NativeBufferProjection>,
     damage: Option<crate::root_geometry::PhysicalPixelRect>,
     root_geometry_generation: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+enum SurfaceCommitDamage {
+    Surface(Rectangle<i32, Logical>),
+    Buffer(Rectangle<i32, BufferCoords>),
+}
+
+fn renderer_surface_view(surface: &WlSurface) -> Option<SurfaceView> {
+    smithay::wayland::compositor::with_states(surface, |states| {
+        states
+            .data_map
+            .get::<RendererSurfaceStateUserData>()
+            .and_then(|surface_state| surface_state.lock().ok()?.view())
+    })
 }
 
 fn surface_buffer_matches_root_geometry_generation(
@@ -6882,7 +6986,16 @@ struct HostSceneSurface {
     target: Rectangle<i32, Logical>,
     dmabuf: Option<SurfaceDmabufInfo>,
     native_materialization: Option<crate::root_geometry::NativeBufferProjection>,
+    native_sampling: Option<NativeSurfaceSampling>,
     damage: Option<crate::root_geometry::PhysicalPixelRect>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NativeSurfaceSampling {
+    view: SurfaceView,
+    surface_size: Size<i32, Logical>,
+    buffer_scale: i32,
+    buffer_transform: Transform,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -6895,6 +7008,7 @@ struct HostSceneComposeStats {
 struct RoleSurfaceMapping {
     origin: Point<f64, Logical>,
     scale: SurfaceScale<f64>,
+    uses_native_surface_view: bool,
 }
 
 fn renderer_surface_tree_bbox(
@@ -7059,6 +7173,7 @@ impl RoleSurfaceMapping {
             return Self {
                 origin: (target_rect.x, target_rect.y).into(),
                 scale: 1.0.into(),
+                uses_native_surface_view: false,
             };
         }
 
@@ -7071,6 +7186,7 @@ impl RoleSurfaceMapping {
             )
                 .into(),
             scale: (scale_x, scale_y).into(),
+            uses_native_surface_view: false,
         }
     }
 
@@ -7078,19 +7194,23 @@ impl RoleSurfaceMapping {
         source_bbox: Rectangle<i32, Logical>,
         projection: crate::root_geometry::NativeBufferProjection,
     ) -> Self {
-        let scale = 1.0 / projection.scale_factor;
-        Self {
-            origin: (
-                projection.logical_clip.x
-                    - projection.fractional_phase_x * scale
-                    - source_bbox.loc.x as f64 * scale,
-                projection.logical_clip.y
-                    - projection.fractional_phase_y * scale
-                    - source_bbox.loc.y as f64 * scale,
-            )
-                .into(),
-            scale: (scale, scale).into(),
-        }
+        let phase_to_logical = 1.0 / projection.scale_factor;
+        let mut mapping = Self::new_logical(
+            source_bbox,
+            crate::root_geometry::LogicalRect {
+                x: projection.logical_clip.x - projection.fractional_phase_x * phase_to_logical,
+                y: projection.logical_clip.y - projection.fractional_phase_y * phase_to_logical,
+                // Map the full projected physical interval here; the logical
+                // clip is applied by the root geometry crop after mapping.
+                width: projection.width_px as f64 * phase_to_logical,
+                height: projection.height_px as f64 * phase_to_logical,
+            },
+        );
+        // Surface-tree coordinates are logical units, regardless of whether
+        // the attached buffer is logical-sized or output-physical-sized.
+        // The source bbox normalization above preserves both representations.
+        mapping.uses_native_surface_view = true;
+        mapping
     }
 
     fn map_point(self, source_point: Point<i32, Logical>) -> Point<i32, Logical> {
@@ -9872,7 +9992,7 @@ impl RuntimeWaylandState {
     }
 
     fn capture_surface_buffer_commit(&mut self, surface: &WlSurface) {
-        let (assignment, buffer_scale, buffer_transform) =
+        let (assignment, buffer_scale, buffer_transform, damage) =
             smithay::wayland::compositor::with_states(surface, |states| {
                 let mut guard = states.cached_state.get::<SurfaceAttributes>();
                 let current = guard.current();
@@ -9883,8 +10003,31 @@ impl RuntimeWaylandState {
                     Some(smithay::wayland::compositor::BufferAssignment::Removed) => Some(None),
                     None => None,
                 };
-                (assignment, current.buffer_scale, current.buffer_transform)
+                let damage = current
+                    .damage
+                    .iter()
+                    .map(|damage| match damage {
+                        smithay::wayland::compositor::Damage::Surface(rect) => {
+                            SurfaceCommitDamage::Surface(*rect)
+                        }
+                        smithay::wayland::compositor::Damage::Buffer(rect) => {
+                            SurfaceCommitDamage::Buffer(*rect)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    assignment,
+                    current.buffer_scale,
+                    current.buffer_transform,
+                    damage,
+                )
             });
+        let buffer_transform: Transform = buffer_transform.into();
+        // The renderer's view is updated from the just-committed buffer and
+        // viewport state by this handler. The assignment and damage above are
+        // copied first because the handler consumes them from SurfaceAttributes.
+        on_commit_buffer_handler::<Self>(surface);
+        let surface_view = renderer_surface_view(surface);
 
         let id = surface_key(surface);
         // Every wl_surface commit is material to the accepted operation: in
@@ -9909,51 +10052,6 @@ impl RuntimeWaylandState {
                     .find(|(candidate, _)| candidate == pane_id)
                     .map(|(_, projection)| (*projection, geometry.committed.snapshot))
             });
-        let damage = native_materialization.and_then(|(projection, root)| {
-            let damaged = smithay::wayland::compositor::with_states(surface, |states| {
-                let mut guard = states.cached_state.get::<SurfaceAttributes>();
-                guard
-                    .current()
-                    .damage
-                    .iter()
-                    .map(|damage| match damage {
-                        smithay::wayland::compositor::Damage::Surface(rect) => {
-                            crate::root_geometry::LogicalRect {
-                                x: projection.logical_clip.x + rect.loc.x as f64,
-                                y: projection.logical_clip.y + rect.loc.y as f64,
-                                width: rect.size.w as f64,
-                                height: rect.size.h as f64,
-                            }
-                        }
-                        smithay::wayland::compositor::Damage::Buffer(rect) => {
-                            crate::root_geometry::LogicalRect {
-                                x: projection.logical_clip.x
-                                    + (rect.loc.x as f64 - projection.fractional_phase_x)
-                                        / projection.scale_factor,
-                                y: projection.logical_clip.y
-                                    + (rect.loc.y as f64 - projection.fractional_phase_y)
-                                        / projection.scale_factor,
-                                width: rect.size.w as f64 / projection.scale_factor,
-                                height: rect.size.h as f64 / projection.scale_factor,
-                            }
-                        }
-                    })
-                    .map(|rect| root.physical_crop(rect))
-                    .reduce(|left, right| {
-                        let x0 = left.x.min(right.x);
-                        let y0 = left.y.min(right.y);
-                        let x1 = (left.x + left.width).max(right.x + right.width);
-                        let y1 = (left.y + left.height).max(right.y + right.height);
-                        crate::root_geometry::PhysicalPixelRect {
-                            x: x0,
-                            y: y0,
-                            width: x1 - x0,
-                            height: y1 - y0,
-                        }
-                    })
-            });
-            damaged
-        });
         match assignment {
             Some(Some(buffer)) => {
                 let mut kind = SurfaceBufferKind::Other;
@@ -9996,8 +10094,44 @@ impl RuntimeWaylandState {
                 let surface_size = size.and_then(|buffer_size| {
                     (buffer_scale > 0).then(|| {
                         Size::<i32, BufferCoords>::new(buffer_size.w, buffer_size.h)
-                            .to_logical(buffer_scale, buffer_transform.into())
+                            .to_logical(buffer_scale, buffer_transform)
                     })
+                });
+                let damage = native_materialization.and_then(|(projection, root)| {
+                    let surface_size = surface_size?;
+                    let surface_view = surface_view?;
+                    let buffer_size =
+                        size.map(|size| Size::<i32, BufferCoords>::new(size.w, size.h));
+                    damage
+                        .iter()
+                        .filter_map(|damage| {
+                            let view_rect = match damage {
+                                SurfaceCommitDamage::Surface(rect) => {
+                                    crate::root_geometry::LogicalRect {
+                                        x: rect.loc.x as f64,
+                                        y: rect.loc.y as f64,
+                                        width: rect.size.w as f64,
+                                        height: rect.size.h as f64,
+                                    }
+                                }
+                                SurfaceCommitDamage::Buffer(rect) => {
+                                    let surface_rect = native_buffer_damage_to_surface_rect(
+                                        *rect,
+                                        buffer_size?,
+                                        buffer_scale,
+                                        buffer_transform,
+                                    )?;
+                                    native_surface_rect_to_view_damage(surface_rect, surface_view)?
+                                }
+                            };
+                            native_surface_rect_to_scanout_damage(
+                                view_rect,
+                                surface_view,
+                                projection,
+                                root,
+                            )
+                        })
+                        .reduce(union_physical_damage)
                 });
                 if let Some((projection, _)) = native_materialization
                     && !native_surface_buffer_matches_projection(size, surface_size, projection)
@@ -10020,6 +10154,9 @@ impl RuntimeWaylandState {
                         kind,
                         size,
                         surface_size,
+                        surface_view,
+                        buffer_scale,
+                        buffer_transform,
                         dmabuf,
                         native_materialization: native_materialization.map(|value| value.0),
                         damage,
@@ -10295,6 +10432,7 @@ impl RuntimeWaylandState {
                 target,
                 dmabuf: snapshot.dmabuf,
                 native_materialization: snapshot.native_materialization,
+                native_sampling: None,
                 damage: snapshot.damage,
             });
         }
@@ -10323,7 +10461,13 @@ impl RuntimeWaylandState {
             },
             |surface, _, &offset| {
                 if let Some(snapshot) = self.host_surface_buffers.get(&surface_key(surface)) {
-                    let target_size = if let Some(size) = snapshot.size.as_ref() {
+                    let target_size = if mapping.uses_native_surface_view {
+                        snapshot
+                            .surface_view
+                            .map(|view| view.dst)
+                            .or(snapshot.surface_size)
+                            .or(snapshot.size)
+                    } else if let Some(size) = snapshot.size.as_ref() {
                         Some(Size::new(size.w, size.h))
                     } else if let Some(info) = snapshot.dmabuf.as_ref() {
                         Some(Size::new(info.width, info.height))
@@ -10331,12 +10475,27 @@ impl RuntimeWaylandState {
                         None
                     };
                     if let Some(size) = target_size {
+                        let native_sampling = if mapping.uses_native_surface_view {
+                            snapshot
+                                .surface_view
+                                .zip(snapshot.surface_size)
+                                .filter(|(_, _)| snapshot.buffer_scale > 0)
+                                .map(|(view, surface_size)| NativeSurfaceSampling {
+                                    view,
+                                    surface_size,
+                                    buffer_scale: snapshot.buffer_scale,
+                                    buffer_transform: snapshot.buffer_transform,
+                                })
+                        } else {
+                            None
+                        };
                         surfaces.push(HostSceneSurface {
                             buffer: snapshot.buffer.clone(),
                             kind: snapshot.kind,
                             target: mapping.map_rect(Rectangle::new(offset, size)),
                             dmabuf: snapshot.dmabuf,
                             native_materialization: snapshot.native_materialization,
+                            native_sampling,
                             damage: snapshot.damage,
                         });
                     }
@@ -10387,6 +10546,7 @@ impl RuntimeWaylandState {
                         target_rect,
                         damage_rect,
                         surface.native_materialization,
+                        surface.native_sampling,
                         root_geometry.rotation,
                         target,
                         target_stride,
@@ -10468,7 +10628,6 @@ impl CompositorHandler for RuntimeWaylandState {
         });
         self.capture_surface_buffer_commit(surface);
         self.update_native_pane_member_map_state(surface);
-        on_commit_buffer_handler::<Self>(surface);
     }
 }
 
@@ -10869,6 +11028,7 @@ fn blit_shm_surface(
     target_rect: Rectangle<i32, Logical>,
     damage_rect: Option<Rectangle<i32, Logical>>,
     native_materialization: Option<crate::root_geometry::NativeBufferProjection>,
+    native_sampling: Option<NativeSurfaceSampling>,
     rotation: OutputRotation,
     target: &mut [u8],
     target_stride: usize,
@@ -10925,15 +11085,30 @@ fn blit_shm_surface(
             }
             let dst_row = (dst_y_i32 as usize).saturating_mul(target_stride);
             for rel_x in clipped_left..clipped_right {
-                let (sample_x, sample_y) = native_source_sample(
-                    native_materialization,
-                    rotation,
-                    rel_x,
-                    rel_y,
-                    dst_w,
-                    dst_h,
-                    src_w,
-                    src_h,
+                let (sample_x, sample_y) = native_sampling.map_or_else(
+                    || {
+                        native_source_sample(
+                            native_materialization,
+                            rotation,
+                            rel_x,
+                            rel_y,
+                            dst_w,
+                            dst_h,
+                            src_w,
+                            src_h,
+                        )
+                    },
+                    |sampling| {
+                        native_surface_source_sample(
+                            sampling,
+                            native_materialization,
+                            rotation,
+                            rel_x,
+                            rel_y,
+                            dst_w,
+                            dst_h,
+                        )
+                    },
                 );
                 let src_x = sample_x.floor().clamp(0.0, src_w.saturating_sub(1) as f64) as usize;
                 let src_y = sample_y.floor().clamp(0.0, src_h.saturating_sub(1) as f64) as usize;
@@ -10990,6 +11165,50 @@ fn blit_shm_surface(
         Err(BufferAccessError::BadMap) => false,
         Err(BufferAccessError::NotWritable) => false,
     }
+}
+
+fn native_surface_source_sample(
+    sampling: NativeSurfaceSampling,
+    projection: Option<crate::root_geometry::NativeBufferProjection>,
+    rotation: OutputRotation,
+    rel_x: usize,
+    rel_y: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> (f64, f64) {
+    let raw_u = (rel_x as f64 + 0.5) / dst_w as f64;
+    let raw_v = (rel_y as f64 + 0.5) / dst_h as f64;
+    let (oriented_u, oriented_v) = match rotation {
+        OutputRotation::Deg0 => (raw_u, raw_v),
+        OutputRotation::Deg90 => (1.0 - raw_v, raw_u),
+        OutputRotation::Deg180 => (1.0 - raw_u, 1.0 - raw_v),
+        OutputRotation::Deg270 => (raw_v, 1.0 - raw_u),
+    };
+    let source_point = if let Some(projection) = projection.filter(|projection| {
+        projection.width_px > 0 && projection.height_px > 0 && projection.scale_factor > 0.0
+    }) {
+        let physical_x = projection.fractional_phase_x
+            + oriented_u * projection.logical_clip.width * projection.scale_factor;
+        let physical_y = projection.fractional_phase_y
+            + oriented_v * projection.logical_clip.height * projection.scale_factor;
+        Point::<f64, Logical>::from((
+            sampling.view.src.loc.x
+                + physical_x * sampling.view.src.size.w / projection.width_px as f64,
+            sampling.view.src.loc.y
+                + physical_y * sampling.view.src.size.h / projection.height_px as f64,
+        ))
+    } else {
+        Point::<f64, Logical>::from((
+            sampling.view.src.loc.x + oriented_u * sampling.view.src.size.w,
+            sampling.view.src.loc.y + oriented_v * sampling.view.src.size.h,
+        ))
+    };
+    let buffer_point = source_point.to_buffer(
+        sampling.buffer_scale as f64,
+        sampling.buffer_transform,
+        &sampling.surface_size.to_f64(),
+    );
+    (buffer_point.x, buffer_point.y)
 }
 
 fn native_source_sample(
@@ -11990,11 +12209,98 @@ mod tests {
         (ready_rx, release_tx)
     }
 
+    #[derive(Clone, Copy)]
+    enum RealShmPattern {
+        Solid([u8; 4]),
+        Coordinates,
+    }
+
+    fn coordinate_pattern_pixel(x: usize, y: usize) -> [u8; 4] {
+        [
+            x as u8 + 1,
+            y as u8 + 1,
+            (x as u8)
+                .wrapping_mul(37)
+                .wrapping_add((y as u8).wrapping_mul(13))
+                .wrapping_add(1),
+            0xff,
+        ]
+    }
+
+    fn real_shm_pattern(width: i32, height: i32, pattern: RealShmPattern) -> Vec<u8> {
+        match pattern {
+            RealShmPattern::Solid(pixel) => pixel.repeat((width * height) as usize),
+            RealShmPattern::Coordinates => (0..height)
+                .flat_map(|y| {
+                    (0..width).flat_map(move |x| coordinate_pattern_pixel(x as usize, y as usize))
+                })
+                .collect(),
+        }
+    }
+
+    fn assert_coordinate_pattern_scanout(
+        scanout: &[u8],
+        output_width: usize,
+        output_height: usize,
+        capture: crate::root_geometry::PhysicalPixelRect,
+        source_width: usize,
+        source_height: usize,
+        rotation: OutputRotation,
+    ) {
+        let background = [0x14, 0x14, 0x18];
+        let x0 = capture.x.saturating_sub(1).max(0) as usize;
+        let y0 = capture.y.saturating_sub(1).max(0) as usize;
+        let x1 = (capture.x + capture.width + 1).min(output_width as i32) as usize;
+        let y1 = (capture.y + capture.height + 1).min(output_height as i32) as usize;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let pixel_index = (y * output_width + x) * 4;
+                let actual = &scanout[pixel_index..pixel_index + 3];
+                let capture_x = x as i32 - capture.x;
+                let capture_y = y as i32 - capture.y;
+                if capture_x >= 0
+                    && capture_x < capture.width
+                    && capture_y >= 0
+                    && capture_y < capture.height
+                {
+                    let u = (capture_x as f64 + 0.5) / capture.width as f64;
+                    let v = (capture_y as f64 + 0.5) / capture.height as f64;
+                    let (source_u, source_v) = match rotation {
+                        OutputRotation::Deg0 => (u, v),
+                        OutputRotation::Deg90 => (1.0 - v, u),
+                        OutputRotation::Deg180 => (1.0 - u, 1.0 - v),
+                        OutputRotation::Deg270 => (v, 1.0 - u),
+                    };
+                    let source_x = (source_u * source_width as f64)
+                        .floor()
+                        .clamp(0.0, source_width.saturating_sub(1) as f64)
+                        as usize;
+                    let source_y = (source_v * source_height as f64)
+                        .floor()
+                        .clamp(0.0, source_height.saturating_sub(1) as f64)
+                        as usize;
+                    let expected = coordinate_pattern_pixel(source_x, source_y);
+                    assert_eq!(
+                        actual,
+                        &expected[..3],
+                        "scanout ({x},{y}) must sample source ({source_x},{source_y})"
+                    );
+                } else {
+                    assert_eq!(
+                        actual, &background,
+                        "scanout border ({x},{y}) must stay clear"
+                    );
+                }
+            }
+        }
+    }
+
     enum RealShmToplevelCommand {
         ReplaceBuffer {
             width: i32,
             height: i32,
-            pixel: [u8; 4],
+            pattern: RealShmPattern,
+            buffer_scale: i32,
             wait_for_configure: bool,
         },
         Finish,
@@ -12004,7 +12310,7 @@ mod tests {
         socket: UnixStream,
         width: i32,
         height: i32,
-        pixel: [u8; 4],
+        pattern: RealShmPattern,
     ) -> (
         mpsc::Receiver<(u32, (i32, i32))>,
         mpsc::Sender<RealShmToplevelCommand>,
@@ -12053,7 +12359,7 @@ mod tests {
             )
             .expect("fixture memfd must allocate");
             rustix::fs::ftruncate(&fd, byte_len as u64).expect("fixture memfd must size");
-            let pixels = pixel.repeat((width * height) as usize);
+            let pixels = real_shm_pattern(width, height, pattern);
             assert_eq!(
                 rustix::io::pwrite(&fd, &pixels, 0).expect("fixture pixels must write"),
                 byte_len
@@ -12083,7 +12389,8 @@ mod tests {
                     RealShmToplevelCommand::ReplaceBuffer {
                         width,
                         height,
-                        pixel,
+                        pattern,
+                        buffer_scale,
                         wait_for_configure,
                     } => {
                         let configure_count = client_state.configure_count;
@@ -12107,7 +12414,7 @@ mod tests {
                         .expect("replacement fixture memfd must allocate");
                         rustix::fs::ftruncate(&fd, byte_len as u64)
                             .expect("replacement fixture memfd must size");
-                        let pixels = pixel.repeat((width * height) as usize);
+                        let pixels = real_shm_pattern(width, height, pattern);
                         assert_eq!(
                             rustix::io::pwrite(&fd, &pixels, 0)
                                 .expect("replacement fixture pixels must write"),
@@ -12123,6 +12430,7 @@ mod tests {
                             &qh,
                             (),
                         );
+                        surface.set_buffer_scale(buffer_scale);
                         surface.attach(Some(&buffer), 0, 0);
                         surface.damage_buffer(0, 0, width, height);
                         surface.commit();
@@ -14183,7 +14491,7 @@ mod tests {
             )
             .unwrap();
         let (buffer_ready, client_commands, client_thread) =
-            spawn_real_shm_toplevel(client_socket, 20, 10, [0x33, 0x22, 0x11, 0xff]);
+            spawn_real_shm_toplevel(client_socket, 20, 10, RealShmPattern::Coordinates);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while wayland.pending_toplevels.is_empty() {
             assert!(
@@ -14329,14 +14637,14 @@ mod tests {
         let mut scanout = vec![0; 200 * 100 * 4];
         let composed = wayland.compose_host_scene(&mut scanout, 200 * 4, 200, 100);
         assert_eq!(composed.composed_surfaces, 1);
-        let capture = active
+        let capture_rect = active
             .captures
             .iter()
             .find(|(id, _)| id == &pane_id)
-            .map(|(_, capture)| capture)
+            .map(|(_, capture)| capture.physical_pixel_rect)
             .expect("the active pane capture must use the committed geometry");
         assert_eq!(
-            capture.physical_pixel_rect,
+            capture_rect,
             crate::root_geometry::PhysicalPixelRect {
                 x: 20,
                 y: 10,
@@ -14345,10 +14653,172 @@ mod tests {
             },
             "the rotated pane keeps its pre-rotation physical footprint"
         );
-        let pixel_x = capture.physical_pixel_rect.x + capture.physical_pixel_rect.width / 2;
-        let pixel_y = capture.physical_pixel_rect.y + capture.physical_pixel_rect.height / 2;
+        assert_eq!(
+            snapshot.damage,
+            Some(capture_rect),
+            "logical-buffer damage must cover the same projected scanout footprint"
+        );
+        let pixel_x = capture_rect.x + capture_rect.width / 2;
+        let pixel_y = capture_rect.y + capture_rect.height / 2;
         let pixel_index = (pixel_y as usize * 200 + pixel_x as usize) * 4;
-        assert_eq!(&scanout[pixel_index..pixel_index + 3], &[0x33, 0x22, 0x11]);
+        assert_eq!(
+            &scanout[pixel_index..pixel_index + 3],
+            &coordinate_pattern_pixel(9, 4)[..3]
+        );
+
+        assert_coordinate_pattern_scanout(
+            &scanout,
+            200,
+            100,
+            capture_rect,
+            20,
+            10,
+            OutputRotation::Deg180,
+        );
+
+        // A scanout-sized buffer is also accepted. Its renderer surface view
+        // is twice as large at scale 1, so native pane mapping must compress
+        // the view to the configured logical pane before the physical crop.
+        client_commands
+            .send(RealShmToplevelCommand::ReplaceBuffer {
+                width: 40,
+                height: 20,
+                pattern: RealShmPattern::Coordinates,
+                buffer_scale: 1,
+                wait_for_configure: false,
+            })
+            .expect("native pane fixture must submit a scanout-sized buffer");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while wayland
+            .host_surface_buffers
+            .get(&pane_surface_key)
+            .is_none_or(|buffer| {
+                buffer.root_geometry_generation != Some(staged_generation)
+                    || buffer.size != Some(Size::new(40, 20))
+            })
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the physical-shape buffer must be captured for the active pane generation"
+            );
+            display.dispatch_clients(&mut wayland).unwrap();
+            display.flush_clients().unwrap();
+            std::thread::yield_now();
+        }
+        let physical_shape = wayland
+            .host_surface_buffers
+            .get(&pane_surface_key)
+            .expect("the physical-shape native buffer must be retained");
+        assert_eq!(physical_shape.surface_size, Some(Size::new(40, 20)));
+        assert_eq!(
+            physical_shape.surface_view.map(|view| view.dst),
+            Some(Size::new(40, 20))
+        );
+        assert_eq!(
+            physical_shape.damage,
+            Some(capture_rect),
+            "scale-one physical-buffer damage must map through its surface view"
+        );
+        let mut physical_shape_scanout = vec![0; 200 * 100 * 4];
+        let physical_shape_result =
+            wayland.compose_host_scene(&mut physical_shape_scanout, 200 * 4, 200, 100);
+        assert_eq!(physical_shape_result.composed_surfaces, 1);
+        assert_coordinate_pattern_scanout(
+            &physical_shape_scanout,
+            200,
+            100,
+            capture_rect,
+            40,
+            20,
+            OutputRotation::Deg180,
+        );
+
+        // A high-resolution buffer with buffer_scale=2 has the same logical
+        // view but must sample all of its physical texels across the same pane.
+        client_commands
+            .send(RealShmToplevelCommand::ReplaceBuffer {
+                width: 40,
+                height: 20,
+                pattern: RealShmPattern::Coordinates,
+                buffer_scale: 2,
+                wait_for_configure: false,
+            })
+            .expect("native pane fixture must submit a scale-two physical buffer");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while wayland
+            .host_surface_buffers
+            .get(&pane_surface_key)
+            .is_none_or(|buffer| {
+                buffer.root_geometry_generation != Some(staged_generation)
+                    || buffer.size != Some(Size::new(40, 20))
+                    || buffer.buffer_scale != 2
+            })
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the scale-two physical buffer must be captured for the active pane generation"
+            );
+            display.dispatch_clients(&mut wayland).unwrap();
+            display.flush_clients().unwrap();
+            std::thread::yield_now();
+        }
+        let scaled_physical = wayland
+            .host_surface_buffers
+            .get(&pane_surface_key)
+            .expect("the scale-two native buffer must be retained");
+        assert_eq!(scaled_physical.surface_size, Some(Size::new(20, 10)));
+        assert_eq!(
+            scaled_physical.surface_view.map(|view| view.dst),
+            Some(Size::new(20, 10))
+        );
+        assert_eq!(
+            scaled_physical.damage,
+            Some(capture_rect),
+            "scale-two physical-buffer damage must cover the projected pane"
+        );
+        let mut scaled_physical_scanout = vec![0; 200 * 100 * 4];
+        let scaled_physical_result =
+            wayland.compose_host_scene(&mut scaled_physical_scanout, 200 * 4, 200, 100);
+        assert_eq!(scaled_physical_result.composed_surfaces, 1);
+        assert_coordinate_pattern_scanout(
+            &scaled_physical_scanout,
+            200,
+            100,
+            capture_rect,
+            40,
+            20,
+            OutputRotation::Deg180,
+        );
+
+        // Restore the configured logical-size shape used by the pending-flip
+        // resize regression below.
+        client_commands
+            .send(RealShmToplevelCommand::ReplaceBuffer {
+                width: 20,
+                height: 10,
+                pattern: RealShmPattern::Coordinates,
+                buffer_scale: 1,
+                wait_for_configure: false,
+            })
+            .expect("native pane fixture must restore the logical-size buffer");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while wayland
+            .host_surface_buffers
+            .get(&pane_surface_key)
+            .is_none_or(|buffer| {
+                buffer.root_geometry_generation != Some(staged_generation)
+                    || buffer.size != Some(Size::new(20, 10))
+                    || buffer.buffer_scale != 1
+            })
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the logical-size pane buffer must be restored before the next transaction"
+            );
+            display.dispatch_clients(&mut wayland).unwrap();
+            display.flush_clients().unwrap();
+            std::thread::yield_now();
+        }
 
         // A second pending flip pins the existing pane projection. Replace
         // its buffer against that generation, then resize the same pane before
@@ -14382,7 +14852,8 @@ mod tests {
             .send(RealShmToplevelCommand::ReplaceBuffer {
                 width: 20,
                 height: 10,
-                pixel: [0x44, 0x55, 0x66, 0xff],
+                pattern: RealShmPattern::Solid([0x44, 0x55, 0x66, 0xff]),
+                buffer_scale: 1,
                 // This orientation keeps the pane's pinned dimensions equal
                 // to its prior size, so no xdg configure is required before
                 // submitting the generation-G buffer.
@@ -14516,7 +14987,8 @@ mod tests {
             .send(RealShmToplevelCommand::ReplaceBuffer {
                 width: resized_client_size.w,
                 height: resized_client_size.h,
-                pixel: [0x77, 0x55, 0x33, 0xff],
+                pattern: RealShmPattern::Solid([0x77, 0x55, 0x33, 0xff]),
+                buffer_scale: 1,
                 wait_for_configure: true,
             })
             .expect("native pane fixture must submit a replacement for the refreshed size");
