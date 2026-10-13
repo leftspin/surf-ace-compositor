@@ -10168,7 +10168,48 @@ impl RuntimeWaylandState {
             Some(None) => {
                 self.host_surface_buffers.remove(&id);
             }
-            None => {}
+            None => {
+                // Viewporter state is double-buffered independently of buffer
+                // attachment. Smithay refreshes SurfaceView on every commit,
+                // so keep the retained CPU-fallback snapshot in step with the
+                // renderer even when wl_surface.commit reuses its current
+                // buffer. A changed view must be fully redrawn because the
+                // same source pixels can now cover a different crop/extent.
+                let retained_size = self
+                    .host_surface_buffers
+                    .get(&id)
+                    .and_then(|snapshot| snapshot.size);
+                let surface_size = retained_size.and_then(|buffer_size| {
+                    (buffer_scale > 0).then(|| {
+                        Size::<i32, BufferCoords>::new(buffer_size.w, buffer_size.h)
+                            .to_logical(buffer_scale, buffer_transform)
+                    })
+                });
+                if let Some((projection, _)) = native_materialization
+                    && !native_surface_buffer_matches_projection(
+                        retained_size,
+                        surface_size,
+                        projection,
+                    )
+                {
+                    self.host_surface_buffers.remove(&id);
+                    eprintln!(
+                        "root4 native buffer rejected after surface-state commit: output projection {}x{}, surface {:?}, buffer {:?}",
+                        projection.width_px, projection.height_px, surface_size, retained_size
+                    );
+                    return;
+                }
+                if let Some(snapshot) = self.host_surface_buffers.get_mut(&id) {
+                    snapshot.surface_size = surface_size;
+                    snapshot.surface_view = surface_view;
+                    snapshot.buffer_scale = buffer_scale;
+                    snapshot.buffer_transform = buffer_transform;
+                    snapshot.native_materialization = native_materialization.map(|value| value.0);
+                    snapshot.damage = None;
+                    snapshot.root_geometry_generation =
+                        native_materialization.map(|value| value.1.generation);
+                }
+            }
         }
     }
 
@@ -11758,7 +11799,7 @@ mod tests {
     };
     use smithay::backend::renderer::element::Element;
     use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as XdgDecorationMode;
-    use smithay::reexports::wayland_server::Display;
+    use smithay::reexports::wayland_server::{Display, Resource};
     use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
     use smithay::reexports::calloop::EventLoop;
     use smithay::reexports::drm as drm_api;
@@ -11779,6 +11820,7 @@ mod tests {
     use wayland_protocols::xdg::shell::client::{
         xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
     };
+    use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 
     #[derive(Debug)]
     enum NativeGrabClientEvent {
@@ -12028,6 +12070,8 @@ mod tests {
     delegate_noop!(SurfaceTreeClient: ignore wl_buffer::WlBuffer);
     delegate_noop!(SurfaceTreeClient: ignore wl_callback::WlCallback);
     delegate_noop!(SurfaceTreeClient: ignore wl_region::WlRegion);
+    delegate_noop!(SurfaceTreeClient: ignore wp_viewport::WpViewport);
+    delegate_noop!(SurfaceTreeClient: ignore wp_viewporter::WpViewporter);
     delegate_noop!(SurfaceTreeClient: ignore xdg_positioner::XdgPositioner);
     delegate_noop!(SurfaceTreeClient: ignore xdg_popup::XdgPopup);
 
@@ -12286,6 +12330,53 @@ mod tests {
         }
     }
 
+    fn assert_coordinate_pattern_viewport_scanout(
+        scanout: &[u8],
+        output_width: usize,
+        output_height: usize,
+        capture: crate::root_geometry::PhysicalPixelRect,
+        buffer_width: usize,
+        buffer_height: usize,
+        buffer_scale: i32,
+        source: (f64, f64, f64, f64),
+        rotation: OutputRotation,
+    ) {
+        assert!(capture.x >= 0 && capture.y >= 0);
+        assert!(capture.x + capture.width <= output_width as i32);
+        assert!(capture.y + capture.height <= output_height as i32);
+        let scale = buffer_scale as f64;
+        for y in capture.y as usize..(capture.y + capture.height) as usize {
+            for x in capture.x as usize..(capture.x + capture.width) as usize {
+                let pixel_index = (y * output_width + x) * 4;
+                let actual = &scanout[pixel_index..pixel_index + 3];
+                let u = (x as i32 - capture.x) as f64 + 0.5;
+                let v = (y as i32 - capture.y) as f64 + 0.5;
+                let u = u / capture.width as f64;
+                let v = v / capture.height as f64;
+                let (source_u, source_v) = match rotation {
+                    OutputRotation::Deg0 => (u, v),
+                    OutputRotation::Deg90 => (1.0 - v, u),
+                    OutputRotation::Deg180 => (1.0 - u, 1.0 - v),
+                    OutputRotation::Deg270 => (v, 1.0 - u),
+                };
+                let buffer_x = ((source.0 + source_u * source.2) * scale)
+                    .floor()
+                    .clamp(0.0, buffer_width.saturating_sub(1) as f64)
+                    as usize;
+                let buffer_y = ((source.1 + source_v * source.3) * scale)
+                    .floor()
+                    .clamp(0.0, buffer_height.saturating_sub(1) as f64)
+                    as usize;
+                let expected = coordinate_pattern_pixel(buffer_x, buffer_y);
+                assert_eq!(
+                    actual,
+                    &expected[..3],
+                    "scanout ({x},{y}) must sample viewport buffer ({buffer_x},{buffer_y})"
+                );
+            }
+        }
+    }
+
     enum RealShmToplevelCommand {
         ReplaceBuffer {
             width: i32,
@@ -12293,6 +12384,11 @@ mod tests {
             pattern: RealShmPattern,
             buffer_scale: i32,
             wait_for_configure: bool,
+        },
+        UpdateViewport {
+            source: Option<(f64, f64, f64, f64)>,
+            destination: Option<(i32, i32)>,
+            committed: mpsc::Sender<()>,
         },
         Finish,
     }
@@ -12320,10 +12416,14 @@ mod tests {
             let shm = globals
                 .bind::<wl_shm::WlShm, _, _>(&qh, 1..=1, ())
                 .expect("wl_shm must exist");
+            let viewporter = globals
+                .bind::<wp_viewporter::WpViewporter, _, _>(&qh, 1..=1, ())
+                .expect("wp_viewporter must exist");
             let wm_base = globals
                 .bind::<xdg_wm_base::XdgWmBase, _, _>(&qh, 1..=6, ())
                 .expect("xdg_wm_base must exist");
             let surface = compositor.create_surface(&qh, ());
+            let viewport = viewporter.get_viewport(&surface, &qh, ());
             let surface_id = surface.id().protocol_id();
             let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
             let _toplevel = xdg_surface.get_toplevel(&qh, ());
@@ -12429,6 +12529,31 @@ mod tests {
                             .flush()
                             .expect("replacement native pane buffer must flush");
                         buffer_leases.push((pool, buffer));
+                    }
+                    RealShmToplevelCommand::UpdateViewport {
+                        source,
+                        destination,
+                        committed,
+                    } => {
+                        if let Some((x, y, width, height)) = source {
+                            viewport.set_source(x, y, width, height);
+                        } else {
+                            viewport.set_source(-1.0, -1.0, -1.0, -1.0);
+                        }
+                        if let Some((width, height)) = destination {
+                            viewport.set_destination(width, height);
+                        } else {
+                            viewport.set_destination(-1, -1);
+                        }
+                        // A viewport-only state change deliberately reuses the
+                        // current wl_buffer: do not issue surface.attach here.
+                        surface.commit();
+                        connection
+                            .flush()
+                            .expect("viewport-only surface commit must flush");
+                        committed
+                            .send(())
+                            .expect("test must receive viewport commit acknowledgement");
                     }
                     RealShmToplevelCommand::Finish => break,
                 }
@@ -14782,6 +14907,96 @@ mod tests {
             40,
             20,
             OutputRotation::Deg180,
+        );
+
+        // Viewporter crop/scale state is committed independently of wl_buffer
+        // attachment. Reuse this scale-two patterned buffer and crop its right
+        // half; the retained CPU snapshot must follow the renderer's new view.
+        let retained_buffer_id = scaled_physical.buffer.id();
+        let (viewport_committed, viewport_ack) = mpsc::channel();
+        client_commands
+            .send(RealShmToplevelCommand::UpdateViewport {
+                source: Some((10.0, 0.0, 10.0, 10.0)),
+                destination: Some((20, 10)),
+                committed: viewport_committed,
+            })
+            .expect("native pane fixture must submit a viewport-only crop");
+        viewport_ack
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("client must flush the viewport-only commit without attaching a buffer");
+        display.dispatch_clients(&mut wayland).unwrap();
+        display.flush_clients().unwrap();
+
+        let cropped = wayland
+            .host_surface_buffers
+            .get(&pane_surface_key)
+            .expect("viewport-only commit must retain the existing wl_buffer");
+        assert_eq!(cropped.buffer.id(), retained_buffer_id);
+        assert_eq!(cropped.size, Some(Size::new(40, 20)));
+        assert_eq!(cropped.surface_size, Some(Size::new(20, 10)));
+        assert_eq!(cropped.buffer_scale, 2);
+        assert_eq!(
+            cropped.surface_view.map(|view| (
+                view.src.loc.x,
+                view.src.loc.y,
+                view.src.size.w,
+                view.src.size.h,
+                view.dst.w,
+                view.dst.h,
+            )),
+            Some((10.0, 0.0, 10.0, 10.0, 20, 10)),
+            "retained snapshot must use the committed viewport crop"
+        );
+        assert_eq!(
+            cropped.damage, None,
+            "a viewport-only change must redraw the entire changed view"
+        );
+        let mut cropped_scanout = vec![0; 200 * 100 * 4];
+        let cropped_result = wayland.compose_host_scene(&mut cropped_scanout, 200 * 4, 200, 100);
+        assert_eq!(cropped_result.composed_surfaces, 1);
+        assert_coordinate_pattern_viewport_scanout(
+            &cropped_scanout,
+            200,
+            100,
+            capture_rect,
+            40,
+            20,
+            2,
+            (10.0, 0.0, 10.0, 10.0),
+            OutputRotation::Deg180,
+        );
+
+        // Clear the crop with another no-attach commit so later resize
+        // recovery remains a test of generation matching, not viewport state.
+        let (viewport_reset, viewport_reset_ack) = mpsc::channel();
+        client_commands
+            .send(RealShmToplevelCommand::UpdateViewport {
+                source: None,
+                destination: None,
+                committed: viewport_reset,
+            })
+            .expect("native pane fixture must submit a viewport reset");
+        viewport_reset_ack
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("client must flush the viewport reset without attaching a buffer");
+        display.dispatch_clients(&mut wayland).unwrap();
+        display.flush_clients().unwrap();
+        let viewport_reset_snapshot = wayland
+            .host_surface_buffers
+            .get(&pane_surface_key)
+            .expect("viewport reset must retain the same wl_buffer");
+        assert_eq!(viewport_reset_snapshot.buffer.id(), retained_buffer_id);
+        assert_eq!(
+            viewport_reset_snapshot.surface_view.map(|view| (
+                view.src.loc.x,
+                view.src.loc.y,
+                view.src.size.w,
+                view.src.size.h,
+                view.dst.w,
+                view.dst.h,
+            )),
+            Some((0.0, 0.0, 20.0, 10.0, 20, 10)),
+            "clearing viewport state must refresh the retained view too"
         );
 
         // Restore the configured logical-size shape used by the pending-flip
