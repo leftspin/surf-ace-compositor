@@ -6,6 +6,9 @@ use crate::model::{
     RuntimeFocusTarget, RuntimePhase, StatusSnapshot, SurfaceBindingEvidence,
     SurfaceBindingEvidenceOutcome,
 };
+use crate::presentation_measurement::{
+    PresentationMeasurementCollector, PresentationMeasurementSnapshot,
+};
 use crate::root_geometry::CaptureGeometry;
 use crate::screen_capture::ScreenCaptureStore;
 use crate::state::CompositorState;
@@ -145,6 +148,8 @@ pub enum ControlRequest {
     OverlayRegionsDebugBorders {
         enabled: bool,
     },
+    #[serde(rename = "presentation.measurements")]
+    PresentationMeasurements,
     LaunchNativePaneHosts {
         #[serde(default)]
         pane_ids: Vec<PaneId>,
@@ -232,6 +237,12 @@ pub struct ControlResponse {
         skip_serializing_if = "Option::is_none"
     )]
     pub runtime_app_binding: Option<RuntimeAppBindingDiagnostics>,
+    #[serde(
+        rename = "presentationMeasurements",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub presentation_measurements: Option<PresentationMeasurementSnapshot>,
 }
 
 impl ControlResponse {
@@ -243,6 +254,7 @@ impl ControlResponse {
             capture_path: None,
             geometry: None,
             runtime_app_binding: None,
+            presentation_measurements: None,
         }
     }
 
@@ -254,6 +266,7 @@ impl ControlResponse {
             capture_path: None,
             geometry: None,
             runtime_app_binding: None,
+            presentation_measurements: None,
         }
     }
 
@@ -265,6 +278,7 @@ impl ControlResponse {
             capture_path: Some(path),
             geometry,
             runtime_app_binding: None,
+            presentation_measurements: None,
         }
     }
 
@@ -279,6 +293,19 @@ impl ControlResponse {
             capture_path: None,
             geometry: None,
             runtime_app_binding: Some(diagnostics),
+            presentation_measurements: None,
+        }
+    }
+
+    fn presentation_measurements(snapshot: PresentationMeasurementSnapshot) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            status: None,
+            capture_path: None,
+            geometry: None,
+            runtime_app_binding: None,
+            presentation_measurements: Some(snapshot),
         }
     }
 }
@@ -312,6 +339,22 @@ pub fn serve_listener_with_runtime_control(
     runtime_control: Option<Sender<RuntimeControlCommand>>,
     screen_capture: ScreenCaptureStore,
 ) -> io::Result<()> {
+    serve_listener_with_presentation_measurement_collector(
+        listener,
+        shared_state,
+        runtime_control,
+        screen_capture,
+        None,
+    )
+}
+
+pub fn serve_listener_with_presentation_measurement_collector(
+    listener: UnixListener,
+    shared_state: Arc<Mutex<CompositorState>>,
+    runtime_control: Option<Sender<RuntimeControlCommand>>,
+    screen_capture: ScreenCaptureStore,
+    presentation_measurement_collector: Option<Arc<PresentationMeasurementCollector>>,
+) -> io::Result<()> {
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(stream) => stream,
@@ -325,6 +368,7 @@ pub fn serve_listener_with_runtime_control(
             &shared_state,
             runtime_control.as_ref(),
             &screen_capture,
+            presentation_measurement_collector.as_deref(),
         ) {
             eprintln!("failed to handle control request: {err}");
         }
@@ -395,6 +439,7 @@ fn handle_connection(
     shared_state: &Arc<Mutex<CompositorState>>,
     runtime_control: Option<&Sender<RuntimeControlCommand>>,
     screen_capture: &ScreenCaptureStore,
+    presentation_measurement_collector: Option<&PresentationMeasurementCollector>,
 ) -> io::Result<()> {
     let mut request_line = String::new();
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -404,6 +449,10 @@ fn handle_connection(
     }
 
     let response = match serde_json::from_str::<ControlRequest>(&request_line) {
+        Ok(ControlRequest::PresentationMeasurements) => match presentation_measurement_collector {
+            Some(collector) => ControlResponse::presentation_measurements(collector.snapshot()),
+            None => ControlResponse::err("presentation_measurement_collector_disabled"),
+        },
         Ok(request) => {
             if let Some(response) =
                 handle_runtime_geometry_request(&request, shared_state, runtime_control)
@@ -611,6 +660,9 @@ fn handle_request_with_capture(
         ControlRequest::OverlayRegionsDebugBorders { enabled } => {
             state.set_overlay_region_debug_borders(enabled);
             Ok(Some(state.status_snapshot()))
+        }
+        ControlRequest::PresentationMeasurements => {
+            Err("presentation_measurement_collector_disabled".to_string())
         }
         ControlRequest::LaunchNativePaneHosts { pane_ids } => state
             .launch_native_pane_hosts(pane_ids)
@@ -875,7 +927,10 @@ mod tests {
         NodeSunScheduleProfile, OverlayCaptureCapability, OverlayRect, PaneGeometry,
         PaneGeometryCoordinateSpace, PaneRenderMode, ProcessSpec, RuntimeBackend,
         RuntimeDmabufFormatStatus, RuntimeHostPresentOwnership, RuntimeHostQueuedPresentSource,
-        SurfaceBindingEvidence, SurfaceBindingEvidenceOutcome,
+        RuntimePhase, SurfaceBindingEvidence, SurfaceBindingEvidenceOutcome,
+    };
+    use crate::presentation_measurement::{
+        PresentationButtonState, PresentationMeasurementCollector, PresentationMeasurementOutput,
     };
     use crate::process_manager::{ProcessController, ProcessControllerEvent, ProcessRequestId};
     use crate::screen_capture::ScreenCaptureStore;
@@ -884,7 +939,8 @@ mod tests {
     use smithay::backend::allocator::Fourcc as DrmFourcc;
     use std::collections::BTreeMap;
     use std::fs;
-    use std::os::unix::net::UnixListener;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[derive(Default)]
@@ -929,6 +985,111 @@ mod tests {
             "surf-ace-control-{label}-{}-{suffix}.sock",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn presentation_measurement_query_is_read_only_and_disabled_by_default() {
+        let state = Arc::new(Mutex::new(CompositorState::new(
+            true,
+            Box::new(NoopProcessController::default()),
+        )));
+        let initial_runtime_phase = state.lock().unwrap().status_snapshot().runtime.phase;
+        let (mut client, server) = UnixStream::pair().expect("control stream pair should exist");
+        let server_state = state.clone();
+        let server_thread = std::thread::spawn(move || {
+            handle_connection(
+                server,
+                &server_state,
+                None,
+                &ScreenCaptureStore::default(),
+                None,
+            )
+            .expect("control request should receive a response")
+        });
+        client
+            .write_all(b"{\"type\":\"presentation.measurements\"}\n")
+            .expect("request should be writable");
+        let mut response_line = String::new();
+        BufReader::new(client)
+            .read_line(&mut response_line)
+            .expect("response should be readable");
+        server_thread
+            .join()
+            .expect("control response thread should finish");
+
+        let response: ControlResponse =
+            serde_json::from_str(&response_line).expect("response should be valid JSON");
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_deref(),
+            Some("presentation_measurement_collector_disabled")
+        );
+        assert!(response.presentation_measurements.is_none());
+        assert!(!response_line.contains("presentationMeasurements"));
+        assert_eq!(
+            state.lock().unwrap().status_snapshot().runtime.phase,
+            initial_runtime_phase
+        );
+    }
+
+    #[test]
+    fn presentation_measurement_query_returns_a_bounded_read_only_snapshot_when_enabled() {
+        let state = Arc::new(Mutex::new(CompositorState::new(
+            true,
+            Box::new(NoopProcessController::default()),
+        )));
+        let initial_runtime_phase = state.lock().unwrap().status_snapshot().runtime.phase;
+        let output = PresentationMeasurementOutput {
+            device_path: "/dev/dri/card-test".to_string(),
+            connector_name: "TEST-1".to_string(),
+            connector_id: 10,
+            crtc_id: 20,
+            generation: 1,
+            drm_monotonic_timestamp_capability: Some(1),
+        };
+        let collector = Arc::new(PresentationMeasurementCollector::new(Some(
+            "boot-test".to_string(),
+        )));
+        collector.set_active_output(Some(&output));
+        collector.record_button(
+            10_000_000,
+            PresentationButtonState::Pressed,
+            "event-test",
+            Some(&output),
+        );
+        let before = collector.snapshot();
+
+        let (mut client, server) = UnixStream::pair().expect("control stream pair should exist");
+        let server_state = state.clone();
+        let server_thread = std::thread::spawn(move || {
+            handle_connection(
+                server,
+                &server_state,
+                None,
+                &ScreenCaptureStore::default(),
+                Some(collector.as_ref()),
+            )
+            .expect("control request should receive a response")
+        });
+        client
+            .write_all(b"{\"type\":\"presentation.measurements\"}\n")
+            .expect("request should be writable");
+        let mut response_line = String::new();
+        BufReader::new(client)
+            .read_line(&mut response_line)
+            .expect("response should be readable");
+        server_thread
+            .join()
+            .expect("control response thread should finish");
+
+        let response: ControlResponse =
+            serde_json::from_str(&response_line).expect("response should be valid JSON");
+        assert!(response.ok);
+        assert_eq!(response.presentation_measurements, Some(before));
+        assert_eq!(
+            state.lock().unwrap().status_snapshot().runtime.phase,
+            initial_runtime_phase
+        );
     }
 
     fn overlay_region(
