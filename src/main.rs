@@ -12,7 +12,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use surf_ace_compositor::control::{
     ControlRequest, RuntimeControlCommand, bind_control_listener, send_request,
-    serve_listener_with_runtime_control,
+    serve_listener_with_presentation_measurement_collector,
 };
 use surf_ace_compositor::host_sun_schedule_profile::{
     DesktopColorSchemePreference, discover_desktop_color_scheme, discover_host_sun_schedule_profile,
@@ -24,6 +24,7 @@ use surf_ace_compositor::model::{
 use surf_ace_compositor::output_rotation_memory::{
     OUTPUT_ROTATION_STATE_PATH_ENV, OutputRotationMemory,
 };
+use surf_ace_compositor::presentation_measurement::PresentationMeasurementCollector;
 use surf_ace_compositor::process_manager::LocalProcessController;
 use surf_ace_compositor::runtime::{
     HostRuntimeOptions, RuntimeSelectionReport, parse_shell_overlay_toggle_shortcut,
@@ -336,6 +337,11 @@ enum Command {
         host_drm_device: Option<PathBuf>,
         #[arg(long, env = HOST_OUTPUT_ENV)]
         host_output: Option<String>,
+        #[arg(
+            long,
+            help = "Opt in to bounded raw primary-button and output-presentation measurement capture."
+        )]
+        presentation_measurements: bool,
         #[arg(long)]
         config: Option<PathBuf>,
         #[arg(
@@ -477,6 +483,7 @@ fn main() {
                 HostRuntimeOptions {
                     forced_drm_path: None,
                     forced_output_name: None,
+                    presentation_measurement_collector: None,
                 },
                 None,
                 None,
@@ -493,6 +500,7 @@ fn main() {
             runtime,
             host_drm_device,
             host_output,
+            presentation_measurements,
             config,
             output_rotation,
             output_rotation_state_path,
@@ -502,6 +510,12 @@ fn main() {
             overlay_region_debug_borders,
             sun_schedule_node,
         }) => {
+            if presentation_measurements && runtime != "host" {
+                eprintln!("--presentation-measurements requires --runtime host");
+                std::process::exit(2);
+            }
+            let presentation_measurement_collector = presentation_measurements
+                .then(|| Arc::new(PresentationMeasurementCollector::from_kernel_boot_id()));
             let launch = serve_launch.as_deref().or(launch.as_deref());
             if launch.is_some() && main_app_launch_intent_json.is_none() {
                 dispatch_launch_to_active_socket_or_continue(&socket_path, launch.unwrap());
@@ -512,6 +526,7 @@ fn main() {
                 HostRuntimeOptions {
                     forced_drm_path: host_drm_device,
                     forced_output_name: host_output,
+                    presentation_measurement_collector,
                 },
                 config.as_deref(),
                 main_app_launch_intent_json.as_deref(),
@@ -719,11 +734,12 @@ fn run_server(
                 sun_schedule_discovery_error.clone(),
             );
             persist_startup_output_rotation_if_explicit(&shared_state, output_rotation);
-            if let Err(err) = serve_listener_with_runtime_control(
+            if let Err(err) = serve_listener_with_presentation_measurement_collector(
                 listener,
                 shared_state.clone(),
                 None,
                 screen_capture,
+                host_options.presentation_measurement_collector.clone(),
             ) {
                 appearance_scheduler.stop();
                 eprintln!("control server failed: {err}");
@@ -747,12 +763,15 @@ fn run_server(
             persist_startup_output_rotation_if_explicit(&shared_state, output_rotation);
             let control_state = shared_state.clone();
             let control_screen_capture = screen_capture.clone();
+            let control_presentation_measurement_collector =
+                host_options.presentation_measurement_collector.clone();
             thread::spawn(move || {
-                if let Err(err) = serve_listener_with_runtime_control(
+                if let Err(err) = serve_listener_with_presentation_measurement_collector(
                     listener,
                     control_state,
                     None,
                     control_screen_capture,
+                    control_presentation_measurement_collector,
                 ) {
                     eprintln!("control server failed: {err}");
                 }
@@ -788,12 +807,15 @@ fn run_server(
             let control_state = shared_state.clone();
             let control_runtime_tx = runtime_control_tx.clone();
             let control_screen_capture = screen_capture.clone();
+            let control_presentation_measurement_collector =
+                host_options.presentation_measurement_collector.clone();
             let control_thread = thread::spawn(move || {
-                if let Err(err) = serve_listener_with_runtime_control(
+                if let Err(err) = serve_listener_with_presentation_measurement_collector(
                     listener,
                     control_state,
                     Some(control_runtime_tx),
                     control_screen_capture,
+                    control_presentation_measurement_collector,
                 ) {
                     eprintln!("control server failed: {err}");
                 }

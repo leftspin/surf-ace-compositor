@@ -6,6 +6,10 @@ use crate::model::{
     RuntimeSelectionMode, SurfaceBindingEvidence, SurfaceBindingEvidenceOutcome,
 };
 use crate::output_rotation_model::OutputRotationModel;
+use crate::presentation_measurement::{
+    PRIMARY_BUTTON_CODE, PresentationButtonState, PresentationMeasurementCollector,
+    PresentationMeasurementOutput,
+};
 use crate::screen_capture::ScreenCaptureStore;
 use crate::state::{CompositorState, LAUNCH_TOKEN_ENV};
 use input::Libinput;
@@ -69,7 +73,7 @@ use smithay::reexports::calloop::{
     timer::{TimeoutAction, Timer},
 };
 use smithay::reexports::drm::{
-    self as drm_api, ClientCapability, Device as DrmDevice,
+    self as drm_api, ClientCapability, Device as DrmDevice, DriverCapability,
     buffer::{Buffer as DrmBuffer, DrmFourcc},
     control::{
         AtomicCommitFlags, Device as DrmControlDevice, Mode as DrmMode, ModeTypeFlags,
@@ -135,6 +139,7 @@ use thiserror::Error;
 pub struct HostRuntimeOptions {
     pub forced_drm_path: Option<PathBuf>,
     pub forced_output_name: Option<String>,
+    pub presentation_measurement_collector: Option<Arc<PresentationMeasurementCollector>>,
 }
 
 #[derive(Debug, Clone)]
@@ -690,6 +695,7 @@ pub fn run_host_with_control(
         options.forced_drm_path.clone(),
         options.forced_output_name.clone(),
         screen_capture,
+        options.presentation_measurement_collector.clone(),
     );
     let mut initial_devices: Vec<(u64, PathBuf)> = udev
         .device_list()
@@ -858,6 +864,8 @@ pub fn run_host_with_control(
     )?;
     loop_handle
         .insert_source(libinput_backend, |event, _, data| {
+            data.host_backend
+                .record_presentation_measurement_input(&event);
             data.wayland_state.forward_input_event(event);
             let mut state = lock_state(&data.shared_state);
             state.mark_runtime_input_event();
@@ -2060,6 +2068,7 @@ struct HostBackendState {
     forced_drm_path: Option<PathBuf>,
     forced_output_name: Option<String>,
     screen_capture: ScreenCaptureStore,
+    presentation_measurement_collector: Option<Arc<PresentationMeasurementCollector>>,
     detected_devices: HashMap<u64, PathBuf>,
     opened_devices: HashMap<u64, OpenedHostDevice>,
     claimed_output: Option<ClaimedHostOutput>,
@@ -2071,6 +2080,7 @@ struct HostBackendState {
     last_selection_attempt: Option<String>,
     last_selection_result: Option<String>,
     next_presentation_token: u64,
+    next_output_measurement_generation: Option<u64>,
 }
 
 struct OpenedHostDevice {
@@ -2106,6 +2116,13 @@ struct ClaimedPresentationPipeline {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PresentationToken(u64);
+
+#[derive(Clone, Copy)]
+struct PageFlipCompletion {
+    crtc: drm_crtc::Handle,
+    timestamp: Duration,
+    frame_sequence: u32,
+}
 
 struct HostGlesRendererState {
     render_node: DrmNode,
@@ -2170,6 +2187,7 @@ struct ClaimedHostOutput {
     mode: DrmMode,
     startup_present_ownership: StartupPresentOwnership,
     identity: OutputIdentity,
+    measurement_identity: Option<PresentationMeasurementOutput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2393,6 +2411,7 @@ impl HostBackendState {
             forced_drm_path: None,
             forced_output_name: None,
             screen_capture,
+            presentation_measurement_collector: None,
             detected_devices: HashMap::new(),
             opened_devices: HashMap::new(),
             claimed_output: None,
@@ -2404,6 +2423,7 @@ impl HostBackendState {
             last_selection_attempt: None,
             last_selection_result: None,
             next_presentation_token: 0,
+            next_output_measurement_generation: Some(1),
         }
     }
 
@@ -2418,6 +2438,9 @@ impl HostBackendState {
         let Some(output) = self.claimed_output.take() else {
             return;
         };
+        if let Some(collector) = self.presentation_measurement_collector.as_deref() {
+            collector.set_active_output(None);
+        }
         let pipeline = self
             .opened_devices
             .get_mut(&output.device_id)
@@ -2436,7 +2459,14 @@ impl HostBackendState {
                     .to_string(),
             });
         };
-        drain_pipeline_before_reclaim(&opened.fd, &opened.path, &mut retired.pipeline)
+        let collector = self.presentation_measurement_collector.clone();
+        drain_pipeline_before_reclaim(
+            &opened.fd,
+            &opened.path,
+            &mut retired.pipeline,
+            collector.as_deref(),
+            retired.output.measurement_identity.as_ref(),
+        )
     }
 
     fn new(
@@ -2446,6 +2476,7 @@ impl HostBackendState {
         forced_drm_path: Option<PathBuf>,
         forced_output_name: Option<String>,
         screen_capture: ScreenCaptureStore,
+        presentation_measurement_collector: Option<Arc<PresentationMeasurementCollector>>,
     ) -> Self {
         let device_selection_state = if forced_drm_path.is_some() {
             RuntimeHostSelectionState::Forced
@@ -2464,6 +2495,7 @@ impl HostBackendState {
             forced_drm_path,
             forced_output_name,
             screen_capture,
+            presentation_measurement_collector,
             detected_devices: HashMap::new(),
             opened_devices: HashMap::new(),
             claimed_output: None,
@@ -2475,7 +2507,34 @@ impl HostBackendState {
             last_selection_attempt: None,
             last_selection_result: None,
             next_presentation_token: 0,
+            next_output_measurement_generation: Some(1),
         }
+    }
+
+    fn record_presentation_measurement_input(&self, input: &InputEvent<LibinputInputBackend>) {
+        let Some(collector) = self.presentation_measurement_collector.as_deref() else {
+            return;
+        };
+        let event = match input {
+            InputEvent::PointerButton { event, .. } => event,
+            InputEvent::DeviceRemoved { device } => {
+                collector.record_input_device_removed(device.sysname());
+                return;
+            }
+            _ => return,
+        };
+        if event.button_code() != PRIMARY_BUTTON_CODE {
+            return;
+        }
+        let state = match event.state() {
+            ButtonState::Pressed => PresentationButtonState::Pressed,
+            ButtonState::Released => PresentationButtonState::Released,
+        };
+        let output = self
+            .claimed_output
+            .as_ref()
+            .and_then(|claimed| claimed.measurement_identity.as_ref());
+        collector.record_button(event.time(), state, event.device().sysname(), output);
     }
 
     fn detected_count(&self) -> usize {
@@ -2705,6 +2764,12 @@ impl HostBackendState {
             self.drain_retired_pipeline_before_reclaim()?;
         }
 
+        let collector = self.presentation_measurement_collector.clone();
+        let prior_measurement_identity = self
+            .claimed_output
+            .as_ref()
+            .filter(|claimed| claimed.device_id == chosen.device_id)
+            .and_then(|claimed| claimed.measurement_identity.clone());
         let Some(opened) = self.opened_devices.get_mut(&chosen.device_id) else {
             return Err(RuntimeError::HostNoConnectedOutputRoute);
         };
@@ -2720,7 +2785,13 @@ impl HostBackendState {
             defer_activation,
         ) {
             Ok(claimed) => {
-                if defer_activation && let Err(err) = drain_prior_pipeline_before_reclaim(opened) {
+                if defer_activation
+                    && let Err(err) = drain_prior_pipeline_before_reclaim(
+                        opened,
+                        collector.as_deref(),
+                        prior_measurement_identity.as_ref(),
+                    )
+                {
                     if let Some(pipeline) = opened.prepared_pipeline.take() {
                         destroy_claimed_pipeline_resources(&opened.fd, pipeline);
                     }
@@ -2735,11 +2806,33 @@ impl HostBackendState {
                         return Err(err);
                     }
                 }
+                let measurement_generation = if collector.is_some() {
+                    let generation = self.next_output_measurement_generation;
+                    self.next_output_measurement_generation =
+                        generation.and_then(|value| value.checked_add(1));
+                    generation
+                } else {
+                    None
+                };
+                let measurement_identity = measurement_generation.map(|generation| {
+                    let monotonic_timestamp_capability = HostKmsCard::new(&opened.fd)
+                        .get_driver_capability(DriverCapability::MonotonicTimestamp)
+                        .ok();
+                    PresentationMeasurementOutput {
+                        device_path: opened.path.display().to_string(),
+                        connector_name: claimed.identity.connector_name.clone(),
+                        connector_id: claimed.identity.connector_id,
+                        crtc_id: u32::from(chosen.plan.crtc),
+                        generation,
+                        drm_monotonic_timestamp_capability: monotonic_timestamp_capability,
+                    }
+                });
                 let claimed_output = ClaimedHostOutput {
                     device_id: chosen.device_id,
                     mode: claimed.mode,
                     startup_present_ownership: claimed.startup_present_ownership,
                     identity: claimed.identity.clone(),
+                    measurement_identity: measurement_identity.clone(),
                 };
                 self.last_good_output_identity = Some(claimed.identity.clone());
                 self.last_selection_result = Some(describe_output_selection_result(
@@ -2753,6 +2846,9 @@ impl HostBackendState {
                     self.prepared_reclaim_output = Some(claimed_output.clone());
                 } else {
                     self.claimed_output = Some(claimed_output.clone());
+                    if let Some(collector) = collector.as_deref() {
+                        collector.set_active_output(measurement_identity.as_ref());
+                    }
                 }
                 Ok(claimed_output)
             }
@@ -2841,6 +2937,13 @@ impl HostBackendState {
                 })?;
         opened.claimed_pipeline = Some(pipeline);
         self.claimed_output = Some(prepared);
+        if let Some(collector) = self.presentation_measurement_collector.as_deref() {
+            collector.set_active_output(
+                self.claimed_output
+                    .as_ref()
+                    .and_then(|claimed| claimed.measurement_identity.as_ref()),
+            );
+        }
         Ok(())
     }
 
@@ -2888,6 +2991,9 @@ impl HostBackendState {
         opened.claimed_pipeline = Some(retired.pipeline);
         self.claimed_output = Some(restored_output.clone());
         self.last_good_output_identity = Some(restored_output.identity.clone());
+        if let Some(collector) = self.presentation_measurement_collector.as_deref() {
+            collector.set_active_output(restored_output.measurement_identity.as_ref());
+        }
         self.last_selection_result = Some(format!(
             "reclaim candidate was discarded before activation; restored {} on {}",
             restored_output.identity.connector_name,
@@ -3326,6 +3432,7 @@ impl HostBackendState {
         let Some(claimed) = self.claimed_output.as_ref().cloned() else {
             return Ok(Vec::new());
         };
+        let collector = self.presentation_measurement_collector.clone();
         let Some(opened) = self.opened_devices.get_mut(&claimed.device_id) else {
             return Ok(Vec::new());
         };
@@ -3341,13 +3448,29 @@ impl HostBackendState {
             })
         })?;
 
-        Ok(complete_pipeline_flip_events(
-            pipeline,
-            events.into_iter().filter_map(|event| match event {
-                drm_api::control::Event::PageFlip(flip) => Some(flip.crtc),
-                _ => None,
-            }),
-        ))
+        if let Some(collector) = collector.as_deref() {
+            Ok(complete_pipeline_flip_events_with_measurement(
+                pipeline,
+                events.into_iter().filter_map(|event| match event {
+                    drm_api::control::Event::PageFlip(flip) => Some(PageFlipCompletion {
+                        crtc: flip.crtc,
+                        timestamp: flip.duration,
+                        frame_sequence: flip.frame,
+                    }),
+                    _ => None,
+                }),
+                Some(collector),
+                claimed.measurement_identity.as_ref(),
+            ))
+        } else {
+            Ok(complete_pipeline_flip_events(
+                pipeline,
+                events.into_iter().filter_map(|event| match event {
+                    drm_api::control::Event::PageFlip(flip) => Some(flip.crtc),
+                    _ => None,
+                }),
+            ))
+        }
     }
 
     fn close_device(&mut self, device_id: u64) -> Result<(), RuntimeError> {
@@ -3358,6 +3481,9 @@ impl HostBackendState {
             .unwrap_or(false)
         {
             self.claimed_output = None;
+            if let Some(collector) = self.presentation_measurement_collector.as_deref() {
+                collector.set_active_output(None);
+            }
         }
         if self
             .prepared_reclaim_output
@@ -3460,17 +3586,46 @@ fn complete_pipeline_flip_events(
         .collect()
 }
 
-fn drain_prior_pipeline_before_reclaim(opened: &mut OpenedHostDevice) -> Result<(), RuntimeError> {
+fn complete_pipeline_flip_events_with_measurement(
+    pipeline: &mut ClaimedPresentationPipeline,
+    completions: impl IntoIterator<Item = PageFlipCompletion>,
+    collector: Option<&PresentationMeasurementCollector>,
+    output: Option<&PresentationMeasurementOutput>,
+) -> Vec<PresentationToken> {
+    completions
+        .into_iter()
+        .filter_map(|completion| {
+            let token = complete_pipeline_flip_for_crtc(pipeline, completion.crtc)?;
+            if let Some(collector) = collector {
+                collector.record_presentation(
+                    completion.timestamp,
+                    u32::from(completion.crtc),
+                    completion.frame_sequence,
+                    output,
+                );
+            }
+            Some(token)
+        })
+        .collect()
+}
+
+fn drain_prior_pipeline_before_reclaim(
+    opened: &mut OpenedHostDevice,
+    collector: Option<&PresentationMeasurementCollector>,
+    output: Option<&PresentationMeasurementOutput>,
+) -> Result<(), RuntimeError> {
     let Some(pipeline) = opened.claimed_pipeline.as_mut() else {
         return Ok(());
     };
-    drain_pipeline_before_reclaim(&opened.fd, &opened.path, pipeline)
+    drain_pipeline_before_reclaim(&opened.fd, &opened.path, pipeline, collector, output)
 }
 
 fn drain_pipeline_before_reclaim(
     fd: &OwnedFd,
     path: &std::path::Path,
     pipeline: &mut ClaimedPresentationPipeline,
+    collector: Option<&PresentationMeasurementCollector>,
+    output: Option<&PresentationMeasurementOutput>,
 ) -> Result<(), RuntimeError> {
     let card = HostKmsCard::new(fd);
     let events = card
@@ -3479,13 +3634,29 @@ fn drain_pipeline_before_reclaim(
             path: path.display().to_string(),
             error: format!("failed to drain prior presentation before reclaim: {err}"),
         })?;
-    complete_pipeline_flip_events(
-        pipeline,
-        events.into_iter().filter_map(|event| match event {
-            drm_api::control::Event::PageFlip(flip) => Some(flip.crtc),
-            _ => None,
-        }),
-    );
+    if let Some(collector) = collector {
+        complete_pipeline_flip_events_with_measurement(
+            pipeline,
+            events.into_iter().filter_map(|event| match event {
+                drm_api::control::Event::PageFlip(flip) => Some(PageFlipCompletion {
+                    crtc: flip.crtc,
+                    timestamp: flip.duration,
+                    frame_sequence: flip.frame,
+                }),
+                _ => None,
+            }),
+            Some(collector),
+            output,
+        );
+    } else {
+        complete_pipeline_flip_events(
+            pipeline,
+            events.into_iter().filter_map(|event| match event {
+                drm_api::control::Event::PageFlip(flip) => Some(flip.crtc),
+                _ => None,
+            }),
+        );
+    }
     if pipeline.flip_pending {
         return Err(RuntimeError::HostOutputClaim {
             path: path.display().to_string(),
@@ -11785,8 +11956,10 @@ mod tests {
         PresentationToken, RuntimeGeometryMutation, RootGeometryStageStore,
         RuntimeGeometryMutationQueue, RuntimeSurfaceRole, RuntimeWaylandState,
         RegisteredDrmEventSource, ShellOverlayToggleShortcut, StartupPresentOwnership,
+        PageFlipCompletion,
         TimeoutAction, Timer, build_host_gles_renderer_state,
         compile_native_clip_program, complete_pipeline_flip_events,
+        complete_pipeline_flip_events_with_measurement,
         materialize_native_surface_elements,
         copy_renderer_pixels_to_dumb,
         direct_present_supported_for_rotation, native_materialized_destination_rect,
@@ -11815,6 +11988,10 @@ mod tests {
     };
     use crate::screen_capture::ScreenCaptureStore;
     use crate::state::CompositorState;
+    use crate::presentation_measurement::{
+        PresentationButtonState, PresentationMeasurementCollector,
+        PresentationMeasurementOutput,
+    };
     use smithay::input::keyboard::{Keysym, ModifiersState, keysyms};
     use smithay::backend::drm::DrmNode;
     use smithay::backend::renderer::utils::DamageSet;
@@ -11835,6 +12012,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
     use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, delegate_noop};
     use wayland_client::globals::registry_queue_init;
     use wayland_client::protocol::{
@@ -12761,6 +12939,7 @@ mod tests {
                 connector_name: format!("TEST-{device_id}"),
                 connector_id: device_id as u32,
             },
+            measurement_identity: None,
         }
     }
 
@@ -13486,6 +13665,115 @@ mod tests {
             complete_pipeline_flip_events(&mut pipeline, [crtc]),
             [PresentationToken(8)]
         );
+    }
+
+    #[test]
+    fn accepted_claimed_crtc_pageflip_records_raw_completion_and_deduplicates() {
+        let crtc = drm_api::control::from_u32(1).unwrap();
+        let other_crtc = drm_api::control::from_u32(2).unwrap();
+        let output = PresentationMeasurementOutput {
+            device_path: "/dev/dri/card-test".to_string(),
+            connector_name: "HDMI-A-1".to_string(),
+            connector_id: 10,
+            crtc_id: 1,
+            generation: 1,
+            drm_monotonic_timestamp_capability: Some(1),
+        };
+        let collector = PresentationMeasurementCollector::new(Some("boot-test".to_string()));
+        collector.set_active_output(Some(&output));
+        collector.record_button(
+            100_000,
+            PresentationButtonState::Pressed,
+            "event-test",
+            Some(&output),
+        );
+
+        let mut pipeline = test_pipeline(false);
+        pipeline.crtc = crtc;
+        pipeline.flip_pending = true;
+        pipeline.pending_flip_source = Some(super::QueuedFlipSource::Dumb);
+        pipeline.pending_presentation_token = Some(PresentationToken(1));
+        let wrong_crtc = PageFlipCompletion {
+            crtc: other_crtc,
+            timestamp: Duration::from_micros(100_010),
+            frame_sequence: 7,
+        };
+        assert!(
+            complete_pipeline_flip_events_with_measurement(
+                &mut pipeline,
+                [wrong_crtc],
+                Some(&collector),
+                Some(&output),
+            )
+            .is_empty()
+        );
+        assert!(collector.snapshot().presentations.is_empty());
+        assert!(pipeline.flip_pending);
+
+        let accepted = PageFlipCompletion {
+            crtc,
+            timestamp: Duration::from_micros(100_010),
+            frame_sequence: 7,
+        };
+        assert_eq!(
+            complete_pipeline_flip_events_with_measurement(
+                &mut pipeline,
+                [accepted],
+                Some(&collector),
+                Some(&output),
+            ),
+            [PresentationToken(1)]
+        );
+
+        pipeline.flip_pending = true;
+        pipeline.pending_flip_source = Some(super::QueuedFlipSource::Dumb);
+        pipeline.pending_presentation_token = Some(PresentationToken(2));
+        assert_eq!(
+            complete_pipeline_flip_events_with_measurement(
+                &mut pipeline,
+                [accepted],
+                Some(&collector),
+                Some(&output),
+            ),
+            [PresentationToken(2)]
+        );
+        let snapshot = collector.snapshot();
+        assert_eq!(snapshot.presentations.len(), 2);
+        assert_eq!(snapshot.duplicate_presentation_count, 1);
+        assert_eq!(snapshot.one_second_presentation_counts[0], 1);
+        assert_eq!(snapshot.presentations[0].timestamp_seconds, 0);
+        assert_eq!(
+            snapshot.presentations[0].timestamp_subsecond_microseconds,
+            100_010
+        );
+        assert_eq!(snapshot.presentations[0].crtc_id, 1);
+        assert_eq!(snapshot.presentations[0].frame_sequence, 7);
+        assert!(snapshot.presentations[1].duplicate);
+    }
+
+    #[test]
+    fn disabled_measurement_does_not_change_pending_flip_completion() {
+        let crtc = drm_api::control::from_u32(1).unwrap();
+        let mut pipeline = test_pipeline(false);
+        pipeline.crtc = crtc;
+        pipeline.flip_pending = true;
+        pipeline.pending_flip_source = Some(super::QueuedFlipSource::Dumb);
+        pipeline.pending_presentation_token = Some(PresentationToken(3));
+
+        assert_eq!(
+            complete_pipeline_flip_events_with_measurement(
+                &mut pipeline,
+                [PageFlipCompletion {
+                    crtc,
+                    timestamp: Duration::from_micros(200_000),
+                    frame_sequence: 8,
+                }],
+                None,
+                None,
+            ),
+            [PresentationToken(3)]
+        );
+        assert!(!pipeline.flip_pending);
     }
 
     #[test]
