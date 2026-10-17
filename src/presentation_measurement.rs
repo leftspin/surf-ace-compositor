@@ -356,11 +356,13 @@ impl PresentationMeasurementCollector {
         let output_generation = output.map(|identity| identity.generation);
         let key = (crtc_id, output_generation, frame_sequence);
         let duplicate =
-            if let Some((prior_seconds, prior_subsecond)) = capture.seen_frames.get(&key) {
+            if let Some((prior_seconds, prior_subsecond)) =
+                capture.seen_frames.get(&key).copied()
+            {
                 capture.duplicate_presentation_count =
                     capture.duplicate_presentation_count.saturating_add(1);
-                if *prior_seconds != timestamp_seconds
-                    || *prior_subsecond != timestamp_subsecond_microseconds
+                if prior_seconds != timestamp_seconds
+                    || prior_subsecond != timestamp_subsecond_microseconds
                 {
                     capture.invalidate("duplicate_frame_timestamp_conflict");
                 }
@@ -761,8 +763,8 @@ mod tests {
     #[test]
     fn refuses_missing_boot_or_unavailable_monotonic_clock_capability() {
         let no_boot = PresentationMeasurementCollector::new(None);
-        let output = output(1, Some(1));
-        start(&no_boot, &output);
+        let boot_output = output(1, Some(1));
+        start(&no_boot, &boot_output);
         assert!(
             no_boot
                 .snapshot()
