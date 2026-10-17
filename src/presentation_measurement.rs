@@ -773,8 +773,8 @@ mod tests {
         );
 
         let no_clock = collector();
-        let output = output(1, Some(0));
-        start(&no_clock, &output);
+        let no_clock_output = output(1, Some(0));
+        start(&no_clock, &no_clock_output);
         let snapshot = no_clock.snapshot();
         assert!(!snapshot.clock_alignment_verified);
         assert!(
