@@ -832,6 +832,13 @@ fn sensitive_value_replacement(bytes: &[u8], start: usize, key: &str) -> (usize,
     if start >= bytes.len() {
         return (start, "[REDACTED]".to_string());
     }
+    const REDACTION_MARKER: &[u8] = b"[REDACTED]";
+    if bytes[start..].starts_with(REDACTION_MARKER) {
+        return (
+            start + REDACTION_MARKER.len(),
+            "[REDACTED]".to_string(),
+        );
+    }
     if bytes[start] == b'\'' || bytes[start] == b'"' {
         let quote = bytes[start];
         let mut end = start + 1;
@@ -1092,6 +1099,50 @@ mod tests {
             &["opaque-value".to_string()],
         );
         assert_eq!(safe, "application reported [REDACTED] in diagnostics");
+    }
+
+    #[test]
+    fn stream_sanitizer_emits_one_marker_for_api_key_and_launch_token() {
+        let api_key = "synthetic-api-key-f1";
+        let launch_token = "synthetic-launch-token-f1";
+        let secrets = sensitive_environment_values(&[
+            EnvironmentEntry {
+                key: b"SERVICE_API_KEY".to_vec(),
+                value: api_key.as_bytes().to_vec(),
+            },
+            EnvironmentEntry {
+                key: b"SURF_ACE_COMPOSITOR_LAUNCH_TOKEN".to_vec(),
+                value: launch_token.as_bytes().to_vec(),
+            },
+        ]);
+        let input = format!("api_key={api_key}\nlaunch_token={launch_token}\n");
+        let (failure_tx, failure_rx) = mpsc::channel();
+        let failed = AtomicBool::new(false);
+        let mut output = Vec::new();
+
+        pump_stream(
+            Cursor::new(input.into_bytes()),
+            &mut output,
+            "surface0-redaction-test.service",
+            StreamKind::Stdout,
+            &secrets,
+            &failure_tx,
+            &failed,
+        );
+
+        let output = String::from_utf8(output).expect("sanitized output is utf-8");
+        assert_eq!(
+            output,
+            concat!(
+                "unit=surface0-redaction-test.service stream=stdout api_key=[REDACTED]\n",
+                "unit=surface0-redaction-test.service stream=stdout launch_token=[REDACTED]\n",
+            )
+        );
+        assert!(!output.contains(api_key));
+        assert!(!output.contains(launch_token));
+        assert!(!output.contains("[REDACTED]]"));
+        assert!(!failed.load(Ordering::Acquire));
+        assert!(failure_rx.try_recv().is_err());
     }
 
     #[test]
