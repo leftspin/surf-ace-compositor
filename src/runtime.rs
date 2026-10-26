@@ -12112,6 +12112,7 @@ mod tests {
         render_output_size_before_transform, scene_texture_transform, screen_capture_src_flipped,
         render_elements_to_texture,
         same_surface,
+        surface_id,
         composite_scene_texture_to_physical_scanout,
         select_atomic_plane_zpos_values, select_preferred_scanout_format, select_primary_path,
         remap_damage_to_materialized_destination, source_rect_from_bbox_and_geometry,
