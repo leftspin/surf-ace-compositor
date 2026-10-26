@@ -655,13 +655,15 @@ fn run_server(
                 std::process::exit(2);
             }
         };
-    let main_app_launch_intent =
+    let (main_app_launch_intent, main_app_launch_error) =
         match resolve_main_app_launch_intent(main_app_launch_intent_json, launch) {
-            Ok(intent) => intent,
-            Err(err) => {
-                eprintln!("invalid main app launch intent: {err}");
-                std::process::exit(2);
-            }
+            Ok(intent) => (intent, None),
+            Err(err) => (
+                None,
+                Some(format!(
+                    "invalid main app launch intent: {err}; continuing without a main app"
+                )),
+            ),
         };
     let (sun_schedule_profile, sun_schedule_discovery_error) =
         match discover_host_sun_schedule_profile(sun_schedule_node) {
@@ -695,10 +697,16 @@ fn run_server(
         state.set_shell_overlay_toggle_shortcut(shell_overlay_toggle_shortcut.display_string());
         state.set_overlay_region_debug_borders(overlay_region_debug_borders);
         state.configure_shell_overlay_process(resolve_default_shell_overlay_process());
+        if let Some(error) = main_app_launch_error {
+            eprintln!("{error}");
+            state.record_runtime_diagnostic(error);
+        }
         if let Some(intent) = main_app_launch_intent {
             if let Err(err) = state.select_main_app_launch_intent(intent) {
-                eprintln!("invalid main app launch intent: {err}");
-                std::process::exit(2);
+                let diagnostic =
+                    format!("invalid main app launch intent: {err}; continuing without a main app");
+                eprintln!("{diagnostic}");
+                state.record_runtime_diagnostic(diagnostic);
             }
         }
         if let Some(profile) = &sun_schedule_profile {

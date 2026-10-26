@@ -2213,6 +2213,116 @@ struct OutputClaimCandidate {
     plan: OutputClaimPlan,
 }
 
+struct OutputCandidateSelection {
+    index: Option<usize>,
+    device_override_applied: bool,
+    output_override_applied: bool,
+    warnings: Vec<String>,
+}
+
+fn select_output_candidate_index(
+    candidates: &[(PathBuf, String)],
+    forced_device_path: Option<&Path>,
+    forced_output_name: Option<&str>,
+    last_good_identity: Option<&OutputIdentity>,
+    recovering: bool,
+) -> OutputCandidateSelection {
+    let mut warnings = Vec::new();
+
+    let missing_device = forced_device_path.is_some_and(|forced_path| {
+        !candidates
+            .iter()
+            .any(|(device_path, _)| device_path == forced_path)
+    });
+    let missing_output = forced_output_name.is_some_and(|forced_name| {
+        let forced_device_is_available = forced_device_path.is_none_or(|forced_path| {
+            candidates
+                .iter()
+                .any(|(device_path, _)| device_path == forced_path)
+        });
+        forced_device_is_available
+            && !candidates.iter().any(|(device_path, output_name)| {
+                forced_device_path.is_none_or(|forced_path| device_path == forced_path)
+                    && output_name == forced_name
+            })
+    });
+
+    if missing_device {
+        warnings.push(format!(
+            "forced device override {} is unavailable; using automatic output selection",
+            forced_device_path
+                .expect("missing device requires an override")
+                .display()
+        ));
+    }
+    if missing_output {
+        let scope = forced_device_path
+            .map(|path| format!(" on {}", path.display()))
+            .unwrap_or_default();
+        warnings.push(format!(
+            "forced connector override {}{} is unavailable; using automatic output selection",
+            forced_output_name.expect("missing output requires an override"),
+            scope
+        ));
+    }
+
+    let override_is_missing = missing_device || missing_output;
+    let selected_by_override =
+        if override_is_missing || (forced_device_path.is_none() && forced_output_name.is_none()) {
+            None
+        } else {
+            candidates.iter().position(|(device_path, output_name)| {
+                forced_device_path.is_none_or(|forced_path| device_path == forced_path)
+                    && forced_output_name.is_none_or(|forced_name| output_name == forced_name)
+            })
+        };
+    if let Some(index) = selected_by_override {
+        return OutputCandidateSelection {
+            index: Some(index),
+            device_override_applied: forced_device_path.is_some(),
+            output_override_applied: forced_output_name.is_some(),
+            warnings,
+        };
+    }
+
+    if recovering {
+        if let Some(last_good) = last_good_identity {
+            if let Some(index) = candidates.iter().position(|(device_path, output_name)| {
+                device_path == &last_good.device_path && output_name == &last_good.connector_name
+            }) {
+                return OutputCandidateSelection {
+                    index: Some(index),
+                    device_override_applied: false,
+                    output_override_applied: false,
+                    warnings,
+                };
+            }
+            if candidates.len() > 1 {
+                warnings.push(format!(
+                    "previous output {}:{} disappeared; using the initial automatic output choice",
+                    last_good.device_path.display(),
+                    last_good.connector_name
+                ));
+            }
+        }
+    }
+
+    OutputCandidateSelection {
+        index: (!candidates.is_empty()).then_some(0),
+        device_override_applied: false,
+        output_override_applied: false,
+        warnings,
+    }
+}
+
+fn format_selection_result_with_warnings(result: String, warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        result
+    } else {
+        format!("{result}; warning: {}", warnings.join("; warning: "))
+    }
+}
+
 #[derive(Clone)]
 #[allow(dead_code)]
 struct AtomicClaimPlan {
@@ -2666,13 +2776,7 @@ impl HostBackendState {
             let Some(opened) = self.opened_devices.get(&device_id) else {
                 continue;
             };
-            if forced_drm_path
-                .as_ref()
-                .is_some_and(|forced_path| forced_path != &opened.path)
-            {
-                continue;
-            }
-            match build_output_claim_plans(opened, forced_output_name.as_deref()) {
+            match build_output_claim_plans(opened, None) {
                 Ok(plans) => {
                     for plan in plans {
                         candidates.push(OutputClaimCandidate {
@@ -2692,73 +2796,56 @@ impl HostBackendState {
             }
         }
 
-        if let Some(forced_path) = forced_drm_path.as_ref() {
-            if candidates.is_empty() {
-                self.device_selection_state = RuntimeHostSelectionState::ForcedFailed;
-                let error = RuntimeError::HostOutputClaim {
-                    path: forced_path.display().to_string(),
-                    error: "forced device override rejected: no connected output route".to_string(),
-                };
-                self.last_selection_result = Some(format!(
-                    "forced device override {} rejected: no connected output route",
-                    forced_path.display()
-                ));
-                return Err(error);
-            }
-        }
-
-        if let Some(forced_output) = forced_output_name.as_ref() {
-            candidates.retain(|candidate| candidate.plan.connector_name == *forced_output);
-            if candidates.is_empty() {
-                self.output_selection_state = RuntimeHostSelectionState::ForcedFailed;
-                let error = RuntimeError::HostOutputClaim {
-                    path: forced_drm_path
-                        .as_ref()
-                        .map(|path| path.display().to_string())
-                        .or_else(|| self.primary_opened_path())
-                        .unwrap_or_else(|| "<unknown-device>".to_string()),
-                    error: format!(
-                        "forced output override {} rejected: connector not present",
-                        forced_output
-                    ),
-                };
-                self.last_selection_result = Some(format!(
-                    "forced output override {} rejected: connector not present",
-                    forced_output
-                ));
-                return Err(error);
-            }
-        }
-
-        let chosen = if let Some(last_good) = self.last_good_output_identity.as_ref() {
-            if let Some(index) = candidates.iter().position(|candidate| {
-                candidate.device_path == last_good.device_path
-                    && candidate.plan.connector_name == last_good.connector_name
-            }) {
-                candidates.remove(index)
-            } else if candidates.len() == 1 {
-                candidates.remove(0)
-            } else {
-                let error = RuntimeError::HostOutputClaim {
-                    path: last_good.device_path.display().to_string(),
-                    error: "previous output disappeared and no single safe replacement was found"
-                        .to_string(),
-                };
-                self.last_selection_result = Some(
-                    "recovery required: previous output disappeared and no single safe replacement was found"
-                        .to_string(),
-                );
-                return Err(error);
-            }
+        let candidate_identities = candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.device_path.clone(),
+                    candidate.plan.connector_name.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let selection = select_output_candidate_index(
+            &candidate_identities,
+            forced_drm_path.as_deref(),
+            forced_output_name.as_deref(),
+            self.last_good_output_identity.as_ref(),
+            recovering,
+        );
+        self.device_selection_state = if selection.device_override_applied {
+            RuntimeHostSelectionState::Forced
         } else {
-            let Some(first) = candidates.into_iter().next() else {
-                return match last_error {
-                    Some(err) => Err(err),
-                    None => Err(RuntimeError::HostNoConnectedOutputRoute),
-                };
-            };
-            first
+            RuntimeHostSelectionState::Automatic
         };
+        self.output_selection_state = if selection.output_override_applied {
+            RuntimeHostSelectionState::Forced
+        } else {
+            RuntimeHostSelectionState::Automatic
+        };
+        for warning in &selection.warnings {
+            eprintln!("host output selection warning: {warning}");
+        }
+        if !selection.warnings.is_empty() {
+            self.last_selection_result = Some(format_selection_result_with_warnings(
+                "output selection is falling back to its initial automatic choice".to_string(),
+                &selection.warnings,
+            ));
+        }
+        let Some(chosen_index) = selection.index else {
+            let detail = last_error
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "no connected output route was found".to_string());
+            self.last_selection_result = Some(format_selection_result_with_warnings(
+                format!("automatic output selection found no usable route: {detail}"),
+                &selection.warnings,
+            ));
+            return match last_error {
+                Some(err) => Err(err),
+                None => Err(RuntimeError::HostNoConnectedOutputRoute),
+            };
+        };
+        let chosen = candidates.remove(chosen_index);
 
         if defer_activation {
             self.drain_retired_pipeline_before_reclaim()?;
@@ -2835,12 +2922,21 @@ impl HostBackendState {
                     measurement_identity: measurement_identity.clone(),
                 };
                 self.last_good_output_identity = Some(claimed.identity.clone());
-                self.last_selection_result = Some(describe_output_selection_result(
-                    recovering,
-                    previous_identity.as_ref(),
-                    &claimed.identity,
-                    forced_drm_path.as_deref(),
-                    forced_output_name.as_deref(),
+                self.last_selection_result = Some(format_selection_result_with_warnings(
+                    describe_output_selection_result(
+                        recovering,
+                        previous_identity.as_ref(),
+                        &claimed.identity,
+                        selection
+                            .device_override_applied
+                            .then_some(forced_drm_path.as_deref())
+                            .flatten(),
+                        selection
+                            .output_override_applied
+                            .then_some(forced_output_name.as_deref())
+                            .flatten(),
+                    ),
+                    &selection.warnings,
                 ));
                 if defer_activation {
                     self.prepared_reclaim_output = Some(claimed_output.clone());
@@ -2857,10 +2953,13 @@ impl HostBackendState {
                     "host backend failed to claim output ownership on {}: {err}",
                     opened.path.display()
                 );
-                self.last_selection_result = Some(format!(
-                    "failed to claim output on {}:{}: {err}",
-                    opened.path.display(),
-                    chosen.plan.connector_name
+                self.last_selection_result = Some(format_selection_result_with_warnings(
+                    format!(
+                        "failed to claim output on {}:{}: {err}",
+                        opened.path.display(),
+                        chosen.plan.connector_name
+                    ),
+                    &selection.warnings,
                 ));
                 Err(err)
             }
@@ -6261,6 +6360,7 @@ struct RuntimeWaylandState {
     native_pane_focused_surfaces: HashMap<PaneId, String>,
     native_pane_focus_history: HashMap<PaneId, Vec<String>>,
     pending_toplevels: Vec<ToplevelSurface>,
+    ordinary_toplevels: Vec<ToplevelSurface>,
     popups: Vec<ManagedPopup>,
     pressed_pointer_buttons: HashSet<u32>,
     canceled_pointer_button_releases: HashSet<u32>,
@@ -7763,6 +7863,7 @@ impl RuntimeWaylandState {
             native_pane_focused_surfaces: HashMap::new(),
             native_pane_focus_history: HashMap::new(),
             pending_toplevels: Vec::new(),
+            ordinary_toplevels: Vec::new(),
             popups: Vec::new(),
             pressed_pointer_buttons: HashSet::new(),
             canceled_pointer_button_releases: HashSet::new(),
@@ -8640,6 +8741,9 @@ impl RuntimeWaylandState {
     }
 
     fn assign_toplevel_role(&mut self, surface: ToplevelSurface) {
+        let surface_id = surface_key(surface.wl_surface());
+        self.ordinary_toplevels
+            .retain(|ordinary| surface_key(ordinary.wl_surface()) != surface_id);
         self.enforce_main_app_binding_policy();
         match self.classify_toplevel(&surface) {
             SurfaceClassification::MainApp => self.assign_main_role(surface),
@@ -8655,9 +8759,10 @@ impl RuntimeWaylandState {
     fn assign_main_role(&mut self, surface: ToplevelSurface) {
         if self.main_toplevel.is_none() {
             let Some(client_pid) = self.client_pid_for_toplevel(&surface) else {
-                surface.send_close();
-                let mut state = lock_state(&self.shared_state);
-                state.increment_runtime_denied_toplevel();
+                self.retain_ordinary_toplevel(
+                    surface,
+                    "main-app window could not be bound to a process",
+                );
                 return;
             };
             let evidence = self.main_app_binding_evidence_for_surface(&surface);
@@ -8675,9 +8780,10 @@ impl RuntimeWaylandState {
                 .map(|main| !same_surface(main.wl_surface(), surface.wl_surface()))
                 .unwrap_or(true)
             {
-                surface.send_close();
-                let mut state = lock_state(&self.shared_state);
-                state.increment_runtime_denied_toplevel();
+                self.retain_ordinary_toplevel(
+                    surface,
+                    "additional main-app window observed while a main role is already assigned",
+                );
             }
         }
     }
@@ -8689,9 +8795,10 @@ impl RuntimeWaylandState {
         launch_pid: u32,
     ) {
         let Some(client_pid) = self.client_pid_for_toplevel(&surface) else {
-            surface.send_close();
-            let mut state = lock_state(&self.shared_state);
-            state.increment_runtime_denied_toplevel();
+            self.retain_ordinary_toplevel(
+                surface,
+                "native pane window could not be bound to a process",
+            );
             return;
         };
         if let Some(primary) = self.native_pane_toplevels.get(&pane_id) {
@@ -8725,12 +8832,9 @@ impl RuntimeWaylandState {
                         == crate::model::NativePaneSameLaunchSecondaryToplevels::Accept
             });
             if !identity_matches {
-                surface.send_close();
-                let mut state = lock_state(&self.shared_state);
-                state.increment_runtime_denied_toplevel();
-                state.runtime_mark_native_pane_window_group_denied(
-                    &pane_id,
-                    "secondary_toplevel_launch_identity_rejected",
+                self.retain_ordinary_toplevel(
+                    surface,
+                    "native pane window did not match an accepted secondary-window group",
                 );
                 return;
             }
@@ -8808,21 +8912,24 @@ impl RuntimeWaylandState {
 
     fn assign_overlay_role_or_queue(&mut self, surface: ToplevelSurface) {
         let Some(expected_pid) = self.expected_overlay_client_pid() else {
-            surface.send_close();
-            let mut state = lock_state(&self.shared_state);
-            state.increment_runtime_denied_toplevel();
+            self.retain_ordinary_toplevel(
+                surface,
+                "overlay window arrived while no overlay process is expected",
+            );
             return;
         };
         let Some(client_pid) = self.client_pid_for_toplevel(&surface) else {
-            surface.send_close();
-            let mut state = lock_state(&self.shared_state);
-            state.increment_runtime_denied_toplevel();
+            self.retain_ordinary_toplevel(
+                surface,
+                "overlay window could not be bound to a process",
+            );
             return;
         };
         if client_pid != expected_pid {
-            surface.send_close();
-            let mut state = lock_state(&self.shared_state);
-            state.increment_runtime_denied_toplevel();
+            self.retain_ordinary_toplevel(
+                surface,
+                "overlay window belongs to a different process than the active overlay",
+            );
             return;
         }
         if self.overlay_toplevel.is_none() {
@@ -8832,10 +8939,30 @@ impl RuntimeWaylandState {
             self.sync_runtime_status_with_roles();
             self.apply_focus_route();
         } else {
-            surface.send_close();
-            let mut state = lock_state(&self.shared_state);
-            state.increment_runtime_denied_toplevel();
+            self.retain_ordinary_toplevel(
+                surface,
+                "overlay window arrived while an overlay role is already assigned",
+            );
         }
+    }
+
+    fn retain_ordinary_toplevel(&mut self, surface: ToplevelSurface, reason: &str) {
+        let id = surface_key(surface.wl_surface());
+        if self
+            .ordinary_toplevels
+            .iter()
+            .any(|ordinary| surface_key(ordinary.wl_surface()) == id)
+        {
+            return;
+        }
+        self.pending_toplevels
+            .retain(|pending| surface_key(pending.wl_surface()) != id);
+        self.ordinary_toplevels.push(surface.clone());
+        self.configure_toplevel_with_current_role(&surface);
+
+        let diagnostic = format!("{reason}; retained as an ordinary window");
+        eprintln!("surface admission warning: {diagnostic}");
+        lock_state(&self.shared_state).record_runtime_diagnostic(diagnostic);
     }
 
     fn promote_pending_toplevels(&mut self) {
@@ -9358,6 +9485,15 @@ impl RuntimeWaylandState {
     fn handle_surface_identity_update(&mut self, surface: &ToplevelSurface) {
         let updated_id = surface_key(surface.wl_surface());
         if let Some(idx) = self
+            .ordinary_toplevels
+            .iter()
+            .position(|ordinary| surface_key(ordinary.wl_surface()) == updated_id)
+        {
+            self.ordinary_toplevels.remove(idx);
+            self.assign_toplevel_role(surface.clone());
+            return;
+        }
+        if let Some(idx) = self
             .pending_toplevels
             .iter()
             .position(|pending| surface_key(pending.wl_surface()) == updated_id)
@@ -9548,6 +9684,9 @@ impl RuntimeWaylandState {
         for accessory in &self.native_pane_accessories {
             self.configure_native_pane_accessory(&accessory.surface, &accessory.pane_id);
         }
+        for ordinary in &self.ordinary_toplevels {
+            self.configure_toplevel_with_current_role(ordinary);
+        }
     }
 
     fn sync_output_rotation_reconfigure_if_needed(&mut self) {
@@ -9601,6 +9740,7 @@ impl RuntimeWaylandState {
 
     fn prune_dead_surfaces(&mut self) {
         self.pending_toplevels.retain(ToplevelSurface::alive);
+        self.ordinary_toplevels.retain(ToplevelSurface::alive);
         self.enforce_main_app_binding_policy();
         self.enforce_overlay_binding_policy();
         if self
@@ -10955,6 +11095,8 @@ impl XdgShellHandler for RuntimeWaylandState {
         self.drop_surface_buffer(surface.wl_surface());
         self.pending_toplevels
             .retain(|pending| surface_key(pending.wl_surface()) != destroyed_id);
+        self.ordinary_toplevels
+            .retain(|ordinary| surface_key(ordinary.wl_surface()) != destroyed_id);
         if self
             .main_toplevel
             .as_ref()
@@ -11976,6 +12118,7 @@ mod tests {
         stage_runtime_root_geometry_consumers,
         transform_from_rotation, embedded_toplevel_decoration_mode,
         activate_root_geometry_stage, install_root_geometry_stage, lock_state, ButtonState,
+        select_output_candidate_index, ToplevelSurface,
     };
     use crate::output_rotation_model::OutputRotationModel;
     use crate::model::{
@@ -12248,6 +12391,7 @@ mod tests {
         configured: bool,
         configure_count: u32,
         toplevel_size: Option<(i32, i32)>,
+        close_received: bool,
     }
 
     impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListContents>
@@ -12286,8 +12430,12 @@ mod tests {
             _conn: &Connection,
             _qh: &QueueHandle<Self>,
         ) {
-            if let xdg_toplevel::Event::Configure { width, height, .. } = event {
-                state.toplevel_size = Some((width, height));
+            match event {
+                xdg_toplevel::Event::Configure { width, height, .. } => {
+                    state.toplevel_size = Some((width, height));
+                }
+                xdg_toplevel::Event::Close => state.close_received = true,
+                _ => {}
             }
         }
     }
@@ -12789,6 +12937,139 @@ mod tests {
             }
         });
         (ready_rx, command_tx, client_thread)
+    }
+
+    enum AdmissionToplevelCommand {
+        CheckClose(mpsc::Sender<bool>),
+        Finish,
+    }
+
+    fn spawn_admission_toplevel(
+        socket: UnixStream,
+    ) -> (
+        mpsc::Receiver<u32>,
+        mpsc::Sender<AdmissionToplevelCommand>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::channel();
+        let client_thread = std::thread::spawn(move || {
+            let connection = Connection::from_socket(socket).expect("client socket must connect");
+            let (globals, mut queue) = registry_queue_init::<SurfaceTreeClient>(&connection)
+                .expect("admission fixture globals must roundtrip");
+            let qh = queue.handle();
+            let compositor = globals
+                .bind::<wl_compositor::WlCompositor, _, _>(&qh, 1..=6, ())
+                .expect("wl_compositor must exist");
+            let wm_base = globals
+                .bind::<xdg_wm_base::XdgWmBase, _, _>(&qh, 1..=6, ())
+                .expect("xdg_wm_base must exist");
+            let surface = compositor.create_surface(&qh, ());
+            let surface_id = surface.id().protocol_id();
+            let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+            let _toplevel = xdg_surface.get_toplevel(&qh, ());
+            surface.commit();
+            connection
+                .flush()
+                .expect("admission fixture toplevel must flush");
+            ready_tx
+                .send(surface_id)
+                .expect("test must receive admission surface id");
+
+            let mut state = SurfaceTreeClient::default();
+            while let Ok(command) = command_rx.recv() {
+                match command {
+                    AdmissionToplevelCommand::CheckClose(result) => {
+                        queue
+                            .roundtrip(&mut state)
+                            .expect("admission fixture must receive server events");
+                        result
+                            .send(state.close_received)
+                            .expect("test must receive close-event result");
+                    }
+                    AdmissionToplevelCommand::Finish => break,
+                }
+            }
+        });
+        (ready_rx, command_tx, client_thread)
+    }
+
+    fn take_admission_toplevel(
+        display: &mut Display<RuntimeWaylandState>,
+        wayland_state: &mut RuntimeWaylandState,
+    ) -> (
+        ToplevelSurface,
+        mpsc::Sender<AdmissionToplevelCommand>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (server_socket, client_socket) = UnixStream::pair().expect("socket pair must create");
+        let _server_client = display
+            .handle()
+            .insert_client(
+                server_socket,
+                Arc::new(super::RuntimeClientState::default()),
+            )
+            .expect("test client must insert");
+        let (ready, commands, thread) = spawn_admission_toplevel(client_socket);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut client_surface_id = None;
+        loop {
+            display
+                .dispatch_clients(wayland_state)
+                .expect("admission requests must dispatch");
+            display
+                .flush_clients()
+                .expect("admission replies must flush");
+            if client_surface_id.is_none() {
+                client_surface_id = ready.try_recv().ok();
+            }
+            if let Some(client_surface_id_value) = client_surface_id
+                && let Some(index) = wayland_state
+                    .pending_toplevels
+                    .iter()
+                    .position(|surface| surface_id(surface.wl_surface()) == client_surface_id_value)
+            {
+                return (
+                    wayland_state.pending_toplevels.remove(index),
+                    commands,
+                    thread,
+                );
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "admission client must create a pending toplevel"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn assert_admission_client_not_closed(
+        display: &mut Display<RuntimeWaylandState>,
+        wayland_state: &mut RuntimeWaylandState,
+        commands: &mpsc::Sender<AdmissionToplevelCommand>,
+    ) {
+        let (result_tx, result_rx) = mpsc::channel();
+        commands
+            .send(AdmissionToplevelCommand::CheckClose(result_tx))
+            .expect("admission client must accept close probe");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            display
+                .dispatch_clients(wayland_state)
+                .expect("close probe requests must dispatch");
+            display
+                .flush_clients()
+                .expect("close probe replies must flush");
+            if let Ok(close_received) = result_rx.try_recv() {
+                assert!(!close_received, "window admission must not send close");
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "admission client must report close probe"
+            );
+            std::thread::yield_now();
+        }
     }
 
     #[derive(Default)]
@@ -16663,6 +16944,223 @@ mod tests {
         ];
         let selected = select_primary_path(paths.iter(), Some(Path::new("/dev/dri/card0")));
         assert_eq!(selected.as_deref(), Some("/dev/dri/card2"));
+    }
+
+    #[test]
+    fn missing_forced_output_overrides_fall_back_to_initial_selection_with_warnings() {
+        let candidates = vec![
+            (PathBuf::from("/dev/dri/card0"), "DP-1".to_string()),
+            (PathBuf::from("/dev/dri/card0"), "HDMI-A-1".to_string()),
+            (PathBuf::from("/dev/dri/card1"), "DP-2".to_string()),
+        ];
+
+        let missing_device = select_output_candidate_index(
+            &candidates,
+            Some(Path::new("/dev/dri/card8")),
+            None,
+            None,
+            false,
+        );
+        assert_eq!(missing_device.index, Some(0));
+        assert!(!missing_device.device_override_applied);
+        assert!(missing_device.warnings[0].contains("forced device override"));
+        assert!(
+            super::format_selection_result_with_warnings(
+                "automatic output selection".to_string(),
+                &missing_device.warnings
+            )
+            .contains("forced device override")
+        );
+
+        let missing_connector =
+            select_output_candidate_index(&candidates, None, Some("DP-9"), None, false);
+        assert_eq!(missing_connector.index, Some(0));
+        assert!(!missing_connector.output_override_applied);
+        assert!(missing_connector.warnings[0].contains("forced connector override"));
+
+        let missing_replacement = select_output_candidate_index(
+            &candidates,
+            None,
+            None,
+            Some(&OutputIdentity {
+                device_path: PathBuf::from("/dev/dri/card7"),
+                connector_name: "DP-7".to_string(),
+                connector_id: 7,
+            }),
+            true,
+        );
+        assert_eq!(missing_replacement.index, Some(0));
+        assert!(missing_replacement.warnings[0].contains("previous output"));
+        assert!(missing_replacement.warnings[0].contains("initial automatic output choice"));
+
+        let unique_replacement = select_output_candidate_index(
+            &candidates[..1],
+            None,
+            None,
+            Some(&OutputIdentity {
+                device_path: PathBuf::from("/dev/dri/card7"),
+                connector_name: "DP-7".to_string(),
+                connector_id: 7,
+            }),
+            true,
+        );
+        assert_eq!(unique_replacement.index, Some(0));
+        assert!(unique_replacement.warnings.is_empty());
+    }
+
+    #[test]
+    fn unmatched_toplevels_remain_open_as_ordinary_windows() {
+        let shared_state = Arc::new(Mutex::new(CompositorState::new(
+            true,
+            Box::new(NoopProcessController::default()),
+        )));
+        {
+            let mut state = lock_state(&shared_state);
+            state.configure_shell_overlay_process(Some(ProcessSpec {
+                command: "overlay-fixture".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                env: Default::default(),
+            }));
+            state
+                .toggle_shell_overlay()
+                .expect("overlay fixture process must launch");
+            assert!(
+                state
+                    .runtime_expected_overlay_binding()
+                    .is_some_and(|(_, pid)| pid != std::process::id())
+            );
+        }
+
+        let mut display: Display<RuntimeWaylandState> =
+            Display::new().expect("test wayland display should initialize");
+        let mut wayland_state = RuntimeWaylandState::new(display.handle(), shared_state.clone())
+            .expect("Wayland runtime state must initialize");
+        let mut clients = Vec::new();
+
+        let (first_main, commands, thread) =
+            take_admission_toplevel(&mut display, &mut wayland_state);
+        let first_main_id = surface_id(first_main.wl_surface());
+        wayland_state.assign_main_role(first_main);
+        display
+            .flush_clients()
+            .expect("main role configure must flush");
+        assert_admission_client_not_closed(&mut display, &mut wayland_state, &commands);
+        clients.push((commands, thread));
+
+        let (second_main, commands, thread) =
+            take_admission_toplevel(&mut display, &mut wayland_state);
+        let second_main_id = surface_id(second_main.wl_surface());
+        wayland_state.assign_main_role(second_main);
+        display
+            .flush_clients()
+            .expect("ordinary main-window configure must flush");
+        assert_eq!(
+            wayland_state
+                .main_toplevel
+                .as_ref()
+                .map(|surface| surface_id(surface.wl_surface())),
+            Some(first_main_id)
+        );
+        assert!(
+            wayland_state
+                .ordinary_toplevels
+                .iter()
+                .any(|surface| { surface_id(surface.wl_surface()) == second_main_id })
+        );
+        assert!(
+            lock_state(&shared_state)
+                .status_snapshot()
+                .runtime
+                .last_diagnostic
+                .as_deref()
+                .is_some_and(|diagnostic| diagnostic.contains("additional main-app window"))
+        );
+        assert_admission_client_not_closed(&mut display, &mut wayland_state, &commands);
+        clients.push((commands, thread));
+
+        let (foreign_overlay, commands, thread) =
+            take_admission_toplevel(&mut display, &mut wayland_state);
+        let foreign_overlay_id = surface_id(foreign_overlay.wl_surface());
+        wayland_state.assign_overlay_role_or_queue(foreign_overlay);
+        display
+            .flush_clients()
+            .expect("ordinary overlay configure must flush");
+        assert!(wayland_state.overlay_toplevel.is_none());
+        assert!(
+            wayland_state
+                .ordinary_toplevels
+                .iter()
+                .any(|surface| { surface_id(surface.wl_surface()) == foreign_overlay_id })
+        );
+        assert!(
+            lock_state(&shared_state)
+                .status_snapshot()
+                .runtime
+                .last_diagnostic
+                .as_deref()
+                .is_some_and(
+                    |diagnostic| diagnostic.contains("different process than the active overlay")
+                )
+        );
+        assert_admission_client_not_closed(&mut display, &mut wayland_state, &commands);
+        clients.push((commands, thread));
+
+        let pane_id = PaneId::new("ordinary-window-fixture");
+        let (native_primary, commands, thread) =
+            take_admission_toplevel(&mut display, &mut wayland_state);
+        let native_primary_id = surface_id(native_primary.wl_surface());
+        wayland_state.assign_native_pane_role(native_primary, pane_id.clone(), std::process::id());
+        display
+            .flush_clients()
+            .expect("native pane role configure must flush");
+        assert_admission_client_not_closed(&mut display, &mut wayland_state, &commands);
+        clients.push((commands, thread));
+
+        let (unmatched_native, commands, thread) =
+            take_admission_toplevel(&mut display, &mut wayland_state);
+        let unmatched_native_id = surface_id(unmatched_native.wl_surface());
+        wayland_state.assign_native_pane_role(
+            unmatched_native,
+            pane_id.clone(),
+            std::process::id(),
+        );
+        display
+            .flush_clients()
+            .expect("ordinary native window configure must flush");
+        assert_eq!(
+            wayland_state
+                .native_pane_toplevels
+                .get(&pane_id)
+                .map(|surface| surface_id(surface.wl_surface())),
+            Some(native_primary_id)
+        );
+        assert!(
+            wayland_state
+                .ordinary_toplevels
+                .iter()
+                .any(|surface| { surface_id(surface.wl_surface()) == unmatched_native_id })
+        );
+        assert!(
+            lock_state(&shared_state)
+                .status_snapshot()
+                .runtime
+                .last_diagnostic
+                .as_deref()
+                .is_some_and(|diagnostic| diagnostic
+                    .contains("did not match an accepted secondary-window group"))
+        );
+        assert_admission_client_not_closed(&mut display, &mut wayland_state, &commands);
+        clients.push((commands, thread));
+
+        for (commands, _) in &clients {
+            commands
+                .send(AdmissionToplevelCommand::Finish)
+                .expect("admission client must finish");
+        }
+        for (_, thread) in clients {
+            thread.join().expect("admission client thread must finish");
+        }
     }
 
     #[test]

@@ -93,6 +93,38 @@ fn spawn_server_with_args(
         .expect("server should start")
 }
 
+fn spawn_server_with_args_and_stderr(
+    socket_path: &Path,
+    runtime: &str,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+    stderr_path: &Path,
+) -> Child {
+    let bin = env!("CARGO_BIN_EXE_surf-ace-compositor");
+    let mut command = Command::new(bin);
+    command.args([
+        "serve",
+        "--runtime",
+        runtime,
+        "--socket-path",
+        socket_path
+            .to_str()
+            .expect("socket path should be representable"),
+    ]);
+    command.args(extra_args);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            fs::File::create(stderr_path).expect("stderr capture file should be created"),
+        ))
+        .spawn()
+        .expect("server should start")
+}
+
 fn spawn_server(socket_path: &Path, runtime: &str, extra_env: &[(&str, &str)]) -> Child {
     spawn_server_with_args(socket_path, runtime, &[], extra_env)
 }
@@ -162,6 +194,83 @@ fn host_start_with_launch_intent_and_overlay_debug_keeps_control_socket_reachabl
     let _ = child.kill();
     let _ = child.wait();
     let _ = fs::remove_file(&socket_path);
+}
+
+#[test]
+fn invalid_or_empty_main_app_configuration_keeps_host_compositor_running() {
+    let unique_suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be monotonic enough for test")
+        .as_nanos();
+    let cases = [
+        ("empty", "", "launch intent JSON must not be empty"),
+        (
+            "invalid",
+            r#"{"process":{"command":" ","args":[],"env":{}},"binding":{"kind":"app_id","app_id":"surf-ace-main-app"}}"#,
+            "main app process command must not be empty",
+        ),
+    ];
+
+    for (case, launch_intent, expected_error) in cases {
+        let socket_path = PathBuf::from(format!(
+            "/tmp/surf-ace-invalid-main-app-{}-{}-{}.sock",
+            std::process::id(),
+            unique_suffix,
+            case
+        ));
+        let stderr_path = PathBuf::from(format!(
+            "/tmp/surf-ace-invalid-main-app-{}-{}-{}.stderr",
+            std::process::id(),
+            unique_suffix,
+            case
+        ));
+        let _ = fs::remove_file(&socket_path);
+        let _ = fs::remove_file(&stderr_path);
+
+        let mut child = spawn_server_with_args_and_stderr(
+            &socket_path,
+            "host",
+            &["--main-app-launch-intent-json", launch_intent],
+            &[
+                (
+                    "SURF_ACE_HOST_RUNTIME_TEST_SCRIPTED_FAILURE_PHASE",
+                    "running",
+                ),
+                ("SURF_ACE_HOST_RUNTIME_TEST_SCRIPTED_HOLD_MS", "1000"),
+            ],
+            &stderr_path,
+        );
+        wait_for_socket(&socket_path);
+
+        let status = wait_for_status_where(&socket_path, "running host runtime", |status| {
+            status["status"]["runtime"]["phase"] == Value::String("running".to_string())
+        });
+        assert_eq!(
+            status["status"]["runtime"]["main_app_launch_intent"],
+            Value::Null
+        );
+        assert!(
+            status["status"]["runtime"]["last_diagnostic"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(expected_error)
+        );
+        assert!(
+            child
+                .try_wait()
+                .expect("child wait should succeed")
+                .is_none(),
+            "invalid main-app configuration must leave the compositor process running"
+        );
+        let stderr = fs::read_to_string(&stderr_path).expect("stderr should be captured");
+        assert!(stderr.contains(expected_error));
+        assert!(stderr.contains("continuing without a main app"));
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_file(&socket_path);
+        let _ = fs::remove_file(&stderr_path);
+    }
 }
 
 #[test]
