@@ -6361,6 +6361,7 @@ struct RuntimeWaylandState {
     native_pane_focus_history: HashMap<PaneId, Vec<String>>,
     pending_toplevels: Vec<ToplevelSurface>,
     ordinary_toplevels: Vec<ToplevelSurface>,
+    ordinary_keyboard_focus: Option<(WlSurface, Option<RuntimeFocusTarget>)>,
     popups: Vec<ManagedPopup>,
     pressed_pointer_buttons: HashSet<u32>,
     canceled_pointer_button_releases: HashSet<u32>,
@@ -6654,6 +6655,7 @@ fn stage_runtime_root_geometry_consumers(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RenderElementSource {
     MainOverlayRegion,
+    OrdinaryToplevel,
     Main,
     MainPopup,
     NativePane,
@@ -7084,6 +7086,7 @@ impl RenderElementCapture {
         self.sources.extend(std::iter::repeat(source).take(added));
         match source {
             RenderElementSource::MainOverlayRegion => self.counts.main_overlay_regions += added,
+            RenderElementSource::OrdinaryToplevel => self.counts.ordinary_toplevels += added,
             RenderElementSource::Main => self.counts.main += added,
             RenderElementSource::MainPopup => self.counts.main_popups += added,
             RenderElementSource::NativePane => self.counts.native_panes += added,
@@ -7115,6 +7118,7 @@ impl RenderElementCapture {
 #[derive(Default, Debug, Clone, Copy)]
 struct RenderElementCounts {
     main_overlay_regions: usize,
+    ordinary_toplevels: usize,
     main: usize,
     main_popups: usize,
     native_panes: usize,
@@ -7556,6 +7560,9 @@ impl RuntimeWaylandState {
         for (_, native) in native_roots {
             self.collect_accepted_surface_tree(native.wl_surface(), &mut surfaces);
         }
+        for ordinary in &self.ordinary_toplevels {
+            self.collect_accepted_surface_tree(ordinary.wl_surface(), &mut surfaces);
+        }
 
         let popups = self
             .popups
@@ -7864,6 +7871,7 @@ impl RuntimeWaylandState {
             native_pane_focus_history: HashMap::new(),
             pending_toplevels: Vec::new(),
             ordinary_toplevels: Vec::new(),
+            ordinary_keyboard_focus: None,
             popups: Vec::new(),
             pressed_pointer_buttons: HashSet::new(),
             canceled_pointer_button_releases: HashSet::new(),
@@ -8060,6 +8068,17 @@ impl RuntimeWaylandState {
                 },
             );
             let focus_target = surface_under.map(|(surface, _)| surface);
+            self.ordinary_keyboard_focus = focus_target.as_ref().and_then(|surface| {
+                self.ordinary_toplevels
+                    .iter()
+                    .any(|ordinary| same_surface(ordinary.wl_surface(), surface))
+                    .then(|| {
+                        (
+                            surface.clone(),
+                            status.runtime.active_focus_target.clone(),
+                        )
+                    })
+            });
             if let Some(surface) = focus_target.as_ref() {
                 self.note_native_pane_surface_focus(surface, true);
             }
@@ -8242,6 +8261,25 @@ impl RuntimeWaylandState {
             Some(RuntimeFocusTarget::NativePane { pane_id })
                 if !self.native_pane_toplevels.contains_key(pane_id)
         );
+        let keep_ordinary_focus = !shell_overlay_focus_requested
+            && self
+                .ordinary_keyboard_focus
+                .as_ref()
+                .is_some_and(|(surface, requested_at_focus)| {
+                    requested_target.as_ref() == requested_at_focus.as_ref()
+                        && self.ordinary_toplevels.iter().any(|ordinary| {
+                            ordinary.alive() && same_surface(ordinary.wl_surface(), surface)
+                        })
+                });
+        if keep_ordinary_focus {
+            if let (Some(keyboard), Some((surface, _))) =
+                (self.seat.get_keyboard(), self.ordinary_keyboard_focus.as_ref())
+            {
+                keyboard.set_focus(self, Some(surface.clone()), 0.into());
+                return;
+            }
+        }
+        self.ordinary_keyboard_focus = None;
         let resolved = shell_overlay_focus_requested
             .then(|| {
                 self.overlay_toplevel.as_ref().map(|surface| {
@@ -9118,6 +9156,29 @@ impl RuntimeWaylandState {
         self.runtime_output_size().h
     }
 
+    fn ordinary_toplevel_rect(
+        &self,
+        index: usize,
+        surface: &ToplevelSurface,
+    ) -> Rectangle<i32, Logical> {
+        const WINDOW_CASCADE_STEP: i32 = 24;
+
+        let output = self.runtime_output_size();
+        let source = toplevel_surface_source_rect(surface);
+        let width = source.size.w.max(0).min(output.w.max(1));
+        let height = source.size.h.max(0).min(output.h.max(1));
+        let max_x = output.w.max(1) - width;
+        let max_y = output.h.max(1) - height;
+        let offset = i32::try_from(index.saturating_add(1))
+            .unwrap_or(i32::MAX)
+            .saturating_mul(WINDOW_CASCADE_STEP);
+
+        Rectangle::new(
+            (offset.min(max_x), offset.min(max_y)).into(),
+            (width, height).into(),
+        )
+    }
+
     fn map_physical_pointer_point_to_logical(
         &self,
         point: Point<f64, Logical>,
@@ -9323,6 +9384,27 @@ impl RuntimeWaylandState {
                     .map(RoleSurfaceMapping::focus_origin)
                     .unwrap_or_else(|| rect.loc.to_f64());
                 return Some((native.wl_surface().clone(), focus_origin));
+            }
+        }
+        for (index, ordinary) in self.ordinary_toplevels.iter().enumerate().rev() {
+            if !ordinary.alive() {
+                continue;
+            }
+            let rect = self.ordinary_toplevel_rect(index, ordinary);
+            if rect.size.w <= 0 || rect.size.h <= 0 {
+                continue;
+            }
+            let hit = pos.x >= rect.loc.x as f64
+                && pos.x < (rect.loc.x + rect.size.w) as f64
+                && pos.y >= rect.loc.y as f64
+                && pos.y < (rect.loc.y + rect.size.h) as f64;
+            if hit {
+                let focus_origin = RoleSurfaceMapping::new(
+                    toplevel_surface_source_rect(ordinary),
+                    rect,
+                )
+                .focus_origin();
+                return Some((ordinary.wl_surface().clone(), focus_origin));
             }
         }
         self.main_toplevel.as_ref().map(|main| {
@@ -9803,6 +9885,7 @@ impl RuntimeWaylandState {
         let mut main_popup_elements = Vec::new();
         let mut native_pane_elements = Vec::new();
         let mut cropped_native_pane_elements = Vec::new();
+        let mut ordinary_toplevel_elements = Vec::new();
         let mut native_pane_accessory_elements = Vec::new();
         let mut native_pane_popup_elements = Vec::new();
         let mut overlay_elements = Vec::new();
@@ -10082,6 +10165,29 @@ impl RuntimeWaylandState {
             ));
         }
 
+        for (index, ordinary) in self.ordinary_toplevels.iter().enumerate().rev() {
+            if !ordinary.alive() {
+                continue;
+            }
+            let target_rect = self.ordinary_toplevel_rect(index, ordinary);
+            let mapping =
+                RoleSurfaceMapping::new(toplevel_surface_source_rect(ordinary), target_rect);
+            if let Err(err) = import_surface_tree(renderer, ordinary.wl_surface()) {
+                eprintln!(
+                    "host renderer could not import ordinary toplevel surface tree: {err:#?}"
+                );
+                continue;
+            }
+            ordinary_toplevel_elements.extend(render_elements_from_surface_tree(
+                renderer,
+                ordinary.wl_surface(),
+                mapping.render_element_location(),
+                mapping.render_element_scale(),
+                1.0,
+                Kind::Unspecified,
+            ));
+        }
+
         let debug_border_regions = overlay_region_status
             .0
             .then_some(overlay_region_status.1.as_slice());
@@ -10116,6 +10222,10 @@ impl RuntimeWaylandState {
         );
         capture.push(RenderElementSource::NativePane, native_pane_elements);
         capture.push(RenderElementSource::MainPopup, main_popup_elements);
+        capture.push(
+            RenderElementSource::OrdinaryToplevel,
+            ordinary_toplevel_elements,
+        );
         capture.push(RenderElementSource::Main, main_elements);
 
         capture
@@ -12939,6 +13049,99 @@ mod tests {
             }
         });
         (ready_rx, command_tx, client_thread)
+    }
+
+    fn take_renderable_main_or_ordinary_toplevel(
+        display: &mut Display<RuntimeWaylandState>,
+        wayland_state: &mut RuntimeWaylandState,
+        width: i32,
+        height: i32,
+        pattern: RealShmPattern,
+        ordinary: bool,
+    ) -> (
+        WlSurface,
+        mpsc::Sender<RealShmToplevelCommand>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (server_socket, client_socket) = UnixStream::pair().expect("socket pair must create");
+        display
+            .handle()
+            .insert_client(
+                server_socket,
+                Arc::new(super::RuntimeClientState::default()),
+            )
+            .expect("fixture client must insert");
+        let (ready, commands, thread) =
+            spawn_real_shm_toplevel(client_socket, width, height, pattern);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut assigned = false;
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture toplevel must configure and commit its SHM buffer"
+            );
+            display
+                .dispatch_clients(wayland_state)
+                .expect("fixture requests must dispatch");
+            if !assigned && !wayland_state.pending_toplevels.is_empty() {
+                let surface = wayland_state.pending_toplevels.remove(0);
+                if ordinary {
+                    surface.with_pending_state(|pending| {
+                        pending.size = Some((width, height).into());
+                    });
+                }
+                wayland_state.assign_main_role(surface);
+                assigned = true;
+            }
+            display
+                .flush_clients()
+                .expect("fixture configure must flush");
+            if assigned {
+                if let Ok((client_surface_id, configured_size)) = ready.try_recv() {
+                    assert_eq!(configured_size, (width, height));
+                    let surface = if ordinary {
+                        wayland_state
+                            .ordinary_toplevels
+                            .last()
+                            .expect("second main window must be retained as ordinary")
+                    } else {
+                        wayland_state
+                            .main_toplevel
+                            .as_ref()
+                            .expect("first main window must retain the main role")
+                    };
+                    assert_eq!(
+                        surface_id(surface.wl_surface()),
+                        client_surface_id,
+                        "fixture client and server must refer to the same toplevel"
+                    );
+                    let root = surface.wl_surface().clone();
+                    display
+                        .dispatch_clients(wayland_state)
+                        .expect("fixture SHM buffer commit must dispatch");
+                    display
+                        .flush_clients()
+                        .expect("fixture buffer release must flush");
+                    return (root, commands, thread);
+                }
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    fn surfaceless_test_renderer() -> smithay::backend::renderer::gles::GlesRenderer {
+        let display = unsafe {
+            smithay::backend::egl::EGLDisplay::new(
+                smithay::backend::egl::native::EGLSurfacelessDisplay,
+            )
+        }
+        .expect("surfaceless EGL display must initialize for the production renderer path");
+        let context = smithay::backend::egl::EGLContext::new(&display)
+            .expect("surfaceless EGL context must initialize");
+        unsafe {
+            smithay::backend::renderer::gles::GlesRenderer::new(context)
+                .expect("surfaceless GLES renderer must initialize")
+        }
     }
 
     enum AdmissionToplevelCommand {
@@ -17169,6 +17372,201 @@ mod tests {
         for (_, thread) in clients {
             thread.join().expect("admission client thread must finish");
         }
+    }
+
+    #[test]
+    fn ordinary_toplevel_is_rendered_and_receives_pointer_keyboard_input() {
+        let mut initial_state =
+            CompositorState::new(true, Box::new(NoopProcessController::default()));
+        initial_state.mark_runtime_resize(320, 200);
+        let shared_state = Arc::new(Mutex::new(initial_state));
+        let mut display: Display<RuntimeWaylandState> =
+            Display::new().expect("test Wayland display should initialize");
+        let mut wayland_state = RuntimeWaylandState::new(display.handle(), shared_state.clone())
+            .expect("Wayland runtime state must initialize");
+
+        let (main_surface, main_commands, main_thread) =
+            take_renderable_main_or_ordinary_toplevel(
+                &mut display,
+                &mut wayland_state,
+                160,
+                100,
+                RealShmPattern::Solid([0x00, 0xff, 0x00, 0xff]),
+                false,
+            );
+        let (ordinary_surface, ordinary_commands, ordinary_thread) =
+            take_renderable_main_or_ordinary_toplevel(
+                &mut display,
+                &mut wayland_state,
+                100,
+                50,
+                RealShmPattern::Solid([0x00, 0x00, 0xff, 0xff]),
+                true,
+            );
+
+        assert!(
+            wayland_state
+                .main_toplevel
+                .as_ref()
+                .is_some_and(|surface| same_surface(surface.wl_surface(), &main_surface)),
+            "the first window must retain the main role"
+        );
+        assert!(
+            wayland_state.ordinary_toplevels.iter().any(|surface| {
+                same_surface(surface.wl_surface(), &ordinary_surface)
+            }),
+            "the second main window must be retained as ordinary"
+        );
+        assert!(
+            wayland_state
+                .accepted_material_identity()
+                .surfaces
+                .iter()
+                .any(|surface| surface.id == surface_key(&ordinary_surface)),
+            "ordinary surface material must participate in coherent frame acceptance"
+        );
+        assert!(
+            lock_state(&shared_state)
+                .status_snapshot()
+                .runtime
+                .last_diagnostic
+                .as_deref()
+                .is_some_and(|diagnostic| diagnostic.contains("additional main-app window")),
+            "ordinary admission must retain its warning"
+        );
+
+        let ordinary_rect = wayland_state.ordinary_toplevel_rect(
+            0,
+            wayland_state
+                .ordinary_toplevels
+                .first()
+                .expect("ordinary window must be present"),
+        );
+        let pointer_location = (
+            ordinary_rect.loc.x as f64 + ordinary_rect.size.w as f64 / 2.0,
+            ordinary_rect.loc.y as f64 + ordinary_rect.size.h as f64 / 2.0,
+        )
+            .into();
+        let status = lock_state(&shared_state).status_snapshot();
+        let hit = wayland_state
+            .surface_under_point_for_capture(
+                pointer_location,
+                OverlayCaptureCapability::PointerButton,
+                &status,
+            )
+            .expect("ordinary window must be hit-testable");
+        assert!(same_surface(&hit.0, &ordinary_surface));
+        let expected_focus_origin = RoleSurfaceMapping::new(
+            super::toplevel_surface_source_rect(
+                wayland_state
+                    .ordinary_toplevels
+                    .first()
+                    .expect("ordinary window must be present"),
+            ),
+            ordinary_rect,
+        )
+        .focus_origin();
+        assert_eq!(
+            hit.1, expected_focus_origin,
+            "pointer coordinates must use the same ordinary-window placement as rendering"
+        );
+
+        wayland_state.forward_pointer_motion(pointer_location, 1);
+        wayland_state.forward_pointer_button(0x110, ButtonState::Pressed, 2);
+        let keyboard = wayland_state
+            .seat
+            .get_keyboard()
+            .expect("compositor seat must expose its keyboard");
+        assert!(
+            keyboard
+                .current_focus()
+                .as_ref()
+                .is_some_and(|focused| same_surface(focused, &ordinary_surface)),
+            "clicking an ordinary window must focus it for keyboard input"
+        );
+        wayland_state.apply_focus_route();
+        assert!(
+            keyboard
+                .current_focus()
+                .as_ref()
+                .is_some_and(|focused| same_surface(focused, &ordinary_surface)),
+            "the normal focus route must preserve the clicked ordinary window"
+        );
+
+        let mut renderer = surfaceless_test_renderer();
+        let capture = wayland_state.collect_render_elements(&mut renderer, 160, 100);
+        assert!(capture.failure.is_none(), "scene capture must succeed");
+        assert!(capture.counts.ordinary_toplevels > 0);
+        let ordinary_source = capture
+            .sources
+            .iter()
+            .position(|source| *source == super::RenderElementSource::OrdinaryToplevel)
+            .expect("production scene capture must include ordinary-window elements");
+        let main_source = capture
+            .sources
+            .iter()
+            .position(|source| *source == super::RenderElementSource::Main)
+            .expect("production scene capture must include the main surface");
+        assert!(
+            ordinary_source < main_source,
+            "ordinary windows must be layered above the main surface"
+        );
+
+        let path = Path::new("<ordinary-window-render-test>");
+        let mut scene_texture = renderer
+            .create_buffer(GLES_INTERMEDIATE_RENDER_FORMAT, (160, 100).into())
+            .expect("production scene texture must allocate");
+        render_elements_to_texture(
+            &mut renderer,
+            path,
+            &mut scene_texture,
+            (160, 100).into(),
+            &capture.elements,
+            1.0,
+            "ordinary-window scene",
+        )
+        .expect("production scene elements must render");
+        let target = renderer
+            .bind(&mut scene_texture)
+            .expect("production scene texture must bind for readback");
+        let mapping = renderer
+            .copy_framebuffer(
+                &target,
+                Rectangle::from_size(Size::<i32, BufferCoords>::from((160, 100))),
+                DrmFourcc::Xrgb8888,
+            )
+            .expect("production scene must copy to a readback texture");
+        let pixels = renderer
+            .map_texture(&mapping)
+            .expect("production scene readback must map");
+        let red_pixels = pixels
+            .chunks_exact(4)
+            .filter(|pixel| pixel[2] > 200 && pixel[1] < 50 && pixel[0] < 50)
+            .count();
+        let green_pixels = pixels
+            .chunks_exact(4)
+            .filter(|pixel| pixel[1] > 200 && pixel[2] < 50 && pixel[0] < 50)
+            .count();
+        assert!(
+            red_pixels >= 4_500,
+            "the ordinary SHM window must contribute visible red pixels, got {red_pixels}"
+        );
+        assert!(
+            green_pixels >= 10_000,
+            "the main SHM surface must remain visible around the ordinary window, got {green_pixels}"
+        );
+
+        for commands in [&main_commands, &ordinary_commands] {
+            commands
+                .send(RealShmToplevelCommand::Finish)
+                .expect("fixture clients must finish");
+        }
+        main_thread
+            .join()
+            .expect("main fixture client thread must finish");
+        ordinary_thread
+            .join()
+            .expect("ordinary fixture client thread must finish");
     }
 
     #[test]
