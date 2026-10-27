@@ -18,6 +18,7 @@ jobs:
       - run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes \
+            libegl1 \
             libgbm-dev \
             libinput-dev \
             libseat-dev \
