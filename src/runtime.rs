@@ -10292,6 +10292,11 @@ impl RuntimeWaylandState {
         for native in self.native_pane_toplevels.values() {
             send_frames_surface_tree(native.wl_surface(), elapsed_ms);
         }
+        for ordinary in &self.ordinary_toplevels {
+            if ordinary.alive() {
+                send_frames_surface_tree(ordinary.wl_surface(), elapsed_ms);
+            }
+        }
         for accessory in &self.native_pane_accessories {
             if accessory.mapped && self.native_pane_is_keyboard_focused(&accessory.pane_id) {
                 send_frames_surface_tree(accessory.surface.wl_surface(), elapsed_ms);
@@ -12511,6 +12516,7 @@ mod tests {
         configure_count: u32,
         toplevel_size: Option<(i32, i32)>,
         close_received: bool,
+        frame_callback_done: Option<mpsc::Sender<u32>>,
     }
 
     impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListContents>
@@ -12533,12 +12539,28 @@ mod tests {
     delegate_noop!(SurfaceTreeClient: ignore wl_surface::WlSurface);
     delegate_noop!(SurfaceTreeClient: ignore wl_subsurface::WlSubsurface);
     delegate_noop!(SurfaceTreeClient: ignore wl_buffer::WlBuffer);
-    delegate_noop!(SurfaceTreeClient: ignore wl_callback::WlCallback);
     delegate_noop!(SurfaceTreeClient: ignore wl_region::WlRegion);
     delegate_noop!(SurfaceTreeClient: ignore wp_viewport::WpViewport);
     delegate_noop!(SurfaceTreeClient: ignore wp_viewporter::WpViewporter);
     delegate_noop!(SurfaceTreeClient: ignore xdg_positioner::XdgPositioner);
     delegate_noop!(SurfaceTreeClient: ignore xdg_popup::XdgPopup);
+
+    impl Dispatch<wl_callback::WlCallback, ()> for SurfaceTreeClient {
+        fn event(
+            state: &mut Self,
+            _proxy: &wl_callback::WlCallback,
+            event: wl_callback::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            if let wl_callback::Event::Done { callback_data } = event {
+                if let Some(done) = state.frame_callback_done.take() {
+                    let _ = done.send(callback_data);
+                }
+            }
+        }
+    }
 
     impl Dispatch<xdg_toplevel::XdgToplevel, ()> for SurfaceTreeClient {
         fn event(
@@ -12864,6 +12886,10 @@ mod tests {
             buffer_transform: wl_output::Transform,
             committed: mpsc::Sender<()>,
         },
+        RequestFrame {
+            requested: mpsc::Sender<()>,
+            completed: mpsc::Sender<u32>,
+        },
         Finish,
     }
 
@@ -13050,6 +13076,25 @@ mod tests {
                         committed
                             .send(())
                             .expect("test must receive buffer-state commit acknowledgement");
+                    }
+                    RealShmToplevelCommand::RequestFrame {
+                        requested,
+                        completed,
+                    } => {
+                        let _callback = surface.frame(&qh, ());
+                        client_state.frame_callback_done = Some(completed);
+                        surface.commit();
+                        connection
+                            .flush()
+                            .expect("ordinary frame callback request must flush");
+                        requested
+                            .send(())
+                            .expect("test must receive frame callback request acknowledgement");
+                        while client_state.frame_callback_done.is_some() {
+                            queue
+                                .blocking_dispatch(&mut client_state)
+                                .expect("ordinary frame callback must be dispatched");
+                        }
                     }
                     RealShmToplevelCommand::Finish => break,
                 }
@@ -17562,6 +17607,28 @@ mod tests {
             green_pixels >= 10_000,
             "the main SHM surface must remain visible around the ordinary window, got {green_pixels}"
         );
+
+        let (frame_requested_tx, frame_requested_rx) = mpsc::channel();
+        let (frame_done_tx, frame_done_rx) = mpsc::channel();
+        ordinary_commands
+            .send(RealShmToplevelCommand::RequestFrame {
+                requested: frame_requested_tx,
+                completed: frame_done_tx,
+            })
+            .expect("ordinary client must request a frame callback");
+        frame_requested_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("ordinary client must flush its frame callback request");
+        display
+            .dispatch_clients(&mut wayland_state)
+            .expect("server must receive ordinary frame callback request");
+        wayland_state.send_frame_callbacks();
+        display
+            .flush_clients()
+            .expect("ordinary frame callback must flush to client");
+        frame_done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("ordinary client must receive its frame callback");
 
         for commands in [&main_commands, &ordinary_commands] {
             commands
