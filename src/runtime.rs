@@ -11444,6 +11444,13 @@ impl SeatHandler for RuntimeWaylandState {
         let target = focused
             .and_then(|surface| self.role_for_surface(surface))
             .map(runtime_focus_target_for_role);
+        self.ordinary_keyboard_focus = focused
+            .filter(|focused| {
+                self.ordinary_toplevels.iter().any(|ordinary| {
+                    ordinary.alive() && surface_tree_contains(ordinary.wl_surface(), focused)
+                })
+            })
+            .map(|surface| (surface.clone(), target.clone()));
         let mut state = lock_state(&self.shared_state);
         state.set_runtime_focus_target(target);
     }
