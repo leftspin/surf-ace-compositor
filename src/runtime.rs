@@ -17011,10 +17011,10 @@ mod tests {
 
     #[test]
     fn unmatched_toplevels_remain_open_as_ordinary_windows() {
-        let shared_state = Arc::new(Mutex::new(CompositorState::new(
-            true,
-            Box::new(NoopProcessController::default()),
-        )));
+        let mut initial_state =
+            CompositorState::new(true, Box::new(NoopProcessController::default()));
+        initial_state.mark_runtime_resize(1280, 800);
+        let shared_state = Arc::new(Mutex::new(initial_state));
         {
             let mut state = lock_state(&shared_state);
             state.configure_shell_overlay_process(Some(ProcessSpec {
