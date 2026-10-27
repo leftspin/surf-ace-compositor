@@ -9074,26 +9074,26 @@ impl RuntimeWaylandState {
         SurfaceClassification::OverlayCandidate
     }
 
-    fn main_surface_matches_current_contract(&self, surface: &ToplevelSurface) -> bool {
-        let Some(expectation) = self.expected_main_app_binding() else {
-            return false;
-        };
-        let Some(client_pid) = self.client_pid_for_toplevel(surface) else {
-            return false;
-        };
-        pid_matches_or_descends_from(client_pid, expectation.pid)
-            || expectation
-                .launch_token
-                .as_deref()
-                .is_some_and(|token| process_launch_token_matches(client_pid, token))
+    fn main_surface_matches_current_contract(&self, surface: &ToplevelSurface) -> Option<bool> {
+        let expectation = self.expected_main_app_binding()?;
+        let client_pid = self.client_pid_for_toplevel(surface)?;
+        Some(
+            pid_matches_or_descends_from(client_pid, expectation.pid)
+                || expectation
+                    .launch_token
+                    .as_deref()
+                    .is_some_and(|token| process_launch_token_matches(client_pid, token)),
+        )
     }
 
     fn enforce_main_app_binding_policy(&mut self) {
+        // Unknown binding or client identity is not evidence to close the
+        // currently accepted main surface.
         let should_clear = self
             .main_toplevel
             .as_ref()
-            .map(|surface| !self.main_surface_matches_current_contract(surface))
-            .unwrap_or(false);
+            .and_then(|surface| self.main_surface_matches_current_contract(surface))
+            .is_some_and(|matches| !matches);
         if !should_clear {
             return;
         }
@@ -17015,32 +17015,6 @@ mod tests {
         let mut initial_state =
             CompositorState::new(true, Box::new(NoopProcessController::default()));
         initial_state.mark_runtime_resize(1280, 800);
-        initial_state
-            .select_main_app_launch_intent(crate::model::MainAppLaunchIntent {
-                process: ProcessSpec {
-                    command: "main-fixture".to_string(),
-                    args: Vec::new(),
-                    cwd: None,
-                    env: Default::default(),
-                },
-                binding: crate::model::MainAppSurfaceBinding::AppId {
-                    app_id: "main-fixture".to_string(),
-                },
-            })
-            .expect("main-app fixture intent must be accepted");
-        initial_state.mark_runtime_running(
-            crate::model::RuntimeBackend::Winit,
-            Some("wayland-fixture".to_string()),
-            1280,
-            800,
-        );
-        assert!(
-            initial_state.runtime_mark_main_app_surface_attached_for_launch_pid_with_evidence(
-                1,
-                std::process::id(),
-                None,
-            )
-        );
         let shared_state = Arc::new(Mutex::new(initial_state));
         {
             let mut state = lock_state(&shared_state);
