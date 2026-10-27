@@ -12113,6 +12113,7 @@ mod tests {
         render_elements_to_texture,
         same_surface,
         surface_id,
+        surface_key,
         composite_scene_texture_to_physical_scanout,
         select_atomic_plane_zpos_values, select_preferred_scanout_format, select_primary_path,
         remap_damage_to_materialized_destination, source_rect_from_bbox_and_geometry,
@@ -17014,6 +17015,32 @@ mod tests {
         let mut initial_state =
             CompositorState::new(true, Box::new(NoopProcessController::default()));
         initial_state.mark_runtime_resize(1280, 800);
+        initial_state
+            .select_main_app_launch_intent(crate::model::MainAppLaunchIntent {
+                process: ProcessSpec {
+                    command: "main-fixture".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: Default::default(),
+                },
+                binding: crate::model::MainAppSurfaceBinding::AppId {
+                    app_id: "main-fixture".to_string(),
+                },
+            })
+            .expect("main-app fixture intent must be accepted");
+        initial_state.mark_runtime_running(
+            crate::model::RuntimeBackend::Winit,
+            Some("wayland-fixture".to_string()),
+            1280,
+            800,
+        );
+        assert!(
+            initial_state.runtime_mark_main_app_surface_attached_for_launch_pid_with_evidence(
+                1,
+                std::process::id(),
+                None,
+            )
+        );
         let shared_state = Arc::new(Mutex::new(initial_state));
         {
             let mut state = lock_state(&shared_state);
@@ -17041,33 +17068,38 @@ mod tests {
 
         let (first_main, commands, thread) =
             take_admission_toplevel(&mut display, &mut wayland_state);
-        let first_main_id = surface_id(first_main.wl_surface());
+        let first_main_key = surface_key(first_main.wl_surface());
         wayland_state.assign_main_role(first_main);
         display
             .flush_clients()
             .expect("main role configure must flush");
+        assert!(
+            wayland_state
+                .main_toplevel
+                .as_ref()
+                .is_some_and(|surface| { &surface_key(surface.wl_surface()) == &first_main_key })
+        );
         assert_admission_client_not_closed(&mut display, &mut wayland_state, &commands);
         clients.push((commands, thread));
 
         let (second_main, commands, thread) =
             take_admission_toplevel(&mut display, &mut wayland_state);
-        let second_main_id = surface_id(second_main.wl_surface());
+        let second_main_key = surface_key(second_main.wl_surface());
         wayland_state.assign_main_role(second_main);
         display
             .flush_clients()
             .expect("ordinary main-window configure must flush");
-        assert_eq!(
+        assert!(
             wayland_state
                 .main_toplevel
                 .as_ref()
-                .map(|surface| surface_id(surface.wl_surface())),
-            Some(first_main_id)
+                .is_some_and(|surface| { &surface_key(surface.wl_surface()) == &first_main_key })
         );
         assert!(
             wayland_state
                 .ordinary_toplevels
                 .iter()
-                .any(|surface| { surface_id(surface.wl_surface()) == second_main_id })
+                .any(|surface| { &surface_key(surface.wl_surface()) == &second_main_key })
         );
         assert!(
             lock_state(&shared_state)
@@ -17078,6 +17110,7 @@ mod tests {
                 .is_some_and(|diagnostic| diagnostic.contains("additional main-app window"))
         );
         assert_admission_client_not_closed(&mut display, &mut wayland_state, &commands);
+        assert_admission_client_not_closed(&mut display, &mut wayland_state, &clients[0].0);
         clients.push((commands, thread));
 
         let (foreign_overlay, commands, thread) =
