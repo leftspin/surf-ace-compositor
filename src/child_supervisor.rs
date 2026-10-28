@@ -1142,13 +1142,13 @@ mod tests {
 
     #[test]
     fn sanitizer_redacts_required_credential_shapes_and_preserves_safe_text() {
-        let record = "keep Authorization: Bearer t285-synthetic-secret url=https://alice:uri-password@example.test/path token='env secret value' end";
+        let record = "keep Authorization: Bearer sample-access-token url=https://alice:uri-password@example.test/path token='env secret value' end";
         let safe = sanitize_record(record, &[]);
         assert!(safe.contains("keep Authorization: Bearer [REDACTED]"));
         assert!(safe.contains("https://alice:[REDACTED]@example.test/path"));
         assert!(safe.contains("token='[REDACTED]'"));
         assert!(safe.contains("end"));
-        assert!(!safe.contains("t285-synthetic-secret"));
+        assert!(!safe.contains("sample-access-token"));
         assert!(!safe.contains("uri-password"));
         assert!(!safe.contains("env secret value"));
     }
@@ -1225,7 +1225,7 @@ mod tests {
         let (failure_tx, failure_rx) = mpsc::channel();
         let failed = AtomicBool::new(false);
         let mut output = Vec::new();
-        let mut reader = Cursor::new(b"token=t285-secret\nfinal=visible".to_vec());
+        let mut reader = Cursor::new(b"token=sample-access-token\nfinal=visible".to_vec());
         pump_stream(
             &mut reader,
             &mut output,
@@ -1238,7 +1238,7 @@ mod tests {
         let output = String::from_utf8(output).expect("sanitized output is utf-8");
         assert!(output.contains("token=[REDACTED]"));
         assert!(output.contains("final=visible"));
-        assert!(!output.contains("t285-secret"));
+        assert!(!output.contains("sample-access-token"));
         assert!(failure_rx.try_recv().is_err());
 
         let (failure_tx, failure_rx) = mpsc::channel();
@@ -1252,7 +1252,7 @@ mod tests {
             &mut output,
             "surface1-foot.service",
             StreamKind::Stdout,
-            &["t285-secret".to_string()],
+            &["sample-access-token".to_string()],
             &failure_tx,
             &failed,
         );
