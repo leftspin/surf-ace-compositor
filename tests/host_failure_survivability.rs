@@ -20,6 +20,17 @@ fn wait_for_socket(socket_path: &Path) {
     );
 }
 
+fn wait_for_stderr_contains(stderr_path: &Path, expected: &str) -> String {
+    for _ in 0..100 {
+        let stderr = fs::read_to_string(stderr_path).unwrap_or_default();
+        if stderr.contains(expected) {
+            return stderr;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("timed out waiting for stderr to contain {expected:?}");
+}
+
 fn send_control(socket_path: &Path, request_json: &str) -> Value {
     for _ in 0..50 {
         match UnixStream::connect(socket_path) {
@@ -274,7 +285,7 @@ fn invalid_or_empty_main_app_configuration_keeps_host_compositor_running() {
 }
 
 #[test]
-fn host_failure_keeps_control_socket_reachable_and_reports_failed_phase() {
+fn host_failure_keeps_control_socket_reachable_while_retrying() {
     let unique_suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be monotonic enough for test")
@@ -289,26 +300,31 @@ fn host_failure_keeps_control_socket_reachable_and_reports_failed_phase() {
     let mut child = spawn_forced_host_failure_server(&socket_path);
     wait_for_socket(&socket_path);
 
-    let status = send_control(&socket_path, "{\"type\":\"get_status\"}");
+    let status = wait_for_status_where(
+        &socket_path,
+        "host runtime retry with the failure retained",
+        |status| {
+            status["status"]["runtime"]["phase"] == Value::String("starting".to_string())
+                && status["status"]["runtime"]["last_diagnostic"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("forced host runtime failure"))
+        },
+    );
     assert_eq!(status["ok"], Value::Bool(true));
     assert_eq!(
         status["status"]["runtime"]["phase"],
-        Value::String("failed".to_string())
+        Value::String("starting".to_string())
     );
-    assert_eq!(
-        status["status"]["runtime"]["host_start_attempt_count"],
-        Value::Number(1u64.into())
-    );
-    assert_eq!(
-        status["status"]["runtime"]["host_last_start_trigger"],
-        Value::String("bootstrap".to_string())
-    );
-    assert_eq!(
-        status["status"]["runtime"]["last_error"]
+    assert!(
+        status["status"]["runtime"]["last_diagnostic"]
             .as_str()
-            .expect("last_error should be present")
-            .contains("forced host runtime failure"),
-        true
+            .expect("retry warning should remain visible during retry")
+            .contains("forced host runtime failure")
+    );
+    assert_eq!(status["status"]["runtime"]["wayland_socket"], Value::Null);
+    assert_eq!(
+        status["status"]["runtime"]["host_output_ownership"],
+        Value::Bool(false)
     );
     assert!(
         child
@@ -318,50 +334,13 @@ fn host_failure_keeps_control_socket_reachable_and_reports_failed_phase() {
         "server must remain alive so control path is usable for recovery"
     );
 
-    let start_response = send_control(&socket_path, "{\"type\":\"start_host_runtime\"}");
-    assert_eq!(start_response["ok"], Value::Bool(true));
-    assert_eq!(
-        start_response["status"]["runtime"]["phase"],
-        Value::String("failed".to_string())
-    );
-    assert_eq!(
-        start_response["status"]["runtime"]["host_start_attempt_count"],
-        Value::Number(2u64.into())
-    );
-    assert_eq!(
-        start_response["status"]["runtime"]["host_start_request_pending"],
-        Value::Bool(true)
-    );
-    assert_eq!(
-        start_response["status"]["runtime"]["host_last_start_trigger"],
-        Value::String("control_retry".to_string())
-    );
-    assert_eq!(
-        start_response["status"]["runtime"]["last_error"]
-            .as_str()
-            .expect("last_error should remain visible while retry is only queued")
-            .contains("forced host runtime failure"),
-        true
-    );
-
-    let mut failed_again = false;
-    for _ in 0..50 {
-        let follow_up = send_control(&socket_path, "{\"type\":\"get_status\"}");
-        if follow_up["status"]["runtime"]["phase"] == Value::String("failed".to_string())
-            && follow_up["status"]["runtime"]["host_start_request_pending"] == Value::Bool(false)
-        {
-            assert_eq!(
-                follow_up["status"]["runtime"]["runtime_operator_action_needed"],
-                Value::Bool(true)
-            );
-            failed_again = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
+    let follow_up = send_control(&socket_path, "{\"type\":\"get_status\"}");
+    assert_eq!(follow_up["ok"], Value::Bool(true));
     assert!(
-        failed_again,
-        "forced restart should fail and keep reporting failed phase"
+        follow_up["status"]["runtime"]["last_diagnostic"]
+            .as_str()
+            .expect("retry warning should remain visible during retry")
+            .contains("forced host runtime failure")
     );
     assert!(
         child
@@ -377,7 +356,7 @@ fn host_failure_keeps_control_socket_reachable_and_reports_failed_phase() {
 }
 
 #[test]
-fn auto_host_failure_stays_failed_and_does_not_downgrade_to_winit() {
+fn auto_host_failure_keeps_retrying_without_downgrading_to_winit() {
     let unique_suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be monotonic enough for test")
@@ -399,7 +378,15 @@ fn auto_host_failure_stays_failed_and_does_not_downgrade_to_winit() {
     );
     wait_for_socket(&socket_path);
 
-    let status = send_control(&socket_path, "{\"type\":\"get_status\"}");
+    let status = wait_for_status_where(&socket_path, "automatic host selection retry", |status| {
+        status["status"]["runtime"]["backend"] == Value::String("host_drm".to_string())
+            && status["status"]["runtime"]["runtime_selection_mode"]
+                == Value::String("automatic".to_string())
+            && status["status"]["runtime"]["phase"] == Value::String("starting".to_string())
+            && status["status"]["runtime"]["last_diagnostic"]
+                .as_str()
+                .is_some_and(|error| error.contains("forced host runtime failure"))
+    });
     assert_eq!(status["ok"], Value::Bool(true));
     assert_eq!(
         status["status"]["runtime"]["backend"],
@@ -407,24 +394,23 @@ fn auto_host_failure_stays_failed_and_does_not_downgrade_to_winit() {
     );
     assert_eq!(
         status["status"]["runtime"]["phase"],
-        Value::String("failed".to_string())
+        Value::String("starting".to_string())
     );
     assert_eq!(
         status["status"]["runtime"]["runtime_selection_mode"],
         Value::String("automatic".to_string())
     );
-    assert_eq!(
-        status["status"]["runtime"]["runtime_operator_action_needed"],
-        Value::Bool(true)
-    );
-    assert_eq!(
-        status["status"]["runtime"]["runtime_operator_action_reason"]
+    assert!(
+        status["status"]["runtime"]["last_diagnostic"]
             .as_str()
-            .expect("operator action reason should be present")
-            .contains("automatic host runtime failed"),
-        true
+            .expect("retry warning should report the unavailable host display")
+            .contains("forced host runtime failure")
     );
     assert_eq!(status["status"]["runtime"]["wayland_socket"], Value::Null);
+    assert_eq!(
+        status["status"]["runtime"]["host_output_ownership"],
+        Value::Bool(false)
+    );
     assert!(
         child
             .try_wait()
@@ -439,7 +425,7 @@ fn auto_host_failure_stays_failed_and_does_not_downgrade_to_winit() {
 }
 
 #[test]
-fn live_socket_owner_blocks_second_host_start_on_same_socket() {
+fn second_server_survives_optional_control_socket_conflict() {
     let unique_suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be monotonic enough for test")
@@ -449,35 +435,35 @@ fn live_socket_owner_blocks_second_host_start_on_same_socket() {
         std::process::id(),
         unique_suffix
     ));
+    let stderr_path = PathBuf::from(format!(
+        "/tmp/surf-ace-live-socket-owner-{}-{}.stderr",
+        std::process::id(),
+        unique_suffix
+    ));
     let _ = fs::remove_file(&socket_path);
+    let _ = fs::remove_file(&stderr_path);
 
     let mut owner = spawn_server(&socket_path, "none", &[]);
     wait_for_socket(&socket_path);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_surf-ace-compositor"))
-        .args([
-            "serve",
-            "--runtime",
-            "host",
-            "--socket-path",
-            socket_path
-                .to_str()
-                .expect("socket path should be representable"),
-        ])
-        .env("SURF_ACE_HOST_RUNTIME_FORCE_FAIL", "1")
-        .output()
-        .expect("second host server should run");
-
-    assert!(
-        !output.status.success(),
-        "second server unexpectedly succeeded: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    let mut second = spawn_server_with_args_and_stderr(
+        &socket_path,
+        "host",
+        &[],
+        &[("SURF_ACE_HOST_RUNTIME_FORCE_FAIL", "1")],
+        &stderr_path,
     );
+    let stderr = wait_for_stderr_contains(
+        &stderr_path,
+        "optional control service unavailable; continuing without control",
+    );
+    assert!(stderr.contains("control socket already active"));
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("control socket already active"),
-        "second server stderr should report live socket ownership: {}",
-        String::from_utf8_lossy(&output.stderr)
+        second
+            .try_wait()
+            .expect("second server wait should succeed")
+            .is_none(),
+        "optional control socket failure must not stop the compositor process"
     );
 
     let status = send_control(&socket_path, "{\"type\":\"get_status\"}");
@@ -491,16 +477,19 @@ fn live_socket_owner_blocks_second_host_start_on_same_socket() {
             .try_wait()
             .expect("owner wait should succeed")
             .is_none(),
-        "existing server must remain alive after rejecting second start"
+        "existing server must remain alive after the second process loses optional control"
     );
 
+    let _ = second.kill();
+    let _ = second.wait();
     let _ = owner.kill();
     let _ = owner.wait();
     let _ = fs::remove_file(&socket_path);
+    let _ = fs::remove_file(&stderr_path);
 }
 
 #[test]
-fn queued_retry_transitions_into_starting_without_clearing_last_error() {
+fn host_startup_failure_retries_and_keeps_warning_visible() {
     let unique_suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be monotonic enough for test")
@@ -525,68 +514,30 @@ fn queued_retry_transitions_into_starting_without_clearing_last_error() {
     );
     wait_for_socket(&socket_path);
 
-    let initial_failed =
-        wait_for_status_where(&socket_path, "initial failed host state", |status| {
-            status["status"]["runtime"]["phase"] == Value::String("failed".to_string())
-                && status["status"]["runtime"]["host_start_attempt_count"]
-                    == Value::Number(1u64.into())
-        });
+    let starting = wait_for_status_where(
+        &socket_path,
+        "automatic retry entering starting",
+        |status| {
+            status["status"]["runtime"]["phase"] == Value::String("starting".to_string())
+                && status["status"]["runtime"]["last_diagnostic"]
+                    .as_str()
+                    .is_some_and(|error| {
+                        error.contains("scripted host runtime failure after starting")
+                    })
+        },
+    );
     assert_eq!(
-        initial_failed["status"]["runtime"]["last_error"]
+        starting["status"]["runtime"]["last_diagnostic"]
             .as_str()
-            .expect("last_error should be present")
+            .expect("retry warning should remain visible while startup retries")
             .contains("scripted host runtime failure after starting"),
         true
-    );
-
-    let start_response = send_control(&socket_path, "{\"type\":\"start_host_runtime\"}");
-    assert_eq!(start_response["ok"], Value::Bool(true));
-    assert_eq!(
-        start_response["status"]["runtime"]["phase"],
-        Value::String("failed".to_string())
-    );
-    assert_eq!(
-        start_response["status"]["runtime"]["host_start_request_pending"],
-        Value::Bool(true)
-    );
-
-    let starting = wait_for_status_where(&socket_path, "retry entering starting", |status| {
-        status["status"]["runtime"]["phase"] == Value::String("starting".to_string())
-            && status["status"]["runtime"]["host_start_request_pending"] == Value::Bool(false)
-    });
-    assert_eq!(
-        starting["status"]["runtime"]["last_error"]
-            .as_str()
-            .expect("last_error should remain visible while restart is starting")
-            .contains("scripted host runtime failure after starting"),
-        true
-    );
-    assert_eq!(
-        starting["status"]["runtime"]["runtime_operator_action_needed"],
-        Value::Bool(false)
     );
     assert_eq!(
         starting["status"]["runtime"]["host_output_ownership"],
         Value::Bool(false)
     );
-
-    let failed_again = wait_for_status_where(
-        &socket_path,
-        "retry failed again after starting",
-        |status| {
-            status["status"]["runtime"]["phase"] == Value::String("failed".to_string())
-                && status["status"]["runtime"]["host_start_attempt_count"]
-                    == Value::Number(2u64.into())
-                && status["status"]["runtime"]["host_start_request_pending"] == Value::Bool(false)
-        },
-    );
-    assert_eq!(
-        failed_again["status"]["runtime"]["last_error"]
-            .as_str()
-            .expect("last_error should be present after restart failure")
-            .contains("scripted host runtime failure after starting"),
-        true
-    );
+    assert_eq!(starting["status"]["runtime"]["wayland_socket"], Value::Null);
 
     let _ = child.kill();
     let _ = child.wait();
@@ -594,7 +545,7 @@ fn queued_retry_transitions_into_starting_without_clearing_last_error() {
 }
 
 #[test]
-fn queued_retry_transitions_into_preflight_ready_without_clearing_last_error() {
+fn automatic_preflight_retry_keeps_warning_visible() {
     let unique_suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be monotonic enough for test")
@@ -611,51 +562,30 @@ fn queued_retry_transitions_into_preflight_ready_without_clearing_last_error() {
         "host",
         &[
             (
-                "SURF_ACE_HOST_RUNTIME_TEST_SCRIPTED_FAILURE_PHASE",
-                "preflight_ready",
+                "SURF_ACE_HOST_RUNTIME_TEST_SCRIPTED_PHASES",
+                "preflight_ready,preflight_ready",
             ),
             ("SURF_ACE_HOST_RUNTIME_TEST_SCRIPTED_HOLD_MS", "250"),
         ],
     );
     wait_for_socket(&socket_path);
 
-    let initial_failed = wait_for_status_where(
+    let preflight_ready = wait_for_status_where(
         &socket_path,
-        "initial failed preflight host state",
+        "automatic retry entering preflight_ready",
         |status| {
-            status["status"]["runtime"]["phase"] == Value::String("failed".to_string())
-                && status["status"]["runtime"]["host_start_attempt_count"]
-                    == Value::Number(1u64.into())
+            status["status"]["runtime"]["phase"] == Value::String("preflight_ready".to_string())
+                && status["status"]["runtime"]["last_diagnostic"]
+                    .as_str()
+                    .is_some_and(|error| {
+                        error.contains("scripted host runtime failure after preflight_ready")
+                    })
         },
     );
     assert_eq!(
-        initial_failed["status"]["runtime"]["last_error"]
+        preflight_ready["status"]["runtime"]["last_diagnostic"]
             .as_str()
-            .expect("last_error should be present")
-            .contains("scripted host runtime failure after preflight_ready"),
-        true
-    );
-
-    let start_response = send_control(&socket_path, "{\"type\":\"start_host_runtime\"}");
-    assert_eq!(start_response["ok"], Value::Bool(true));
-    assert_eq!(
-        start_response["status"]["runtime"]["phase"],
-        Value::String("failed".to_string())
-    );
-    assert_eq!(
-        start_response["status"]["runtime"]["host_start_request_pending"],
-        Value::Bool(true)
-    );
-
-    let preflight_ready =
-        wait_for_status_where(&socket_path, "retry entering preflight_ready", |status| {
-            status["status"]["runtime"]["phase"] == Value::String("preflight_ready".to_string())
-                && status["status"]["runtime"]["host_start_request_pending"] == Value::Bool(false)
-        });
-    assert_eq!(
-        preflight_ready["status"]["runtime"]["last_error"]
-            .as_str()
-            .expect("last_error should remain visible while restart is preflight-ready")
+            .expect("retry warning should remain visible while preflight is ready")
             .contains("scripted host runtime failure after preflight_ready"),
         true
     );
@@ -667,28 +597,6 @@ fn queued_retry_transitions_into_preflight_ready_without_clearing_last_error() {
         preflight_ready["status"]["runtime"]["host_output_ownership"],
         Value::Bool(false)
     );
-    assert_eq!(
-        preflight_ready["status"]["runtime"]["runtime_operator_action_needed"],
-        Value::Bool(false)
-    );
-
-    let failed_again = wait_for_status_where(
-        &socket_path,
-        "retry failed again after preflight_ready",
-        |status| {
-            status["status"]["runtime"]["phase"] == Value::String("failed".to_string())
-                && status["status"]["runtime"]["host_start_attempt_count"]
-                    == Value::Number(2u64.into())
-                && status["status"]["runtime"]["host_start_request_pending"] == Value::Bool(false)
-        },
-    );
-    assert_eq!(
-        failed_again["status"]["runtime"]["last_error"]
-            .as_str()
-            .expect("last_error should be present after restart failure")
-            .contains("scripted host runtime failure after preflight_ready"),
-        true
-    );
 
     let _ = child.kill();
     let _ = child.wait();
@@ -696,7 +604,7 @@ fn queued_retry_transitions_into_preflight_ready_without_clearing_last_error() {
 }
 
 #[test]
-fn successful_restart_clears_last_error_only_when_running_and_owned() {
+fn automatic_recovery_reaches_running_after_startup_failure() {
     let unique_suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be monotonic enough for test")
@@ -721,55 +629,23 @@ fn successful_restart_clears_last_error_only_when_running_and_owned() {
     );
     wait_for_socket(&socket_path);
 
-    let initial_failed = wait_for_status_where(
-        &socket_path,
-        "initial failed host state before successful retry",
-        |status| {
-            status["status"]["runtime"]["phase"] == Value::String("failed".to_string())
-                && status["status"]["runtime"]["host_start_attempt_count"]
-                    == Value::Number(1u64.into())
-        },
-    );
-    assert_eq!(
-        initial_failed["status"]["runtime"]["last_error"]
-            .as_str()
-            .expect("last_error should be present after initial failure")
-            .contains("scripted host runtime failure after starting"),
-        true
-    );
-
-    let start_response = send_control(&socket_path, "{\"type\":\"start_host_runtime\"}");
-    assert_eq!(start_response["ok"], Value::Bool(true));
-    assert_eq!(
-        start_response["status"]["runtime"]["phase"],
-        Value::String("failed".to_string())
-    );
-    assert_eq!(
-        start_response["status"]["runtime"]["host_start_request_pending"],
-        Value::Bool(true)
-    );
-    assert_eq!(
-        start_response["status"]["runtime"]["last_error"]
-            .as_str()
-            .expect("last_error should remain visible while retry is queued")
-            .contains("scripted host runtime failure after starting"),
-        true
-    );
-
     let preflight_ready = wait_for_status_where(
         &socket_path,
-        "successful retry entering preflight_ready",
+        "automatic retry entering preflight_ready",
         |status| {
             status["status"]["runtime"]["phase"] == Value::String("preflight_ready".to_string())
-                && status["status"]["runtime"]["host_start_request_pending"] == Value::Bool(false)
+                && status["status"]["runtime"]["wayland_socket"]
+                    == Value::String("wayland-test-running".to_string())
+                && status["status"]["runtime"]["last_diagnostic"]
+                    .as_str()
+                    .is_some_and(|warning| {
+                        warning.contains("scripted host runtime failure after starting")
+                    })
         },
     );
     assert_eq!(
-        preflight_ready["status"]["runtime"]["last_error"]
-            .as_str()
-            .expect("last_error should remain visible while restart is preflight-ready")
-            .contains("scripted host runtime failure after starting"),
-        true
+        preflight_ready["status"]["runtime"]["last_error"],
+        Value::Null
     );
     assert_eq!(
         preflight_ready["status"]["runtime"]["wayland_socket"],
@@ -798,8 +674,11 @@ fn successful_restart_clears_last_error_only_when_running_and_owned() {
         "last_error must clear only once running host ownership is live"
     );
     assert_eq!(
-        running["status"]["runtime"]["host_start_attempt_count"],
-        Value::Number(2u64.into())
+        running["status"]["runtime"]["last_diagnostic"]
+            .as_str()
+            .expect("the failure warning should remain in status after recovery")
+            .contains("scripted host runtime failure after starting"),
+        true
     );
     assert_eq!(
         running["status"]["runtime"]["wayland_socket"],

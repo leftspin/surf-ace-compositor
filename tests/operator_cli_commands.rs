@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -244,9 +244,11 @@ fn serve_restores_remembered_output_rotation_when_unspecified() {
 }
 
 #[test]
-fn failed_explicit_start_does_not_overwrite_remembered_output_rotation() {
-    let state_path = unique_temp_path("surf-ace-output-rotation-state-failed-start", ".json");
-    let socket_path = unique_temp_path("surf-ace-output-rotation-owned", ".sock");
+fn invalid_explicit_rotation_does_not_overwrite_remembered_output_rotation() {
+    let state_path = unique_temp_path("surf-ace-output-rotation-state-invalid", ".json");
+    let first_socket = unique_temp_path("surf-ace-output-rotation-first", ".sock");
+    let second_socket = unique_temp_path("surf-ace-output-rotation-second", ".sock");
+    let stderr_path = unique_temp_path("surf-ace-output-rotation-invalid", ".log");
     fs::write(&state_path, b"\"deg90\"").expect("initial state should write");
 
     let owner = Command::new(env!("CARGO_BIN_EXE_surf-ace-compositor"))
@@ -255,9 +257,11 @@ fn failed_explicit_start_does_not_overwrite_remembered_output_rotation() {
             "--runtime",
             "none",
             "--socket-path",
-            socket_path
+            first_socket
                 .to_str()
                 .expect("socket path should be valid UTF-8"),
+            "--output-rotation",
+            "deg90",
             "--output-rotation-state-path",
             state_path
                 .to_str()
@@ -265,37 +269,41 @@ fn failed_explicit_start_does_not_overwrite_remembered_output_rotation() {
         ])
         .spawn()
         .expect("owner serve should start");
-    wait_for_socket(&socket_path);
+    wait_for_socket(&first_socket);
+    let owner_status = send_control_request(&first_socket, json!({ "type": "get_status" }));
+    assert_eq!(owner_status["status"]["output_rotation"], json!("deg90"));
 
-    let output = Command::new(env!("CARGO_BIN_EXE_surf-ace-compositor"))
+    let second = Command::new(env!("CARGO_BIN_EXE_surf-ace-compositor"))
         .args([
             "serve",
             "--runtime",
             "none",
             "--socket-path",
-            socket_path
+            second_socket
                 .to_str()
                 .expect("socket path should be valid UTF-8"),
             "--output-rotation",
-            "deg270",
+            "invalid",
             "--output-rotation-state-path",
             state_path
                 .to_str()
                 .expect("state path should be valid UTF-8"),
         ])
-        .output()
-        .expect("second serve should run");
-
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            fs::File::create(&stderr_path).expect("stderr capture should be created"),
+        ))
+        .spawn()
+        .expect("second serve should start with a default rotation");
+    wait_for_socket(&second_socket);
+    let second_status = send_control_request(&second_socket, json!({ "type": "get_status" }));
+    assert_eq!(second_status["status"]["output_rotation"], json!("deg90"));
     assert!(
-        !output.status.success(),
-        "second serve unexpectedly succeeded: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("control socket already active"),
-        "second serve stderr should report live socket ownership: {}",
-        String::from_utf8_lossy(&output.stderr)
+        fs::read_to_string(&stderr_path)
+            .expect("stderr should be readable")
+            .contains("invalid optional output rotation"),
+        "invalid optional rotation should warn"
     );
     assert_eq!(
         serde_json::from_slice::<Value>(&fs::read(&state_path).expect("state should remain"))
@@ -303,9 +311,12 @@ fn failed_explicit_start_does_not_overwrite_remembered_output_rotation() {
         json!("deg90")
     );
 
+    stop_child(second);
     stop_child(owner);
-    let _ = fs::remove_file(&socket_path);
+    let _ = fs::remove_file(&first_socket);
+    let _ = fs::remove_file(&second_socket);
     let _ = fs::remove_file(&state_path);
+    let _ = fs::remove_file(&stderr_path);
 }
 
 #[test]
@@ -593,60 +604,71 @@ fn serve_launch_shorthand_reuses_active_control_socket_instead_of_rebinding() {
 }
 
 #[test]
-fn host_config_failures_exit_before_runtime_device_preflight() {
-    let socket_path = unique_temp_path("surf-ace-config-preflight", ".sock");
+fn host_config_faults_warn_default_and_keep_control_available() {
+    fn verify_case(config_path: &Path, warning: &str) {
+        let socket_path = unique_temp_path("surf-ace-config-fallback", ".sock");
+        let stderr_path = unique_temp_path("surf-ace-config-fallback", ".log");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_surf-ace-compositor"))
+            .env("SURF_ACE_HOST_RUNTIME_FORCE_FAIL", "1")
+            .args([
+                "serve",
+                "--runtime",
+                "host",
+                "--socket-path",
+                socket_path.to_str().unwrap(),
+                "--config",
+                config_path.to_str().unwrap(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(
+                fs::File::create(&stderr_path).expect("stderr capture should be created"),
+            ))
+            .spawn()
+            .expect("host compositor should continue after an optional config fault");
+
+        wait_for_socket(&socket_path);
+        let status = send_control_request(&socket_path, json!({ "type": "get_status" }));
+        let stderr = fs::read_to_string(&stderr_path).expect("stderr should be readable");
+        let remains_running = child
+            .try_wait()
+            .expect("child status should be readable")
+            .is_none();
+        stop_child(child);
+        let _ = fs::remove_file(&socket_path);
+        let _ = fs::remove_file(&stderr_path);
+
+        assert_eq!(status["ok"], json!(true));
+        assert!(
+            remains_running,
+            "optional config faults must not exit the process"
+        );
+        assert!(
+            stderr.contains(warning),
+            "expected {warning:?} in {stderr:?}"
+        );
+    }
+
     let missing = unique_temp_path("surf-ace-missing-config", ".json");
-    let output = Command::new(env!("CARGO_BIN_EXE_surf-ace-compositor"))
-        .env("SURF_ACE_HOST_RUNTIME_FORCE_FAIL", "1")
-        .args([
-            "serve",
-            "--runtime",
-            "host",
-            "--socket-path",
-            socket_path.to_str().unwrap(),
-            "--config",
-            missing.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("failed to read config"));
+    verify_case(
+        &missing,
+        "optional config unavailable; using defaults: failed to read config",
+    );
 
     let malformed = unique_temp_path("surf-ace-malformed-config", ".json");
-    fs::write(&malformed, "{").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_surf-ace-compositor"))
-        .env("SURF_ACE_HOST_RUNTIME_FORCE_FAIL", "1")
-        .args([
-            "serve",
-            "--runtime",
-            "host",
-            "--socket-path",
-            socket_path.to_str().unwrap(),
-            "--config",
-            malformed.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid config"));
+    fs::write(&malformed, "{").expect("malformed config should be written");
+    verify_case(
+        &malformed,
+        "optional config unavailable; using defaults: invalid config",
+    );
 
     let invalid_scale = unique_temp_path("surf-ace-invalid-scale", ".json");
-    fs::write(&invalid_scale, r#"{"root4":{"display_scale_factor":4.1}}"#).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_surf-ace-compositor"))
-        .env("SURF_ACE_HOST_RUNTIME_FORCE_FAIL", "1")
-        .args([
-            "serve",
-            "--runtime",
-            "host",
-            "--socket-path",
-            socket_path.to_str().unwrap(),
-            "--config",
-            invalid_scale.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid_display_scale"));
+    fs::write(&invalid_scale, r#"{"root4":{"display_scale_factor":4.1}}"#)
+        .expect("invalid-scale config should be written");
+    verify_case(
+        &invalid_scale,
+        "optional display config was rejected; using default display settings: invalid_display_scale",
+    );
 
     let _ = fs::remove_file(malformed);
     let _ = fs::remove_file(invalid_scale);
