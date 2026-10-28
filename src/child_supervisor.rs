@@ -1142,13 +1142,13 @@ mod tests {
 
     #[test]
     fn sanitizer_redacts_required_credential_shapes_and_preserves_safe_text() {
-        let record = "keep Authorization: Bearer t285-synthetic-secret url=https://alice:uri-password@example.test/path token='env secret value' end";
+        let record = "keep Authorization: Bearer sample-access-token url=https://alice:uri-password@example.test/path token='env secret value' end";
         let safe = sanitize_record(record, &[]);
         assert!(safe.contains("keep Authorization: Bearer [REDACTED]"));
         assert!(safe.contains("https://alice:[REDACTED]@example.test/path"));
         assert!(safe.contains("token='[REDACTED]'"));
         assert!(safe.contains("end"));
-        assert!(!safe.contains("t285-synthetic-secret"));
+        assert!(!safe.contains("sample-access-token"));
         assert!(!safe.contains("uri-password"));
         assert!(!safe.contains("env secret value"));
     }
