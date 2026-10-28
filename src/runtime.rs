@@ -12989,6 +12989,7 @@ mod tests {
             requested: mpsc::Sender<()>,
             completed: mpsc::Sender<u32>,
         },
+        ReadConfigure(mpsc::Sender<Option<(i32, i32)>>),
         CheckClose(mpsc::Sender<bool>),
         Finish,
     }
@@ -13201,6 +13202,14 @@ mod tests {
                             .send(client_state.close_received)
                             .expect("test must receive close-event result");
                     }
+                    RealShmToplevelCommand::ReadConfigure(result) => {
+                        queue
+                            .roundtrip(&mut client_state)
+                            .expect("surface fixture must receive configure events");
+                        result
+                            .send(client_state.toplevel_size)
+                            .expect("test must receive configure readback");
+                    }
                     RealShmToplevelCommand::Finish => break,
                 }
             }
@@ -13255,7 +13264,12 @@ mod tests {
                 .expect("fixture configure must flush");
             if assigned {
                 if let Ok((client_surface_id, configured_size)) = ready.try_recv() {
-                    assert_eq!(configured_size, Some((width, height)));
+                    let expected_size = if ordinary { (0, 0) } else { (width, height) };
+                    assert_eq!(
+                        configured_size,
+                        Some(expected_size),
+                        "fixture receives the main role size or an unresolved no-size hint"
+                    );
                     let surface = if ordinary {
                         wayland_state
                             .ordinary_toplevels
@@ -15679,10 +15693,20 @@ mod tests {
         let (surface_id, configured_size) = buffer_ready
             .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
             .expect("real client must submit and report its first buffer");
+        assert!(
+            configured_size.is_none_or(|size| size == (0, 0)),
+            "identity-unresolved surface receives no role-specific size hint"
+        );
+        let (configured_tx, configured_rx) = mpsc::channel();
+        client_commands
+            .send(RealShmToplevelCommand::ReadConfigure(configured_tx))
+            .expect("client must read the configure after pane identity is resolved");
         assert_eq!(
-            configured_size,
+            configured_rx
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .expect("resolved native pane must receive its role size"),
             Some((20, 10)),
-            "the scale-1 Wayland client receives pane logical dimensions"
+            "the scale-1 Wayland client receives pane logical dimensions after binding"
         );
         let pane_surface: WlSurface = server_client
             .object_from_protocol_id(&display_handle, surface_id)
@@ -17505,7 +17529,7 @@ mod tests {
                 .runtime
                 .last_diagnostic
                 .as_deref()
-                .is_some_and(|diagnostic| diagnostic.contains("additional main-app window"))
+                .is_some_and(|diagnostic| diagnostic.contains("surface identity is unresolved"))
         );
         assert_admission_client_not_closed(&mut display, &mut wayland_state, &commands);
         assert_admission_client_not_closed(&mut display, &mut wayland_state, &clients[0].0);
@@ -17656,7 +17680,7 @@ mod tests {
                 .runtime
                 .last_diagnostic
                 .as_deref()
-                .is_some_and(|diagnostic| diagnostic.contains("additional main-app window")),
+                .is_some_and(|diagnostic| diagnostic.contains("surface identity is unresolved")),
             "ordinary admission must retain its warning"
         );
 
