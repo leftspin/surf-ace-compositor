@@ -329,8 +329,7 @@ enum Command {
         #[arg(
             long,
             env = RUNTIME_ENV,
-            default_value = "auto",
-            value_parser = ["auto", "none", "winit", "host"]
+            default_value = "auto"
         )]
         runtime: String,
         #[arg(long, env = HOST_DRM_DEVICE_ENV)]
@@ -344,11 +343,7 @@ enum Command {
         presentation_measurements: bool,
         #[arg(long)]
         config: Option<PathBuf>,
-        #[arg(
-            long,
-            env = OUTPUT_ROTATION_ENV,
-            value_parser = ["deg0", "deg90", "deg180", "deg270"]
-        )]
+        #[arg(long, env = OUTPUT_ROTATION_ENV)]
         output_rotation: Option<String>,
         #[arg(long, env = OUTPUT_ROTATION_STATE_PATH_ENV)]
         output_rotation_state_path: Option<PathBuf>,
@@ -626,33 +621,37 @@ fn run_server(
     output_rotation_state_path: Option<PathBuf>,
     sun_schedule_node: Option<&str>,
 ) {
-    let root4_config = match config_path {
-        Some(path) => match fs::read_to_string(path)
-            .map_err(|err| format!("failed to read config {}: {err}", path.display()))
-            .and_then(|contents| {
-                serde_json::from_str::<serde_json::Value>(&contents)
-                    .map_err(|err| format!("invalid config {}: {err}", path.display()))
-            }) {
-            Ok(config) => Some(config),
-            Err(err) => {
-                eprintln!("{err}");
-                std::process::exit(2);
-            }
-        },
-        None => None,
-    };
+    let mut startup_warnings = Vec::new();
+    let (runtime, runtime_warning) = resolve_optional_runtime_mode(runtime);
+    if let Some(warning) = runtime_warning {
+        eprintln!("{warning}");
+        startup_warnings.push(warning.to_string());
+    }
+    let (root4_config, config_warning) = read_optional_root4_config(config_path);
+    if let Some(warning) = config_warning {
+        eprintln!("{warning}");
+        startup_warnings.push(warning);
+    }
     let launch_plan = resolve_runtime_launch_plan(runtime, detect_host_runtime_capable());
     let output_rotation_memory = output_rotation_state_path
         .or_else(OutputRotationMemory::default_path)
         .map(OutputRotationMemory::new);
-    let startup_output_rotation =
+    let (startup_output_rotation, output_rotation_warning, persist_output_rotation) =
         resolve_startup_output_rotation(output_rotation, output_rotation_memory.as_ref());
+    if let Some(warning) = output_rotation_warning {
+        eprintln!("{warning}");
+        startup_warnings.push(warning);
+    }
     let shell_overlay_toggle_shortcut =
         match parse_shell_overlay_toggle_shortcut(shell_overlay_toggle_shortcut) {
             Ok(shortcut) => shortcut,
             Err(err) => {
-                eprintln!("invalid shell overlay toggle shortcut: {err}");
-                std::process::exit(2);
+                let warning =
+                    format!("invalid optional shell overlay shortcut; using Super+`: {err}");
+                eprintln!("{warning}");
+                startup_warnings.push(warning);
+                parse_shell_overlay_toggle_shortcut("Super+`")
+                    .expect("the built-in shell overlay shortcut must be valid")
             }
         };
     let (main_app_launch_intent, main_app_launch_error) =
@@ -673,18 +672,15 @@ fn run_server(
                 (None, Some(error))
             }
         };
-    let mut state = match CompositorState::new_with_root4_config(
+    let (mut state, display_config_warning) = new_state_with_optional_root4_config(
         launch_plan.host_mode_active,
-        Box::new(LocalProcessController::default()),
         startup_output_rotation,
         root4_config.as_ref(),
-    ) {
-        Ok(state) => state,
-        Err(err) => {
-            eprintln!("{}", err.code());
-            std::process::exit(2);
-        }
-    };
+    );
+    if let Some(warning) = display_config_warning {
+        eprintln!("{warning}");
+        startup_warnings.push(warning);
+    }
     if let Some(memory) = output_rotation_memory {
         state.remember_output_rotation_with(memory);
     }
@@ -697,6 +693,9 @@ fn run_server(
         state.set_shell_overlay_toggle_shortcut(shell_overlay_toggle_shortcut.display_string());
         state.set_overlay_region_debug_borders(overlay_region_debug_borders);
         state.configure_shell_overlay_process(resolve_default_shell_overlay_process());
+        for warning in startup_warnings {
+            state.record_runtime_diagnostic(warning);
+        }
         if let Some(error) = main_app_launch_error {
             eprintln!("{error}");
             state.record_runtime_diagnostic(error);
@@ -729,61 +728,62 @@ fn run_server(
 
     let appearance_scheduler = match launch_plan.selected_runtime.as_str() {
         "none" => {
-            let listener = match bind_control_listener(&socket_path) {
-                Ok(listener) => listener,
-                Err(err) => {
-                    eprintln!("control server failed: {err}");
-                    std::process::exit(1);
-                }
-            };
+            let (listener, warning) =
+                initialize_optional_control(|| bind_control_listener(&socket_path));
+            if let Some(warning) = warning {
+                eprintln!("{warning}");
+                lock_shared_state(&shared_state).record_runtime_diagnostic(warning);
+            }
             let appearance_scheduler = start_appearance_scheduler(
                 shared_state.clone(),
                 sun_schedule_profile.clone(),
                 sun_schedule_discovery_error.clone(),
             );
-            persist_startup_output_rotation_if_explicit(&shared_state, output_rotation);
-            if let Err(err) = serve_listener_with_presentation_measurement_collector(
-                listener,
-                shared_state.clone(),
-                None,
-                screen_capture,
-                host_options.presentation_measurement_collector.clone(),
-            ) {
-                appearance_scheduler.stop();
-                eprintln!("control server failed: {err}");
-                std::process::exit(1);
+            persist_startup_output_rotation_if_explicit(&shared_state, persist_output_rotation);
+            if let Some(listener) = listener {
+                if let Err(err) = serve_listener_with_presentation_measurement_collector(
+                    listener,
+                    shared_state.clone(),
+                    None,
+                    screen_capture,
+                    host_options.presentation_measurement_collector.clone(),
+                ) {
+                    record_optional_control_failure(&shared_state, err);
+                }
             }
             appearance_scheduler
         }
         "winit" => {
-            let listener = match bind_control_listener(&socket_path) {
-                Ok(listener) => listener,
-                Err(err) => {
-                    eprintln!("control server failed: {err}");
-                    std::process::exit(1);
-                }
-            };
+            let (listener, warning) =
+                initialize_optional_control(|| bind_control_listener(&socket_path));
+            if let Some(warning) = warning {
+                eprintln!("{warning}");
+                lock_shared_state(&shared_state).record_runtime_diagnostic(warning);
+            }
             let appearance_scheduler = start_appearance_scheduler(
                 shared_state.clone(),
                 sun_schedule_profile.clone(),
                 sun_schedule_discovery_error.clone(),
             );
-            persist_startup_output_rotation_if_explicit(&shared_state, output_rotation);
-            let control_state = shared_state.clone();
-            let control_screen_capture = screen_capture.clone();
-            let control_presentation_measurement_collector =
-                host_options.presentation_measurement_collector.clone();
-            thread::spawn(move || {
-                if let Err(err) = serve_listener_with_presentation_measurement_collector(
-                    listener,
-                    control_state,
-                    None,
-                    control_screen_capture,
-                    control_presentation_measurement_collector,
-                ) {
-                    eprintln!("control server failed: {err}");
-                }
-            });
+            persist_startup_output_rotation_if_explicit(&shared_state, persist_output_rotation);
+            if let Some(listener) = listener {
+                let control_state = shared_state.clone();
+                let diagnostic_state = shared_state.clone();
+                let control_screen_capture = screen_capture.clone();
+                let control_presentation_measurement_collector =
+                    host_options.presentation_measurement_collector.clone();
+                thread::spawn(move || {
+                    if let Err(err) = serve_listener_with_presentation_measurement_collector(
+                        listener,
+                        control_state,
+                        None,
+                        control_screen_capture,
+                        control_presentation_measurement_collector,
+                    ) {
+                        record_optional_control_failure(&diagnostic_state, err);
+                    }
+                });
+            }
 
             if let Err(err) = run_winit(shared_state.clone()) {
                 appearance_scheduler.stop();
@@ -794,39 +794,41 @@ fn run_server(
         }
         "host" => {
             let auto_selected_host = runtime == "auto";
-            let listener = match bind_control_listener(&socket_path) {
-                Ok(listener) => listener,
-                Err(err) => {
-                    eprintln!("control server failed: {err}");
-                    std::process::exit(1);
-                }
-            };
+            let (listener, warning) =
+                initialize_optional_control(|| bind_control_listener(&socket_path));
+            if let Some(warning) = warning {
+                eprintln!("{warning}");
+                lock_shared_state(&shared_state).record_runtime_diagnostic(warning);
+            }
             let appearance_scheduler = start_appearance_scheduler(
                 shared_state.clone(),
                 sun_schedule_profile.clone(),
                 sun_schedule_discovery_error.clone(),
             );
-            persist_startup_output_rotation_if_explicit(&shared_state, output_rotation);
+            persist_startup_output_rotation_if_explicit(&shared_state, persist_output_rotation);
             let (runtime_control_tx, runtime_control_rx) = mpsc::channel::<RuntimeControlCommand>();
             if let Some(path) = config_path.map(Path::to_path_buf) {
-                spawn_root4_config_watcher(path, runtime_control_tx.clone());
+                spawn_root4_config_watcher(path, runtime_control_tx.clone(), shared_state.clone());
             }
             let runtime_control_rx = Arc::new(Mutex::new(runtime_control_rx));
-            let control_state = shared_state.clone();
-            let control_runtime_tx = runtime_control_tx.clone();
-            let control_screen_capture = screen_capture.clone();
-            let control_presentation_measurement_collector =
-                host_options.presentation_measurement_collector.clone();
-            let control_thread = thread::spawn(move || {
-                if let Err(err) = serve_listener_with_presentation_measurement_collector(
-                    listener,
-                    control_state,
-                    Some(control_runtime_tx),
-                    control_screen_capture,
-                    control_presentation_measurement_collector,
-                ) {
-                    eprintln!("control server failed: {err}");
-                }
+            let control_thread = listener.map(|listener| {
+                let control_state = shared_state.clone();
+                let diagnostic_state = shared_state.clone();
+                let control_runtime_tx = runtime_control_tx.clone();
+                let control_screen_capture = screen_capture.clone();
+                let control_presentation_measurement_collector =
+                    host_options.presentation_measurement_collector.clone();
+                thread::spawn(move || {
+                    if let Err(err) = serve_listener_with_presentation_measurement_collector(
+                        listener,
+                        control_state,
+                        Some(control_runtime_tx),
+                        control_screen_capture,
+                        control_presentation_measurement_collector,
+                    ) {
+                        record_optional_control_failure(&diagnostic_state, err);
+                    }
+                })
             });
 
             {
@@ -845,8 +847,9 @@ fn run_server(
                 std::process::exit(1);
             }
 
-            drop(runtime_control_tx);
-
+            // Keep the sender alive for the compositor lifetime. If the optional
+            // control listener fails, its sender clone drops, but that must not
+            // make the host loop treat the control channel as a shutdown signal.
             loop {
                 let command = {
                     let receiver = match runtime_control_rx.lock() {
@@ -892,10 +895,11 @@ fn run_server(
                 }
             }
 
-            if control_thread.join().is_err() {
-                appearance_scheduler.stop();
-                eprintln!("control server thread terminated unexpectedly");
-                std::process::exit(1);
+            if control_thread.is_some_and(|control_thread| control_thread.join().is_err()) {
+                record_optional_control_failure(
+                    &shared_state,
+                    "control thread terminated unexpectedly".to_string(),
+                );
             }
             appearance_scheduler
         }
@@ -908,7 +912,90 @@ fn run_server(
     appearance_scheduler.stop();
 }
 
-fn spawn_root4_config_watcher(path: PathBuf, runtime_control: mpsc::Sender<RuntimeControlCommand>) {
+fn lock_shared_state(
+    shared_state: &Arc<Mutex<CompositorState>>,
+) -> std::sync::MutexGuard<'_, CompositorState> {
+    match shared_state.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn initialize_optional_control<T>(
+    initialize: impl FnOnce() -> io::Result<T>,
+) -> (Option<T>, Option<String>) {
+    match initialize() {
+        Ok(value) => (Some(value), None),
+        Err(err) => (
+            None,
+            Some(format!(
+                "optional control service unavailable; continuing without control: {err}"
+            )),
+        ),
+    }
+}
+
+fn record_optional_control_failure(shared_state: &Arc<Mutex<CompositorState>>, error: String) {
+    let warning = format!("optional control service unavailable: {error}");
+    eprintln!("{warning}");
+    lock_shared_state(shared_state).record_runtime_diagnostic(warning);
+}
+
+fn new_state_with_optional_root4_config(
+    host_mode_active: bool,
+    output_rotation: OutputRotation,
+    config: Option<&serde_json::Value>,
+) -> (CompositorState, Option<String>) {
+    match CompositorState::new_with_root4_config(
+        host_mode_active,
+        Box::new(LocalProcessController::default()),
+        output_rotation,
+        config,
+    ) {
+        Ok(state) => (state, None),
+        Err(err) => {
+            let warning = format!(
+                "optional display config was rejected; using default display settings: {}",
+                err.code()
+            );
+            let state = CompositorState::new_with_root4_config(
+                host_mode_active,
+                Box::new(LocalProcessController::default()),
+                output_rotation,
+                None,
+            )
+            .expect("built-in display settings must initialize");
+            (state, Some(warning))
+        }
+    }
+}
+
+fn read_optional_root4_config(path: Option<&Path>) -> (Option<serde_json::Value>, Option<String>) {
+    let Some(path) = path else {
+        return (None, None);
+    };
+    let parsed = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read config {}: {err}", path.display()))
+        .and_then(|contents| {
+            serde_json::from_str::<serde_json::Value>(&contents)
+                .map_err(|err| format!("invalid config {}: {err}", path.display()))
+        });
+    match parsed {
+        Ok(config) => (Some(config), None),
+        Err(err) => (
+            None,
+            Some(format!(
+                "optional config unavailable; using defaults: {err}"
+            )),
+        ),
+    }
+}
+
+fn spawn_root4_config_watcher(
+    path: PathBuf,
+    runtime_control: mpsc::Sender<RuntimeControlCommand>,
+    shared_state: Arc<Mutex<CompositorState>>,
+) {
     thread::spawn(move || {
         let read_revision = || {
             let metadata = fs::metadata(&path).ok()?;
@@ -924,12 +1011,39 @@ fn spawn_root4_config_watcher(path: PathBuf, runtime_control: mpsc::Sender<Runti
                 continue;
             }
             observed.clone_from(&current);
-            let Some(contents) = current.and_then(|(_, _, bytes)| String::from_utf8(bytes).ok())
-            else {
+            let Some((_, _, bytes)) = current else {
+                let warning = format!(
+                    "optional config update unavailable at {}; retaining current display settings",
+                    path.display()
+                );
+                eprintln!("{warning}");
+                lock_shared_state(&shared_state).record_runtime_diagnostic(warning);
                 continue;
             };
-            let Ok((factor, source)) = resolve_root4_config_scale(&contents) else {
-                continue;
+            let contents = match String::from_utf8(bytes) {
+                Ok(contents) => contents,
+                Err(err) => {
+                    let warning = format!(
+                        "optional config update is not UTF-8 at {}; retaining current display settings: {err}",
+                        path.display()
+                    );
+                    eprintln!("{warning}");
+                    lock_shared_state(&shared_state).record_runtime_diagnostic(warning);
+                    continue;
+                }
+            };
+            let (factor, source) = match resolve_root4_config_scale(&contents) {
+                Ok(config) => config,
+                Err(err) => {
+                    let warning = format!(
+                        "optional config update was rejected at {}; retaining current display settings: {}",
+                        path.display(),
+                        err.code()
+                    );
+                    eprintln!("{warning}");
+                    lock_shared_state(&shared_state).record_runtime_diagnostic(warning);
+                    continue;
+                }
             };
             if runtime_control
                 .send(RuntimeControlCommand::Root4ConfigScaleSet { factor, source })
@@ -972,9 +1086,9 @@ fn resolve_root4_config_scale(
 
 fn persist_startup_output_rotation_if_explicit(
     shared_state: &Arc<Mutex<CompositorState>>,
-    output_rotation: Option<&str>,
+    output_rotation_was_validly_explicit: bool,
 ) {
-    if output_rotation.is_none() {
+    if !output_rotation_was_validly_explicit {
         return;
     }
     let state = match shared_state.lock() {
@@ -1024,6 +1138,16 @@ fn resolve_runtime_launch_plan(runtime: &str, host_runtime_capable: bool) -> Run
             selection_attempt: format!("forced runtime selection requested backend={forced}"),
             selection_result: format!("selected backend={forced}"),
         },
+    }
+}
+
+fn resolve_optional_runtime_mode(runtime: &str) -> (&str, Option<&'static str>) {
+    match runtime {
+        "auto" | "none" | "winit" | "host" => (runtime, None),
+        _ => (
+            "auto",
+            Some("unsupported optional runtime mode; using auto"),
+        ),
     }
 }
 
@@ -1320,29 +1444,43 @@ fn default_control_socket_path() -> PathBuf {
 fn resolve_startup_output_rotation(
     explicit_rotation: Option<&str>,
     memory: Option<&OutputRotationMemory>,
-) -> OutputRotation {
+) -> (OutputRotation, Option<String>, bool) {
     if let Some(rotation) = explicit_rotation {
         return match parse_output_rotation(rotation) {
-            Ok(rotation) => rotation,
+            Ok(rotation) => (rotation, None, true),
             Err(err) => {
-                eprintln!("{err}");
-                std::process::exit(2);
+                let (fallback, memory_warning) = load_remembered_output_rotation(memory);
+                let mut warning = format!(
+                    "invalid optional output rotation; using remembered/default rotation: {err}"
+                );
+                if let Some(memory_warning) = memory_warning {
+                    warning.push_str("; ");
+                    warning.push_str(&memory_warning);
+                }
+                (fallback, Some(warning), false)
             }
         };
     }
+    let (rotation, warning) = load_remembered_output_rotation(memory);
+    (rotation, warning, false)
+}
+
+fn load_remembered_output_rotation(
+    memory: Option<&OutputRotationMemory>,
+) -> (OutputRotation, Option<String>) {
     let Some(memory) = memory else {
-        return OutputRotation::Deg0;
+        return (OutputRotation::Deg0, None);
     };
     match memory.load() {
-        Ok(Some(rotation)) => rotation,
-        Ok(None) => OutputRotation::Deg0,
-        Err(err) => {
-            eprintln!(
-                "failed to load remembered output rotation from {}: {err}",
+        Ok(Some(rotation)) => (rotation, None),
+        Ok(None) => (OutputRotation::Deg0, None),
+        Err(err) => (
+            OutputRotation::Deg0,
+            Some(format!(
+                "failed to load remembered output rotation from {}; using default: {err}",
                 memory.path().display()
-            );
-            OutputRotation::Deg0
-        }
+            )),
+        ),
     }
 }
 
@@ -1407,15 +1545,16 @@ fn parse_output_rotation(value: &str) -> Result<OutputRotation, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, apply_appearance_inputs, parse_main_app_launch_intent,
-        parse_main_app_launch_shorthand, resolve_main_app_launch_intent,
-        resolve_root4_config_scale, resolve_runtime_launch_plan, resolve_startup_output_rotation,
-        spawn_root4_config_watcher,
+        Cli, Command, apply_appearance_inputs, initialize_optional_control,
+        new_state_with_optional_root4_config, parse_main_app_launch_intent,
+        parse_main_app_launch_shorthand, read_optional_root4_config,
+        resolve_main_app_launch_intent, resolve_optional_runtime_mode, resolve_root4_config_scale,
+        resolve_runtime_launch_plan, resolve_startup_output_rotation, spawn_root4_config_watcher,
     };
     use clap::Parser;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
     use surf_ace_compositor::control::RuntimeControlCommand;
@@ -1460,6 +1599,89 @@ mod tests {
             plan.selection_attempt,
             "auto runtime selection attempted backend=host"
         );
+    }
+
+    #[test]
+    fn unsupported_optional_runtime_mode_warns_and_defaults_to_auto() {
+        assert_eq!(resolve_optional_runtime_mode("host"), ("host", None));
+        assert_eq!(
+            resolve_optional_runtime_mode("unavailable-backend"),
+            (
+                "auto",
+                Some("unsupported optional runtime mode; using auto")
+            )
+        );
+        assert!(
+            Cli::try_parse_from([
+                "surf-ace-compositor",
+                "serve",
+                "--runtime",
+                "unavailable-backend"
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn optional_config_read_faults_warn_and_default_without_rejecting_valid_config() {
+        let path = temp_rotation_path().with_extension("optional-config.json");
+        assert_eq!(read_optional_root4_config(None), (None, None));
+
+        fs::write(&path, r#"{"root4":{"display_scale_factor":1.5}}"#).unwrap();
+        let (config, warning) = read_optional_root4_config(Some(&path));
+        assert_eq!(config.unwrap()["root4"]["display_scale_factor"], 1.5);
+        assert!(warning.is_none());
+
+        fs::write(&path, "{").unwrap();
+        let (config, warning) = read_optional_root4_config(Some(&path));
+        assert!(config.is_none());
+        assert!(
+            warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("using defaults"))
+        );
+
+        fs::remove_file(&path).unwrap();
+        let (config, warning) = read_optional_root4_config(Some(&path));
+        assert!(config.is_none());
+        assert!(
+            warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("using defaults"))
+        );
+    }
+
+    #[test]
+    fn semantically_invalid_optional_display_config_warns_and_uses_builtin_scale() {
+        let config = serde_json::json!({"root4": {"display_scale_factor": 0.5}});
+        let (state, warning) =
+            new_state_with_optional_root4_config(true, OutputRotation::Deg0, Some(&config));
+        assert!(
+            warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("using default display settings"))
+        );
+        let default_geometry = state
+            .prepare_initial_root4_geometry(1920, 1080)
+            .expect("built-in display settings must prepare");
+        assert_eq!(default_geometry.snapshot.scale_factor, 2.0);
+    }
+
+    #[test]
+    fn optional_control_initialization_fault_warns_without_failing_display_setup() {
+        let (control, warning) = initialize_optional_control::<()>(|| {
+            Err(std::io::Error::other("socket path unavailable"))
+        });
+        assert!(control.is_none());
+        assert!(
+            warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("continuing without control"))
+        );
+
+        let (control, warning) = initialize_optional_control(|| Ok("control ready"));
+        assert_eq!(control, Some("control ready"));
+        assert!(warning.is_none());
     }
 
     #[test]
@@ -1648,7 +1870,7 @@ mod tests {
 
         assert_eq!(
             resolve_startup_output_rotation(None, Some(&memory)),
-            OutputRotation::Deg90
+            (OutputRotation::Deg90, None, false)
         );
         let _ = std::fs::remove_file(memory.path());
     }
@@ -1662,8 +1884,27 @@ mod tests {
 
         assert_eq!(
             resolve_startup_output_rotation(Some("deg270"), Some(&memory)),
-            OutputRotation::Deg270
+            (OutputRotation::Deg270, None, true)
         );
+        let _ = std::fs::remove_file(memory.path());
+    }
+
+    #[test]
+    fn invalid_optional_output_rotation_warns_uses_remembered_default_and_is_not_persisted() {
+        let memory = OutputRotationMemory::new(temp_rotation_path());
+        memory
+            .store(OutputRotation::Deg90)
+            .expect("rotation should store");
+
+        let (rotation, warning, persist_explicit) =
+            resolve_startup_output_rotation(Some("invalid"), Some(&memory));
+        assert_eq!(rotation, OutputRotation::Deg90);
+        assert!(
+            warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("using remembered/default rotation"))
+        );
+        assert!(!persist_explicit);
         let _ = std::fs::remove_file(memory.path());
     }
 
@@ -1845,7 +2086,11 @@ mod tests {
         let path = temp_rotation_path().with_extension("root4.json");
         fs::write(&path, "{}").unwrap();
         let (tx, rx) = mpsc::channel();
-        spawn_root4_config_watcher(path.clone(), tx);
+        let shared_state = Arc::new(Mutex::new(CompositorState::new(
+            false,
+            Box::<LocalProcessController>::default(),
+        )));
+        spawn_root4_config_watcher(path.clone(), tx, Arc::clone(&shared_state));
         thread::sleep(std::time::Duration::from_millis(150));
         assert_eq!(
             fs::read(&path).unwrap(),
@@ -1882,6 +2127,14 @@ mod tests {
                 "invalid watched edit must not enqueue a partial generation: {invalid}"
             );
         }
+        assert!(
+            lock_test_state(&shared_state)
+                .status_snapshot()
+                .runtime
+                .last_diagnostic
+                .as_deref()
+                .is_some_and(|warning| warning.contains("retaining current display settings"))
+        );
 
         fs::write(&path, r#"{"root4":{"display_scale_factor":1.5}}"#).unwrap();
         assert!(matches!(
@@ -1895,6 +2148,14 @@ mod tests {
                 .is_err(),
             "an unreadable selected file must preserve the last valid scale"
         );
+        assert!(
+            lock_test_state(&shared_state)
+                .status_snapshot()
+                .runtime
+                .last_diagnostic
+                .as_deref()
+                .is_some_and(|warning| warning.contains("config update unavailable"))
+        );
         fs::write(&path, "{}").unwrap();
         assert!(matches!(
             rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
@@ -1904,5 +2165,13 @@ mod tests {
             }
         ));
         let _ = fs::remove_file(path);
+    }
+
+    fn lock_test_state(
+        state: &Arc<Mutex<CompositorState>>,
+    ) -> std::sync::MutexGuard<'_, CompositorState> {
+        state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
