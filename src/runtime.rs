@@ -135,6 +135,26 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 
+pub const RUNTIME_RECOVERY_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+pub fn retry_runtime_until_stopped<E>(
+    retry_delay: Duration,
+    mut run_attempt: impl FnMut() -> Result<(), E>,
+    mut on_failure: impl FnMut(&E),
+) {
+    loop {
+        match run_attempt() {
+            Ok(()) => return,
+            Err(error) => {
+                on_failure(&error);
+                if !retry_delay.is_zero() {
+                    std::thread::sleep(retry_delay);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct HostRuntimeOptions {
     pub forced_drm_path: Option<PathBuf>,
@@ -371,6 +391,17 @@ fn maybe_sleep_host_runtime_test_scripted_hold() {
     }
 }
 
+pub(crate) fn record_recovery_warning_if_changed(
+    shared_state: &Arc<Mutex<CompositorState>>,
+    warning: String,
+) {
+    let mut state = lock_state(shared_state);
+    if state.status_snapshot().runtime.last_diagnostic.as_deref() != Some(warning.as_str()) {
+        eprintln!("{warning}");
+        state.record_runtime_diagnostic(warning);
+    }
+}
+
 fn run_host_test_scripted_running(
     shared_state: Arc<Mutex<CompositorState>>,
 ) -> Result<(), RuntimeError> {
@@ -449,8 +480,13 @@ pub fn run_winit(shared_state: Arc<Mutex<CompositorState>>) -> Result<(), Runtim
                 // Safety: display is pinned in this event source for the runtime lifetime.
                 let dispatch_result =
                     unsafe { display.get_mut().dispatch_clients(&mut data.wayland_state) };
-                if dispatch_result.is_err() {
-                    data.loop_signal.stop();
+                if let Err(err) = dispatch_result {
+                    record_recovery_warning_if_changed(
+                        &data.shared_state,
+                        format!(
+                            "Wayland client dispatch failed; retaining the compositor and retrying: {err}"
+                        ),
+                    );
                 }
                 Ok(PostAction::Continue)
             },
@@ -462,16 +498,6 @@ pub fn run_winit(shared_state: Arc<Mutex<CompositorState>>) -> Result<(), Runtim
     let size = backend.window_size();
     wayland_state.reconfigure_roles(size.w, size.h);
     wayland_state.sync_runtime_status_with_roles();
-
-    {
-        let mut state = lock_state(&shared_state);
-        state.mark_runtime_running(
-            RuntimeBackend::Winit,
-            Some(socket_name.clone()),
-            size.w,
-            size.h,
-        );
-    }
 
     backend.window().request_redraw();
 
@@ -568,9 +594,14 @@ pub fn run_winit(shared_state: Arc<Mutex<CompositorState>>) -> Result<(), Runtim
                         backend.window().request_redraw();
                     }
                     Err(err) => {
-                        let mut state = lock_state(&data.shared_state);
-                        state.mark_runtime_failed(err);
-                        data.loop_signal.stop();
+                        record_recovery_warning_if_changed(
+                            &data.shared_state,
+                            format!(
+                                "winit presentation failed; retaining the last displayed frame and retrying: {err}"
+                            ),
+                        );
+                        std::thread::sleep(RUNTIME_RECOVERY_RETRY_DELAY);
+                        backend.window().request_redraw();
                     }
                 }
             }
@@ -592,13 +623,36 @@ pub fn run_winit(shared_state: Arc<Mutex<CompositorState>>) -> Result<(), Runtim
         wayland_state,
     };
 
-    let run_result = event_loop.run(None, &mut runtime_data, |_| {});
+    {
+        let mut state = lock_state(&runtime_data.shared_state);
+        state.mark_runtime_running(
+            RuntimeBackend::Winit,
+            Some(socket_name.clone()),
+            size.w,
+            size.h,
+        );
+    }
+
+    retry_runtime_until_stopped(
+        RUNTIME_RECOVERY_RETRY_DELAY,
+        || {
+            event_loop
+                .run(None, &mut runtime_data, |_| {})
+                .map_err(|err| err.to_string())
+        },
+        |err| {
+            record_recovery_warning_if_changed(
+                &runtime_data.shared_state,
+                format!(
+                    "winit event loop failed; retaining clients and the last displayed frame while retrying: {err}"
+                ),
+            );
+        },
+    );
 
     {
         let mut state = lock_state(&runtime_data.shared_state);
-        if run_result.is_err() {
-            state.mark_runtime_failed("calloop runtime loop failed");
-        } else if !matches!(
+        if !matches!(
             state.status_snapshot().runtime.phase,
             crate::model::RuntimePhase::Failed
         ) {
@@ -606,7 +660,6 @@ pub fn run_winit(shared_state: Arc<Mutex<CompositorState>>) -> Result<(), Runtim
         }
     }
 
-    run_result.map_err(|err| RuntimeError::Loop(err.to_string()))?;
     Ok(())
 }
 
@@ -661,7 +714,6 @@ pub fn run_host_with_control(
 
     let mut event_loop: EventLoop<HostRuntimeLoopData> =
         EventLoop::try_new().map_err(|err| RuntimeError::EventLoop(err.to_string()))?;
-    let loop_signal = event_loop.get_signal();
     let loop_handle = event_loop.handle();
 
     let listening_socket = ListeningSocketSource::new_auto()
@@ -791,8 +843,13 @@ pub fn run_host_with_control(
                 // Safety: display is pinned in this event source for the runtime lifetime.
                 let dispatch_result =
                     unsafe { display.get_mut().dispatch_clients(&mut data.wayland_state) };
-                if dispatch_result.is_err() {
-                    data.loop_signal.stop();
+                if let Err(err) = dispatch_result {
+                    record_recovery_warning_if_changed(
+                        &data.shared_state,
+                        format!(
+                            "Wayland client dispatch failed; retaining the compositor and retrying: {err}"
+                        ),
+                    );
                 }
                 Ok(PostAction::Continue)
             },
@@ -830,31 +887,6 @@ pub fn run_host_with_control(
         .map_err(|err| RuntimeError::RegisterSource(err.to_string()))?;
     wayland_state.reconfigure_roles(mode_w as i32, mode_h as i32);
     wayland_state.sync_runtime_status_with_roles();
-    {
-        let (active_connector_name, active_connector_id) = host_backend.active_connector_status();
-        let (last_selection_attempt, last_selection_result) = host_backend.selection_logs();
-        let rotation = { lock_state(&shared_state).output_rotation() };
-        let (ownership, atomic_enabled, overlay_capable) =
-            runtime_host_present_capabilities_for_status(&host_backend, rotation);
-        let mut state = lock_state(&shared_state);
-        state.mark_runtime_host_running(
-            socket_name.clone(),
-            mode_w as i32,
-            mode_h as i32,
-            Some(host_backend.seat_name.clone()),
-            host_backend.detected_count(),
-            host_backend.opened_count(),
-            host_backend.primary_opened_path(),
-            active_connector_name,
-            active_connector_id,
-            last_selection_attempt,
-            last_selection_result,
-            ownership,
-            atomic_enabled,
-            overlay_capable,
-        );
-    }
-
     let drm_events_source_token = Rc::new(RefCell::new(RegisteredDrmEventSource::default()));
     bind_claimed_drm_event_source(
         &loop_handle,
@@ -981,13 +1013,12 @@ pub fn run_host_with_control(
                         }
                         return TimeoutAction::ToDuration(Duration::from_millis(16));
                     }
-                    let mut state = lock_state(&data.shared_state);
-                    state.mark_runtime_failed(format!(
-                        "failed while queuing host presentation frame: {}",
-                        failure.into_error()
-                    ));
-                    data.loop_signal.stop();
-                    return TimeoutAction::Drop;
+                    let error = failure.into_error();
+                    mark_host_output_lost_for_recovery(
+                        data,
+                        format!("failed while queuing host presentation frame: {error}"),
+                    );
+                    return TimeoutAction::ToDuration(RUNTIME_RECOVERY_RETRY_DELAY);
                 }
             }
             TimeoutAction::ToDuration(Duration::from_millis(16))
@@ -1096,7 +1127,6 @@ pub fn run_host_with_control(
     let mut runtime_data = HostRuntimeLoopData {
         shared_state,
         display_handle,
-        loop_signal,
         wayland_state,
         host_backend,
         session_active: true,
@@ -1109,13 +1139,53 @@ pub fn run_host_with_control(
         root_geometry_stage_failure: None,
     };
 
-    let run_result = event_loop.run(None, &mut runtime_data, |_| {});
+    let (active_connector_name, active_connector_id) =
+        runtime_data.host_backend.active_connector_status();
+    let (last_selection_attempt, last_selection_result) =
+        runtime_data.host_backend.selection_logs();
+    let rotation = { lock_state(&runtime_data.shared_state).output_rotation() };
+    let (ownership, atomic_enabled, overlay_capable) =
+        runtime_host_present_capabilities_for_status(&runtime_data.host_backend, rotation);
+    lock_state(&runtime_data.shared_state).mark_runtime_host_running(
+        socket_name.clone(),
+        mode_w as i32,
+        mode_h as i32,
+        Some(runtime_data.host_backend.seat_name.clone()),
+        runtime_data.host_backend.detected_count(),
+        runtime_data.host_backend.opened_count(),
+        runtime_data.host_backend.primary_opened_path(),
+        active_connector_name,
+        active_connector_id,
+        last_selection_attempt,
+        last_selection_result,
+        ownership,
+        atomic_enabled,
+        overlay_capable,
+    );
+
+    retry_runtime_until_stopped(
+        RUNTIME_RECOVERY_RETRY_DELAY,
+        || {
+            event_loop
+                .run(None, &mut runtime_data, |_| {})
+                .map_err(|err| err.to_string())
+        },
+        |err| {
+            let old_token = drm_events_source_token.borrow_mut().token.take();
+            drm_events_source_token.borrow_mut().device_id = None;
+            if let Some(old_token) = old_token {
+                loop_handle.remove(old_token);
+            }
+            mark_host_output_lost_for_recovery(
+                &mut runtime_data,
+                format!("calloop host runtime loop failed: {err}"),
+            );
+        },
+    );
 
     {
         let mut state = lock_state(&runtime_data.shared_state);
-        if run_result.is_err() {
-            state.mark_runtime_failed("calloop runtime loop failed");
-        } else if !matches!(
+        if !matches!(
             state.status_snapshot().runtime.phase,
             crate::model::RuntimePhase::Failed
         ) {
@@ -1123,14 +1193,12 @@ pub fn run_host_with_control(
         }
     }
 
-    run_result.map_err(|err| RuntimeError::Loop(err.to_string()))?;
     Ok(())
 }
 
 struct HostRuntimeLoopData {
     shared_state: Arc<Mutex<CompositorState>>,
     display_handle: DisplayHandle,
-    loop_signal: LoopSignal,
     wayland_state: RuntimeWaylandState,
     host_backend: HostBackendState,
     session_active: bool,
@@ -1936,6 +2004,13 @@ fn mark_host_output_reclaim_pending(data: &mut HostRuntimeLoopData, error: Strin
     state.mark_runtime_host_output_reclaim_pending(error);
 }
 
+fn mark_host_output_lost_for_recovery(data: &mut HostRuntimeLoopData, error: String) {
+    data.host_backend.mark_claim_lost();
+    sync_runtime_host_present_capabilities(&data.shared_state, &data.host_backend);
+    data.wayland_state.sync_dmabuf_protocol_formats(None);
+    mark_host_output_reclaim_pending(data, error);
+}
+
 fn bind_claimed_drm_event_source(
     loop_handle: &LoopHandle<'_, HostRuntimeLoopData>,
     drm_events_fd: OwnedFd,
@@ -2024,12 +2099,11 @@ fn bind_claimed_drm_event_source(
                             RegisteredDrmEventSource::default();
                         return Ok(PostAction::Remove);
                     }
-                    let mut state = lock_state(&data.shared_state);
-                    state.mark_runtime_failed(format!(
-                        "failed while processing host presentation events: {}",
-                        failure.into_error()
-                    ));
-                    data.loop_signal.stop();
+                    let error = failure.into_error();
+                    mark_host_output_lost_for_recovery(
+                        data,
+                        format!("failed while processing host presentation events: {error}"),
+                    );
                     *token_state_for_cb.borrow_mut() = RegisteredDrmEventSource::default();
                     return Ok(PostAction::Remove);
                 }
@@ -8830,9 +8904,7 @@ impl RuntimeWaylandState {
         {
             self.ordinary_keyboard_focus = None;
         }
-        self.ordinary_toplevels
-            .retain(|ordinary| surface_key(ordinary.wl_surface()) != surface_id);
-        self.unresolved_toplevels.remove(&surface_id);
+        self.remove_surface_from_unresolved_tracking(&surface);
         self.enforce_main_app_binding_policy();
         match classification {
             SurfaceClassification::MainApp => self.assign_main_role(surface),
@@ -8931,16 +9003,7 @@ impl RuntimeWaylandState {
                 );
                 return;
             }
-            let pane_id_for_role = pane_id.clone();
-            self.configure_native_pane_accessory(&surface, &pane_id);
-            self.native_pane_accessories
-                .push(ManagedNativePaneToplevel {
-                    surface,
-                    pane_id,
-                    mapped: false,
-                });
-            self.sync_native_pane_group_focus_status(&pane_id_for_role);
-            self.sync_runtime_status_with_roles();
+            self.assign_native_pane_accessory_or_retain_unresolved(surface, pane_id);
             return;
         }
 
@@ -9060,6 +9123,13 @@ impl RuntimeWaylandState {
     }
 
     fn retain_unresolved_toplevel(&mut self, surface: ToplevelSurface) {
+        self.retain_unresolved_toplevel_with_reason(
+            surface,
+            "surface identity is unresolved; retained visibly without pane binding",
+        );
+    }
+
+    fn retain_unresolved_toplevel_with_reason(&mut self, surface: ToplevelSurface, reason: &str) {
         let id = surface_key(surface.wl_surface());
         if !self
             .ordinary_toplevels
@@ -9077,10 +9147,25 @@ impl RuntimeWaylandState {
         }
         if self.unresolved_toplevels.insert(id) {
             self.configure_toplevel_with_current_role(&surface);
-            let diagnostic =
-                "surface identity is unresolved; retained visibly without pane binding".to_string();
+            let diagnostic = reason.to_string();
             eprintln!("surface admission warning: {diagnostic}");
             lock_state(&self.shared_state).record_runtime_diagnostic(diagnostic);
+        }
+    }
+
+    fn remove_surface_from_unresolved_tracking(&mut self, surface: &ToplevelSurface) {
+        let id = surface_key(surface.wl_surface());
+        self.pending_toplevels
+            .retain(|pending| surface_key(pending.wl_surface()) != id);
+        self.ordinary_toplevels
+            .retain(|ordinary| surface_key(ordinary.wl_surface()) != id);
+        self.unresolved_toplevels.remove(&id);
+        if self
+            .ordinary_keyboard_focus
+            .as_ref()
+            .is_some_and(|(focused, _)| surface_key(focused) == id)
+        {
+            self.ordinary_keyboard_focus = None;
         }
     }
 
@@ -9088,14 +9173,9 @@ impl RuntimeWaylandState {
         let mut pending = std::mem::take(&mut self.pending_toplevels);
         for surface in pending.drain(..) {
             match self.classify_toplevel(&surface) {
-                SurfaceClassification::MainApp => self.assign_main_role(surface),
-                SurfaceClassification::NativePane {
-                    pane_id,
-                    launch_pid,
-                } => self.assign_native_pane_role(surface, pane_id, launch_pid),
-                SurfaceClassification::OverlayCandidate => {
-                    self.assign_overlay_role_or_queue(surface)
-                }
+                SurfaceClassification::MainApp
+                | SurfaceClassification::NativePane { .. }
+                | SurfaceClassification::OverlayCandidate => self.assign_toplevel_role(surface),
                 SurfaceClassification::PendingIdentity => self.retain_unresolved_toplevel(surface),
             }
         }
@@ -9774,9 +9854,11 @@ impl RuntimeWaylandState {
         let _ = surface.send_pending_configure();
     }
 
-    fn configure_native_pane_accessory(&self, surface: &ToplevelSurface, pane_id: &PaneId) {
-        let pane_rect = self
-            .presentation_root_geometry
+    fn native_pane_accessory_anchor_rect(
+        &self,
+        pane_id: &PaneId,
+    ) -> Option<Rectangle<i32, Logical>> {
+        self.presentation_root_geometry
             .as_ref()
             .or(self.staged_root_geometry.as_ref())
             .and_then(|root| {
@@ -9786,10 +9868,12 @@ impl RuntimeWaylandState {
                     .find(|pane| &pane.id == pane_id)
                     .map(|pane| rectangle_from_pane_geometry(pane.geometry))
             })
-            .or_else(|| self.native_pane_rect(pane_id));
-        let Some(pane_rect) = pane_rect else {
-            surface.send_close();
-            return;
+            .or_else(|| self.native_pane_rect(pane_id))
+    }
+
+    fn configure_native_pane_accessory(&self, surface: &ToplevelSurface, pane_id: &PaneId) -> bool {
+        let Some(pane_rect) = self.native_pane_accessory_anchor_rect(pane_id) else {
+            return false;
         };
         let output = self.runtime_output_size();
         let width = ((pane_rect.size.w as f64 * 1.4).ceil() as i32)
@@ -9804,6 +9888,76 @@ impl RuntimeWaylandState {
             pending.size = Some((width, height).into());
         });
         let _ = surface.send_pending_configure();
+        true
+    }
+
+    fn assign_native_pane_accessory_or_retain_unresolved(
+        &mut self,
+        surface: ToplevelSurface,
+        pane_id: PaneId,
+    ) {
+        if !self.configure_native_pane_accessory(&surface, &pane_id) {
+            self.retain_unresolved_toplevel_with_reason(
+                surface,
+                "native pane accessory geometry is unavailable; retained visibly without pane binding",
+            );
+            return;
+        }
+        self.native_pane_accessories
+            .push(ManagedNativePaneToplevel {
+                surface,
+                pane_id: pane_id.clone(),
+                mapped: false,
+            });
+        self.sync_native_pane_group_focus_status(&pane_id);
+        self.sync_runtime_status_with_roles();
+    }
+
+    fn move_accessories_without_geometry_to_unresolved(&mut self) {
+        let accessories = std::mem::take(&mut self.native_pane_accessories);
+        for accessory in accessories {
+            if self
+                .native_pane_accessory_anchor_rect(&accessory.pane_id)
+                .is_some()
+            {
+                self.native_pane_accessories.push(accessory);
+            } else {
+                self.native_pane_focus_history
+                    .get_mut(&accessory.pane_id)
+                    .map(|history| {
+                        history.retain(|window_id| {
+                            window_id != &surface_id(accessory.surface.wl_surface()).to_string()
+                        })
+                    });
+                if self
+                    .native_pane_focused_surfaces
+                    .get(&accessory.pane_id)
+                    .is_some_and(|focused| {
+                        focused == &surface_id(accessory.surface.wl_surface()).to_string()
+                    })
+                {
+                    self.native_pane_focused_surfaces.remove(&accessory.pane_id);
+                }
+                if self
+                    .seat
+                    .get_keyboard()
+                    .and_then(|keyboard| keyboard.current_focus())
+                    .is_some_and(|focused| same_surface(&focused, accessory.surface.wl_surface()))
+                {
+                    let requested_target = lock_state(&self.shared_state)
+                        .status_snapshot()
+                        .runtime
+                        .active_focus_target;
+                    self.ordinary_keyboard_focus =
+                        Some((accessory.surface.wl_surface().clone(), requested_target));
+                }
+                self.sync_native_pane_group_focus_status(&accessory.pane_id);
+                self.retain_unresolved_toplevel_with_reason(
+                    accessory.surface,
+                    "native pane accessory geometry became unavailable; retained visibly without pane binding",
+                );
+            }
+        }
     }
 
     fn configure_toplevel_with_current_role(&self, surface: &ToplevelSurface) {
@@ -9835,7 +9989,8 @@ impl RuntimeWaylandState {
         self.stage_role_configures();
     }
 
-    fn stage_role_configures(&self) {
+    fn stage_role_configures(&mut self) {
+        self.move_accessories_without_geometry_to_unresolved();
         if let Some(main) = &self.main_toplevel {
             self.configure_toplevel_for_role(main, RuntimeSurfaceRole::MainApp);
         }
@@ -12315,7 +12470,7 @@ mod tests {
         ClaimedHostOutput, ClaimedPresentationPipeline, GLES_INTERMEDIATE_RENDER_FORMAT,
         HostBackendState, HostRuntimeLoopData, OpenedHostDevice, OutputIdentity, PlaneSelection,
         RoleSurfaceMapping, Root4ConsumerStage,
-        mark_host_output_reclaim_pending,
+        mark_host_output_lost_for_recovery, mark_host_output_reclaim_pending,
         PresentationToken, RuntimeGeometryMutation, RootGeometryStageStore,
         RuntimeGeometryMutationQueue, RuntimeSurfaceRole, RuntimeWaylandState,
         RegisteredDrmEventSource, ShellOverlayToggleShortcut, StartupPresentOwnership,
@@ -12333,6 +12488,7 @@ mod tests {
         render_output_size_before_transform, scene_texture_transform, screen_capture_src_flipped,
         render_elements_to_texture,
         same_surface,
+        retry_runtime_until_stopped,
         surface_id,
         surface_key,
         composite_scene_texture_to_physical_scanout,
@@ -12345,9 +12501,10 @@ mod tests {
     };
     use crate::output_rotation_model::OutputRotationModel;
     use crate::model::{
-        CompositorOverlayKind, NativePaneHostRequest, NativeTargetClass, OutputRotation,
-        OverlayCaptureCapability, OverlayRect, OverlayRegionStatus, PaneGeometry,
-        PaneGeometryCoordinateSpace, PaneId, ProcessSpec, RuntimeFocusTarget,
+        CompositorOverlayKind, MainAppLaunchIntent, MainAppSurfaceBinding,
+        NativePaneHostRequest, NativeTargetClass, OutputRotation, OverlayCaptureCapability,
+        OverlayRect, OverlayRegionStatus, PaneGeometry, PaneGeometryCoordinateSpace, PaneId,
+        ProcessSpec, RuntimeFocusTarget,
     };
     use crate::process_manager::{
         ProcessController, ProcessControllerEvent, ProcessRequestId,
@@ -13293,6 +13450,415 @@ mod tests {
         }
     }
 
+    fn take_unresolved_real_toplevel(
+        display: &mut Display<RuntimeWaylandState>,
+        wayland: &mut RuntimeWaylandState,
+        width: i32,
+        height: i32,
+    ) -> (
+        ToplevelSurface,
+        WlSurface,
+        mpsc::Sender<RealShmToplevelCommand>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (server_socket, client_socket) = UnixStream::pair().expect("socket pair must create");
+        let server_client = display
+            .handle()
+            .insert_client(
+                server_socket,
+                Arc::new(super::RuntimeClientState::default()),
+            )
+            .expect("fixture client must insert");
+        let (ready, commands, thread) = spawn_real_shm_toplevel(
+            client_socket,
+            width,
+            height,
+            RealShmPattern::Solid([0x30, 0x50, 0x70, 0xff]),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut retained = None;
+        let mut ready_ids = None;
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "identity-less fixture must become an unresolved visible toplevel"
+            );
+            display
+                .dispatch_clients(wayland)
+                .expect("fixture requests must dispatch");
+            if retained.is_none() && !wayland.pending_toplevels.is_empty() {
+                let surface = wayland.pending_toplevels[0].clone();
+                wayland.assign_toplevel_role(surface.clone());
+                retained = Some(surface);
+            }
+            display
+                .flush_clients()
+                .expect("fixture configure must flush");
+            if ready_ids.is_none() {
+                ready_ids = ready.try_recv().ok();
+            }
+            if let (Some(toplevel), Some((client_surface_id, configured_size))) =
+                (retained.as_ref(), ready_ids)
+            {
+                assert!(
+                    configured_size.is_none_or(|size| size == (0, 0)),
+                    "unresolved fixture receives no role-specific size"
+                );
+                let surface: WlSurface = server_client
+                    .object_from_protocol_id(&display.handle(), client_surface_id)
+                    .expect("fixture must resolve the server-side surface");
+                display
+                    .dispatch_clients(wayland)
+                    .expect("fixture buffer commit must dispatch");
+                display
+                    .flush_clients()
+                    .expect("fixture buffer response must flush");
+                assert!(
+                    wayland
+                        .unresolved_toplevels
+                        .contains(&surface_key(&surface))
+                );
+                return (toplevel.clone(), surface, commands, thread);
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn promoted_main_app_leaves_unresolved_tracking_and_ordinary_hit_test() {
+        let pid = std::process::id();
+        let mut state = CompositorState::new(
+            true,
+            Box::new(NoopProcessController {
+                spawn_pid: Some(pid),
+                ..Default::default()
+            }),
+        );
+        state.mark_runtime_resize(320, 200);
+        state.mark_runtime_running(
+            crate::model::RuntimeBackend::HostDrm,
+            Some("wayland-main-promotion".to_string()),
+            320,
+            200,
+        );
+        state.set_runtime_focus_target(Some(RuntimeFocusTarget::MainApp));
+        let shared_state = Arc::new(Mutex::new(state));
+        let mut display: Display<RuntimeWaylandState> = Display::new().unwrap();
+        let mut wayland =
+            RuntimeWaylandState::new(display.handle(), Arc::clone(&shared_state)).unwrap();
+        let (toplevel, surface, commands, client_thread) =
+            take_unresolved_real_toplevel(&mut display, &mut wayland, 80, 48);
+        let id = surface_key(&surface);
+        assert!(wayland.unresolved_toplevels.contains(&id));
+        assert!(
+            wayland
+                .ordinary_toplevels
+                .iter()
+                .any(|ordinary| { same_surface(ordinary.wl_surface(), &surface) })
+        );
+
+        let ordinary_index = wayland
+            .ordinary_toplevels
+            .iter()
+            .position(|ordinary| same_surface(ordinary.wl_surface(), &surface))
+            .unwrap();
+        let ordinary_rect = wayland
+            .ordinary_toplevel_rect(ordinary_index, &wayland.ordinary_toplevels[ordinary_index]);
+        let click = (
+            ordinary_rect.loc.x as f64 + ordinary_rect.size.w as f64 / 2.0,
+            ordinary_rect.loc.y as f64 + ordinary_rect.size.h as f64 / 2.0,
+        )
+            .into();
+        wayland.forward_pointer_motion(click, 10);
+        wayland.forward_pointer_button(0x110, ButtonState::Pressed, 11);
+        wayland.apply_focus_route();
+
+        lock_state(&shared_state)
+            .select_main_app_launch_intent(MainAppLaunchIntent {
+                process: ProcessSpec {
+                    command: "fixture-main-app".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: Default::default(),
+                },
+                binding: MainAppSurfaceBinding::AppId {
+                    app_id: "fixture-main-app".to_string(),
+                },
+            })
+            .unwrap();
+        wayland.promote_pending_toplevels();
+
+        assert!(
+            wayland
+                .main_toplevel
+                .as_ref()
+                .is_some_and(|main| same_surface(main.wl_surface(), &surface))
+        );
+        assert!(!wayland.unresolved_toplevels.contains(&id));
+        assert!(
+            !wayland
+                .pending_toplevels
+                .iter()
+                .any(|pending| { same_surface(pending.wl_surface(), &surface) })
+        );
+        assert!(
+            !wayland
+                .ordinary_toplevels
+                .iter()
+                .any(|ordinary| { same_surface(ordinary.wl_surface(), &surface) })
+        );
+        assert!(wayland.ordinary_keyboard_focus.is_none());
+
+        let mut renderer = surfaceless_test_renderer();
+        let rendered = wayland.collect_render_elements(&mut renderer, 320, 200);
+        assert!(rendered.failure.is_none());
+        assert!(rendered.counts.main > 0);
+        assert_eq!(rendered.counts.ordinary_toplevels, 0);
+        let status = lock_state(&shared_state).status_snapshot();
+        let hit = wayland
+            .surface_under_point_for_capture(click, OverlayCaptureCapability::PointerHover, &status)
+            .expect("the promoted main surface must remain hit-testable");
+        assert!(same_surface(&hit.0, &surface));
+        let keyboard = wayland.seat.get_keyboard().unwrap();
+        assert!(
+            keyboard
+                .current_focus()
+                .as_ref()
+                .is_some_and(|focused| same_surface(focused, &surface))
+        );
+        assert_eq!(
+            status.runtime.active_focus_target,
+            Some(RuntimeFocusTarget::MainApp)
+        );
+
+        commands.send(RealShmToplevelCommand::Finish).unwrap();
+        client_thread.join().unwrap();
+        let _ = toplevel;
+    }
+
+    #[test]
+    fn promoted_native_pane_leaves_unresolved_tracking_and_ordinary_hit_test() {
+        let pid = std::process::id();
+        let pane_id = PaneId::new("promotion-pane");
+        let mut state = CompositorState::new(
+            true,
+            Box::new(NoopProcessController {
+                spawn_pid: Some(pid),
+                ..Default::default()
+            }),
+        );
+        state.mark_runtime_resize(320, 200);
+        state.mark_runtime_running(
+            crate::model::RuntimeBackend::HostDrm,
+            Some("wayland-pane-promotion".to_string()),
+            320,
+            200,
+        );
+        state.set_runtime_focus_target(Some(RuntimeFocusTarget::NativePane {
+            pane_id: pane_id.clone(),
+        }));
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
+                id: pane_id.clone(),
+                content_id: Some("promotion-content".to_string()),
+                binding_id: Some("promotion-binding".to_string()),
+                launch_token: None,
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 20.0,
+                    y: 20.0,
+                    width: 80.0,
+                    height: 48.0,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+                target: NativeTargetClass::Terminal,
+                process: ProcessSpec {
+                    command: "fixture-native-pane".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: Default::default(),
+                },
+            }])
+            .unwrap();
+        let shared_state = Arc::new(Mutex::new(state));
+        let mut display: Display<RuntimeWaylandState> = Display::new().unwrap();
+        let mut wayland =
+            RuntimeWaylandState::new(display.handle(), Arc::clone(&shared_state)).unwrap();
+        let (toplevel, surface, commands, client_thread) =
+            take_unresolved_real_toplevel(&mut display, &mut wayland, 80, 48);
+        let id = surface_key(&surface);
+        assert!(wayland.unresolved_toplevels.contains(&id));
+        assert!(
+            wayland
+                .ordinary_toplevels
+                .iter()
+                .any(|ordinary| { same_surface(ordinary.wl_surface(), &surface) })
+        );
+
+        lock_state(&shared_state)
+            .launch_native_pane_hosts(vec![pane_id.clone()])
+            .unwrap();
+        wayland.promote_pending_toplevels();
+
+        assert!(
+            wayland
+                .native_pane_toplevels
+                .get(&pane_id)
+                .is_some_and(|native| same_surface(native.wl_surface(), &surface))
+        );
+        assert!(!wayland.unresolved_toplevels.contains(&id));
+        assert!(
+            !wayland
+                .pending_toplevels
+                .iter()
+                .any(|pending| { same_surface(pending.wl_surface(), &surface) })
+        );
+        assert!(
+            !wayland
+                .ordinary_toplevels
+                .iter()
+                .any(|ordinary| { same_surface(ordinary.wl_surface(), &surface) })
+        );
+
+        commands
+            .send(RealShmToplevelCommand::ReplaceBuffer {
+                width: 80,
+                height: 48,
+                pattern: RealShmPattern::Solid([0x40, 0x60, 0x80, 0xff]),
+                buffer_scale: 1,
+                wait_for_configure: false,
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !wayland
+            .host_surface_buffers
+            .get(&id)
+            .is_some_and(|buffer| buffer.root_geometry_generation.is_some())
+        {
+            assert!(std::time::Instant::now() < deadline);
+            display.dispatch_clients(&mut wayland).unwrap();
+            display.flush_clients().unwrap();
+            std::thread::yield_now();
+        }
+        let mut renderer = surfaceless_test_renderer();
+        let rendered = wayland.collect_render_elements(&mut renderer, 320, 200);
+        assert!(rendered.failure.is_none());
+        assert!(rendered.counts.native_panes > 0);
+        assert_eq!(rendered.counts.ordinary_toplevels, 0);
+        let status = lock_state(&shared_state).status_snapshot();
+        let pane_rect = wayland.native_pane_rect(&pane_id).unwrap();
+        let center = (
+            pane_rect.loc.x as f64 + pane_rect.size.w as f64 / 2.0,
+            pane_rect.loc.y as f64 + pane_rect.size.h as f64 / 2.0,
+        )
+            .into();
+        let hit = wayland
+            .surface_under_point_for_capture(
+                center,
+                OverlayCaptureCapability::PointerHover,
+                &status,
+            )
+            .expect("native pane surface must remain hit-testable in its resolved pane");
+        assert!(same_surface(&hit.0, &surface));
+        let keyboard = wayland.seat.get_keyboard().unwrap();
+        assert!(
+            keyboard
+                .current_focus()
+                .as_ref()
+                .is_some_and(|focused| same_surface(focused, &surface))
+        );
+        assert_eq!(
+            status.runtime.active_focus_target,
+            Some(RuntimeFocusTarget::NativePane { pane_id })
+        );
+
+        commands.send(RealShmToplevelCommand::Finish).unwrap();
+        client_thread.join().unwrap();
+        let _ = toplevel;
+    }
+
+    #[test]
+    fn native_pane_accessory_without_geometry_stays_visible_unresolved_and_open() {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
+        state.mark_runtime_resize(320, 200);
+        let shared_state = Arc::new(Mutex::new(state));
+        let mut display: Display<RuntimeWaylandState> = Display::new().unwrap();
+        let mut wayland =
+            RuntimeWaylandState::new(display.handle(), Arc::clone(&shared_state)).unwrap();
+        let (toplevel, surface, commands, client_thread) =
+            take_unresolved_real_toplevel(&mut display, &mut wayland, 80, 48);
+        let pane_id = PaneId::new("missing-geometry-pane");
+        wayland.assign_native_pane_accessory_or_retain_unresolved(toplevel, pane_id);
+
+        let id = surface_key(&surface);
+        assert!(wayland.unresolved_toplevels.contains(&id));
+        assert!(
+            wayland
+                .ordinary_toplevels
+                .iter()
+                .any(|ordinary| { same_surface(ordinary.wl_surface(), &surface) })
+        );
+        assert!(wayland.native_pane_accessories.is_empty());
+        assert!(wayland.role_for_surface(&surface).is_none());
+
+        let mut renderer = surfaceless_test_renderer();
+        let rendered = wayland.collect_render_elements(&mut renderer, 320, 200);
+        assert!(rendered.failure.is_none());
+        assert!(rendered.counts.ordinary_toplevels > 0);
+        assert_eq!(rendered.counts.native_pane_accessories, 0);
+        let ordinary_index = wayland
+            .ordinary_toplevels
+            .iter()
+            .position(|ordinary| same_surface(ordinary.wl_surface(), &surface))
+            .unwrap();
+        let rect = wayland
+            .ordinary_toplevel_rect(ordinary_index, &wayland.ordinary_toplevels[ordinary_index]);
+        let center = (
+            rect.loc.x as f64 + rect.size.w as f64 / 2.0,
+            rect.loc.y as f64 + rect.size.h as f64 / 2.0,
+        )
+            .into();
+        let status = lock_state(&shared_state).status_snapshot();
+        let hit = wayland
+            .surface_under_point_for_capture(
+                center,
+                OverlayCaptureCapability::PointerHover,
+                &status,
+            )
+            .expect(
+                "unresolved accessory must stay visible and hit-testable as an ordinary window",
+            );
+        assert!(same_surface(&hit.0, &surface));
+
+        let (close_tx, close_rx) = mpsc::channel();
+        commands
+            .send(RealShmToplevelCommand::CheckClose(close_tx))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let close_received = loop {
+            display.dispatch_clients(&mut wayland).unwrap();
+            display.flush_clients().unwrap();
+            if let Ok(closed) = close_rx.try_recv() {
+                break closed;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        assert!(!close_received);
+        assert!(
+            lock_state(&shared_state)
+                .status_snapshot()
+                .runtime
+                .last_diagnostic
+                .as_deref()
+                .is_some_and(|message| message.contains("geometry is unavailable"))
+        );
+
+        commands.send(RealShmToplevelCommand::Finish).unwrap();
+        client_thread.join().unwrap();
+    }
+
     fn surfaceless_test_renderer() -> smithay::backend::renderer::gles::GlesRenderer {
         let display = unsafe {
             smithay::backend::egl::EGLDisplay::new(
@@ -13499,12 +14065,10 @@ mod tests {
         let capture = ScreenCaptureStore::default();
         let host_backend = HostBackendState::for_root_geometry_test(capture.clone());
         let event_loop = EventLoop::<HostRuntimeLoopData>::try_new().unwrap();
-        let loop_signal = event_loop.get_signal();
         (
             HostRuntimeLoopData {
                 shared_state,
                 display_handle,
-                loop_signal,
                 wayland_state,
                 host_backend,
                 session_active: true,
@@ -13592,6 +14156,87 @@ mod tests {
         assert!(reclaimed.host_output_ownership);
         assert_eq!(reclaimed.main_app_surface_id, Some(11));
         assert_eq!(reclaimed.overlay_surface_id, Some(22));
+    }
+
+    #[test]
+    fn fatal_host_presentation_loss_keeps_attached_client_and_last_good_status_for_retry() {
+        let pid = 1;
+        let (mut runtime, _event_loop, _capture) = test_host_runtime_loop();
+        {
+            let mut state = lock_state(&runtime.shared_state);
+            state
+                .select_main_app_launch_intent(MainAppLaunchIntent {
+                    process: ProcessSpec {
+                        command: "fixture-main-app".to_string(),
+                        args: Vec::new(),
+                        cwd: None,
+                        env: Default::default(),
+                    },
+                    binding: MainAppSurfaceBinding::AppId {
+                        app_id: "fixture-main-app".to_string(),
+                    },
+                })
+                .unwrap();
+            state.mark_runtime_running(
+                crate::model::RuntimeBackend::HostDrm,
+                Some("wayland-recovery".to_string()),
+                1280,
+                800,
+            );
+            assert!(state.runtime_mark_main_app_surface_attached_for_pid(pid));
+            state.set_runtime_surface_roles(
+                Some(11),
+                Some(22),
+                Some(PaneId::new("pane-last-good")),
+            );
+            state.set_runtime_focus_target(Some(RuntimeFocusTarget::MainApp));
+        }
+
+        mark_host_output_lost_for_recovery(
+            &mut runtime,
+            "presentation event processing failed; output reclaim scheduled".to_string(),
+        );
+
+        let status = lock_state(&runtime.shared_state).status_snapshot().runtime;
+        assert_eq!(status.phase, crate::model::RuntimePhase::Running);
+        assert_eq!(status.wayland_socket.as_deref(), Some("wayland-recovery"));
+        assert_eq!(status.main_app_surface_id, Some(11));
+        assert_eq!(status.overlay_surface_id, Some(22));
+        assert_eq!(status.window_width, Some(1280));
+        assert_eq!(status.window_height, Some(800));
+        assert!(!status.host_output_ownership);
+        assert!(matches!(
+            status.main_app_launch_state,
+            crate::model::MainAppLaunchState::Attached { pid: Some(attached_pid), .. }
+                if attached_pid == pid
+        ));
+        assert!(status.last_diagnostic.as_deref().is_some_and(|warning| {
+            warning.contains("retaining clients while recovery is pending")
+        }));
+    }
+
+    #[test]
+    fn runtime_loop_retries_transient_failures_until_it_runs_or_stops() {
+        let mut attempts = std::collections::VecDeque::from([
+            Err("first transient failure"),
+            Err("second transient failure"),
+            Ok(()),
+        ]);
+        let mut warnings = Vec::new();
+        retry_runtime_until_stopped(
+            Duration::ZERO,
+            || {
+                attempts
+                    .pop_front()
+                    .expect("test supplies a terminal success")
+            },
+            |error| warnings.push(*error),
+        );
+        assert_eq!(
+            warnings,
+            ["first transient failure", "second transient failure"]
+        );
+        assert!(attempts.is_empty());
     }
 
     fn seed_committed_root_capture(runtime: &HostRuntimeLoopData) {

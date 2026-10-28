@@ -27,8 +27,9 @@ use surf_ace_compositor::output_rotation_memory::{
 use surf_ace_compositor::presentation_measurement::PresentationMeasurementCollector;
 use surf_ace_compositor::process_manager::LocalProcessController;
 use surf_ace_compositor::runtime::{
-    HostRuntimeOptions, RuntimeSelectionReport, parse_shell_overlay_toggle_shortcut,
-    run_host_with_control, run_winit,
+    HostRuntimeOptions, RUNTIME_RECOVERY_RETRY_DELAY, RuntimeSelectionReport,
+    parse_shell_overlay_toggle_shortcut, record_recovery_warning_if_changed,
+    retry_runtime_until_stopped, run_host_with_control, run_winit,
 };
 use surf_ace_compositor::screen_capture::ScreenCaptureStore;
 use surf_ace_compositor::state::CompositorState;
@@ -785,11 +786,16 @@ fn run_server(
                 });
             }
 
-            if let Err(err) = run_winit(shared_state.clone()) {
-                appearance_scheduler.stop();
-                eprintln!("winit runtime failed: {err}");
-                std::process::exit(1);
-            }
+            retry_runtime_until_stopped(
+                RUNTIME_RECOVERY_RETRY_DELAY,
+                || run_winit(shared_state.clone()),
+                |err| {
+                    let warning = format!(
+                        "winit runtime unavailable; keeping the compositor process alive and retrying: {err}"
+                    );
+                    record_recovery_warning_if_changed(&shared_state, warning);
+                },
+            );
             appearance_scheduler
         }
         "host" => {
@@ -861,30 +867,36 @@ fn run_server(
                 let Ok(command) = command else { break };
                 match command {
                     RuntimeControlCommand::StartHostRuntime => {
-                        if let Err(err) = run_host_with_control(
-                            shared_state.clone(),
-                            screen_capture.clone(),
-                            host_options.clone(),
-                            Some(runtime_control_rx.clone()),
-                        ) {
-                            eprintln!("host runtime failed: {err}");
-                            let mut state = match shared_state.lock() {
-                                Ok(guard) => guard,
-                                Err(poisoned) => poisoned.into_inner(),
-                            };
-                            state.mark_runtime_failed(format!("host runtime failed: {err}"));
-                            if auto_selected_host {
-                                state.set_runtime_selection_status(
-                                    surf_ace_compositor::model::RuntimeSelectionMode::Automatic,
-                                    true,
-                                    Some(format!(
-                                        "automatic host runtime failed; operator recovery required: {err}"
-                                    )),
-                                    Some("auto runtime selection attempted backend=host".to_string()),
-                                    Some(format!("selected backend=host; start failed: {err}")),
+                        retry_runtime_until_stopped(
+                            RUNTIME_RECOVERY_RETRY_DELAY,
+                            || {
+                                run_host_with_control(
+                                    shared_state.clone(),
+                                    screen_capture.clone(),
+                                    host_options.clone(),
+                                    Some(runtime_control_rx.clone()),
+                                )
+                            },
+                            |err| {
+                                let warning = format!(
+                                    "host runtime unavailable; retaining the compositor process and retrying: {err}"
                                 );
-                            }
-                        }
+                                record_recovery_warning_if_changed(&shared_state, warning.clone());
+                                let mut state = match shared_state.lock() {
+                                    Ok(guard) => guard,
+                                    Err(poisoned) => poisoned.into_inner(),
+                                };
+                                if auto_selected_host {
+                                    state.set_runtime_selection_status(
+                                        surf_ace_compositor::model::RuntimeSelectionMode::Automatic,
+                                        false,
+                                        None,
+                                        Some("automatic host runtime selection".to_string()),
+                                        Some(warning),
+                                    );
+                                }
+                            },
+                        );
                     }
                     RuntimeControlCommand::Root4ConfigScaleSet { .. } => {}
                     RuntimeControlCommand::SetOutputRotation { response, .. } => {
