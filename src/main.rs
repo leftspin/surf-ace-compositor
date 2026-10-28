@@ -748,7 +748,7 @@ fn run_server(
                     screen_capture,
                     host_options.presentation_measurement_collector.clone(),
                 ) {
-                    record_optional_control_failure(&shared_state, err);
+                    record_optional_control_failure(&shared_state, err.to_string());
                 }
             }
             appearance_scheduler
@@ -780,7 +780,7 @@ fn run_server(
                         control_screen_capture,
                         control_presentation_measurement_collector,
                     ) {
-                        record_optional_control_failure(&diagnostic_state, err);
+                        record_optional_control_failure(&diagnostic_state, err.to_string());
                     }
                 });
             }
@@ -826,7 +826,7 @@ fn run_server(
                         control_screen_capture,
                         control_presentation_measurement_collector,
                     ) {
-                        record_optional_control_failure(&diagnostic_state, err);
+                        record_optional_control_failure(&diagnostic_state, err.to_string());
                     }
                 })
             });
@@ -1664,7 +1664,7 @@ mod tests {
         let default_geometry = state
             .prepare_initial_root4_geometry(1920, 1080)
             .expect("built-in display settings must prepare");
-        assert_eq!(default_geometry.snapshot.scale_factor, 2.0);
+        assert_eq!(default_geometry.snapshot.factor, 2.0);
     }
 
     #[test]
