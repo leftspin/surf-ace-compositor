@@ -14156,7 +14156,7 @@ mod tests {
                 .last_diagnostic
                 .as_deref(),
             Some(
-                "overlay window process does not match the expected owner; retained visibly without binding"
+                "surface identity is unresolved; retained visibly without pane binding"
             )
         );
         assert_eq!(wayland.surface_admission_warning_count, 1);
