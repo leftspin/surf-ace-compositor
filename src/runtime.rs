@@ -15603,33 +15603,6 @@ mod tests {
         let staged_consumers = stage_runtime_root_geometry_consumers(&state, staged, None).unwrap();
         assert!(staged_consumers.topology.panes.is_empty());
         let pane_id = PaneId::new("surface:diagnostic-pane");
-        state
-            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
-                window_group: None,
-                id: pane_id.clone(),
-                content_id: Some("diagnostic-content".to_string()),
-                binding_id: Some("diagnostic-binding".to_string()),
-                launch_token: None,
-                revision: 1,
-                geometry: PaneGeometry {
-                    x: 10.0,
-                    y: 5.0,
-                    width: 20.0,
-                    height: 10.0,
-                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
-                },
-                target: NativeTargetClass::Terminal,
-                process: ProcessSpec {
-                    command: "diagnostic-pane-fixture".to_string(),
-                    args: Vec::new(),
-                    cwd: None,
-                    env: Default::default(),
-                },
-            }])
-            .expect("dynamic native pane request must be accepted");
-        state
-            .launch_native_pane_hosts(vec![pane_id.clone()])
-            .expect("the fixture must publish a process identity for the pane");
         let shared_state = Arc::new(Mutex::new(state));
         let mut display: Display<RuntimeWaylandState> = Display::new().unwrap();
         let mut display_handle = display.handle();
@@ -15660,6 +15633,36 @@ mod tests {
                 .is_empty(),
             "the root geometry snapshot starts before the dynamic pane exists"
         );
+        {
+            let mut state = lock_state(&shared_state);
+            state
+                .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                    window_group: None,
+                    id: pane_id.clone(),
+                    content_id: Some("diagnostic-content".to_string()),
+                    binding_id: Some("diagnostic-binding".to_string()),
+                    launch_token: None,
+                    revision: 1,
+                    geometry: PaneGeometry {
+                        x: 10.0,
+                        y: 5.0,
+                        width: 20.0,
+                        height: 10.0,
+                        coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                    },
+                    target: NativeTargetClass::Terminal,
+                    process: ProcessSpec {
+                        command: "diagnostic-pane-fixture".to_string(),
+                        args: Vec::new(),
+                        cwd: None,
+                        env: Default::default(),
+                    },
+                }])
+                .expect("dynamic native pane request must be accepted");
+            state
+                .launch_native_pane_hosts(vec![pane_id.clone()])
+                .expect("the fixture must publish a process identity for the pane");
+        }
 
         let (server_socket, client_socket) = UnixStream::pair().unwrap();
         let server_client = display_handle
