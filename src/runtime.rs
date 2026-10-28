@@ -8995,7 +8995,6 @@ impl RuntimeWaylandState {
 
     fn assign_toplevel_role(&mut self, surface: ToplevelSurface) {
         let surface_id = surface_key(surface.wl_surface());
-        self.deferred_overlay_admissions.remove(&surface_id);
         let classification = self.classify_toplevel(&surface);
         self.pending_toplevels
             .retain(|pending| surface_key(pending.wl_surface()) != surface_id);
@@ -9003,6 +9002,21 @@ impl RuntimeWaylandState {
             self.retain_unresolved_toplevel(surface);
             return;
         }
+        if matches!(&classification, SurfaceClassification::OverlayCandidate)
+            && self.unresolved_toplevels.contains(&surface_id)
+        {
+            // Resolve overlay ownership before removing an already-visible
+            // unresolved surface. If it is still uncertain, retain its current
+            // configure and focus and let the admission snapshot defer retries.
+            self.deferred_overlay_admissions.remove(&surface_id);
+            self.enforce_main_app_binding_policy();
+            self.assign_overlay_role_or_queue(surface.clone());
+            if !self.deferred_overlay_admissions.contains_key(&surface_id) {
+                self.remove_surface_from_unresolved_tracking(&surface);
+            }
+            return;
+        }
+        self.deferred_overlay_admissions.remove(&surface_id);
         if self
             .ordinary_keyboard_focus
             .as_ref()
@@ -14058,6 +14072,13 @@ mod tests {
         );
         let surface = toplevel.wl_surface().clone();
         let id = surface_key(&surface);
+        if !wayland
+            .pending_toplevels
+            .iter()
+            .any(|pending| same_surface(pending.wl_surface(), &surface))
+        {
+            wayland.pending_toplevels.push(toplevel.clone());
+        }
 
         assert!(matches!(
             wayland.classify_toplevel(&toplevel),
@@ -14083,7 +14104,7 @@ mod tests {
                 .runtime
                 .last_diagnostic
                 .as_deref()
-                .is_some_and(|warning| warning.contains("does not match the expected owner"))
+                .is_some_and(|warning| warning.contains("surface identity is unresolved"))
         );
         assert_eq!(wayland.surface_admission_warning_count, 1);
 
