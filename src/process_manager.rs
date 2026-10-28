@@ -1,13 +1,12 @@
-use crate::child_supervisor::{
-    self, HelperHello, LaunchRequest, SupervisorCommand, SupervisorEvent,
-};
-use crate::model::ProcessSpec;
+use crate::child_supervisor::{self, HelperHello, LaunchRequest, SupervisorEvent};
+use crate::model::{ProcessLaunchObservation, ProcessSpec};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -26,6 +25,7 @@ const DESCRIPTION_PREFIX: &str = "surf-ace-compositor-child-";
 pub struct ProcessExit {
     pub pid: u32,
     pub exit_code: Option<i32>,
+    pub observation: Option<ProcessLaunchObservation>,
 }
 
 pub type ProcessRequestId = u64;
@@ -36,9 +36,25 @@ pub enum ProcessControllerEvent {
         request_id: ProcessRequestId,
         pid: u32,
     },
+    SpawnStartedUnconfirmed {
+        request_id: ProcessRequestId,
+        pid: u32,
+        observation: ProcessLaunchObservation,
+    },
+    SpawnUnconfirmed {
+        request_id: ProcessRequestId,
+        reason: String,
+    },
     SpawnFailed {
         request_id: ProcessRequestId,
         reason: String,
+    },
+    TerminatedUnconfirmed {
+        request_id: ProcessRequestId,
+        result: Result<(), String>,
+    },
+    UnconfirmedExited {
+        request_id: ProcessRequestId,
     },
     Terminated {
         pid: u32,
@@ -54,6 +70,7 @@ pub trait ProcessController: Send {
         extra_env: &BTreeMap<String, String>,
     ) -> Result<ProcessRequestId, String>;
     fn terminate(&mut self, pid: u32) -> Result<(), String>;
+    fn terminate_unconfirmed(&mut self, request_id: ProcessRequestId) -> Result<(), String>;
     fn poll_events(&mut self) -> Vec<ProcessControllerEvent>;
 }
 
@@ -65,6 +82,9 @@ enum ProcessWorkerCommand {
     },
     Terminate {
         pid: u32,
+    },
+    TerminateUnconfirmed {
+        request_id: ProcessRequestId,
     },
     Shutdown,
 }
@@ -79,20 +99,37 @@ pub struct LocalProcessController {
 #[derive(Default)]
 struct SystemdProcessManager {
     children: HashMap<u32, UnitChild>,
+    unconfirmed_children: HashMap<ProcessRequestId, UnitChild>,
 }
 
 trait ProcessManagerOperations: Send + 'static {
     fn spawn(
         &mut self,
+        request_id: ProcessRequestId,
         spec: &ProcessSpec,
         extra_env: &BTreeMap<String, String>,
-    ) -> Result<u32, String>;
+    ) -> Result<ManagedSpawn, String>;
     fn terminate(&mut self, pid: u32) -> Result<(), String>;
-    fn reap_exited(&mut self) -> Vec<ProcessExit>;
+    fn terminate_unconfirmed(&mut self, request_id: ProcessRequestId) -> Result<(), String>;
+    fn reap_exited(&mut self) -> Vec<ManagedExit>;
+}
+
+enum ManagedSpawn {
+    Started {
+        pid: u32,
+        replaced_pid: Option<u32>,
+        observation: Option<ProcessLaunchObservation>,
+    },
+    Unconfirmed,
+}
+
+enum ManagedExit {
+    Started(ProcessExit),
+    Unconfirmed(ProcessRequestId),
 }
 
 struct UnitChild {
-    app_pid: u32,
+    app_pid: Option<u32>,
     unit_name: String,
     slot: u32,
     child: Child,
@@ -103,8 +140,126 @@ struct UnitChild {
     app_exit_reported: bool,
     event_stream_closed: bool,
     supervisor_status: Option<ExitStatus>,
-    stop_requested: bool,
     secrets: Vec<String>,
+    unitless: bool,
+    exit_observation_failure_reported: bool,
+    launch_observation: Option<ProcessLaunchObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DegradationWarning {
+    stage: &'static str,
+    reason: String,
+}
+
+fn degradation_warning(
+    stage: &'static str,
+    reason: &str,
+    secrets: &[String],
+) -> DegradationWarning {
+    DegradationWarning {
+        stage,
+        reason: child_supervisor::sanitize_record(reason, secrets),
+    }
+}
+
+fn unitless_warning(stage: &'static str, reason: &str, secrets: &[String]) -> DegradationWarning {
+    degradation_warning(stage, &format!("{reason} unitless_launch"), secrets)
+}
+
+fn child_kept_running_warning(
+    stage: &'static str,
+    detail: &str,
+    secrets: &[String],
+) -> DegradationWarning {
+    degradation_warning(stage, &format!("child_kept_running {detail}"), secrets)
+}
+
+fn child_start_unconfirmed_warning(
+    stage: &'static str,
+    detail: &str,
+    secrets: &[String],
+) -> DegradationWarning {
+    degradation_warning(stage, &format!("child_start_unconfirmed {detail}"), secrets)
+}
+
+fn shortened_unit_warning(original_basename: &str, secrets: &[String]) -> DegradationWarning {
+    degradation_warning(
+        "unit_name_shortened",
+        &format!("original_basename={original_basename}"),
+        secrets,
+    )
+}
+
+fn application_pid_collision_warning(
+    previous_unit: &str,
+    new_unit: &str,
+    secrets: &[String],
+) -> DegradationWarning {
+    degradation_warning(
+        "application_pid_collision",
+        &format!("stale_tracking_replaced previous_unit={previous_unit} new_unit={new_unit}"),
+        secrets,
+    )
+}
+
+fn emit_warning(
+    slot: u32,
+    unit_name: &str,
+    warning: &DegradationWarning,
+    secrets: &[String],
+) -> bool {
+    child_supervisor::emit_compositor_diagnostic(
+        slot,
+        unit_name,
+        warning.stage,
+        &warning.reason,
+        secrets,
+    )
+}
+
+fn started_child_observation(
+    unit_observed: bool,
+    event_reader_started: bool,
+) -> Option<ProcessLaunchObservation> {
+    (!unit_observed || !event_reader_started).then_some(ProcessLaunchObservation::ChildKeptRunning)
+}
+
+fn replace_stale_pid_tracking<T>(
+    tracked: &mut HashMap<u32, T>,
+    pid: u32,
+    replacement: T,
+    unit_name: impl FnOnce(&T) -> String,
+) -> Option<String> {
+    let previous = tracked.remove(&pid);
+    let previous_unit = previous.as_ref().map(unit_name);
+    drop(previous);
+    tracked.insert(pid, replacement);
+    previous_unit
+}
+
+fn unitless_command(
+    spec: &ProcessSpec,
+    environment: &[child_supervisor::EnvironmentEntry],
+) -> Command {
+    let mut command = Command::new(&spec.command);
+    command.args(&spec.args);
+    command.env_clear();
+    for entry in environment {
+        command.env(
+            std::ffi::OsString::from_vec(entry.key.clone()),
+            std::ffi::OsString::from_vec(entry.value.clone()),
+        );
+    }
+    if let Some(cwd) = &spec.cwd {
+        command.current_dir(cwd);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    command
 }
 
 struct SocketEndpoint {
@@ -122,8 +277,37 @@ impl Drop for SocketEndpoint {
 
 enum StartAttempt {
     Started(UnitChild),
+    Unconfirmed(UnitChild),
     Collision,
     Failure { stage: &'static str, reason: String },
+}
+
+fn unconfirmed_unit_child(
+    child: Child,
+    stderr_reader: JoinHandle<Vec<u8>>,
+    unit_name: &str,
+    slot: u32,
+    secrets: Vec<String>,
+) -> UnitChild {
+    let (event_tx, events) = mpsc::channel();
+    drop(event_tx);
+    UnitChild {
+        app_pid: None,
+        unit_name: unit_name.to_string(),
+        slot,
+        child,
+        stderr_reader: Some(stderr_reader),
+        events,
+        event_reader: None,
+        final_event: None,
+        app_exit_reported: false,
+        event_stream_closed: true,
+        supervisor_status: None,
+        secrets,
+        unitless: false,
+        exit_observation_failure_reported: false,
+        launch_observation: None,
+    }
 }
 
 impl Default for LocalProcessController {
@@ -182,6 +366,12 @@ impl ProcessController for LocalProcessController {
             .map_err(|_| "child process manager worker is unavailable".to_string())
     }
 
+    fn terminate_unconfirmed(&mut self, request_id: ProcessRequestId) -> Result<(), String> {
+        self.commands
+            .send(ProcessWorkerCommand::TerminateUnconfirmed { request_id })
+            .map_err(|_| "child process manager worker is unavailable".to_string())
+    }
+
     fn poll_events(&mut self) -> Vec<ProcessControllerEvent> {
         self.events.try_iter().collect()
     }
@@ -203,14 +393,45 @@ fn process_worker(
                 if shutdown.load(Ordering::Acquire) {
                     continue;
                 }
-                match manager.spawn(&spec, &extra_env) {
-                    Ok(pid) => {
+                match manager.spawn(request_id, &spec, &extra_env) {
+                    Ok(ManagedSpawn::Started {
+                        pid,
+                        replaced_pid,
+                        observation,
+                    }) => {
+                        if let Some(replaced_pid) = replaced_pid {
+                            if events
+                                .send(ProcessControllerEvent::Exited(ProcessExit {
+                                    pid: replaced_pid,
+                                    exit_code: None,
+                                    observation: None,
+                                }))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        let event = match observation {
+                            Some(observation) => ProcessControllerEvent::SpawnStartedUnconfirmed {
+                                request_id,
+                                pid,
+                                observation,
+                            },
+                            None => ProcessControllerEvent::SpawnStarted { request_id, pid },
+                        };
+                        if shutdown.load(Ordering::Acquire) || events.send(event).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(ManagedSpawn::Unconfirmed) => {
                         if shutdown.load(Ordering::Acquire)
                             || events
-                                .send(ProcessControllerEvent::SpawnStarted { request_id, pid })
+                                .send(ProcessControllerEvent::SpawnUnconfirmed {
+                                    request_id,
+                                    reason: "child_start_unconfirmed".to_string(),
+                                })
                                 .is_err()
                         {
-                            let _ = manager.terminate(pid);
                             return;
                         }
                     }
@@ -236,13 +457,30 @@ fn process_worker(
                     return;
                 }
             }
+            Ok(ProcessWorkerCommand::TerminateUnconfirmed { request_id }) => {
+                if events
+                    .send(ProcessControllerEvent::TerminatedUnconfirmed {
+                        request_id,
+                        result: manager.terminate_unconfirmed(request_id),
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
             Ok(ProcessWorkerCommand::Shutdown) => return,
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
 
         for exit in manager.reap_exited() {
-            if events.send(ProcessControllerEvent::Exited(exit)).is_err() {
+            let event = match exit {
+                ManagedExit::Started(exit) => ProcessControllerEvent::Exited(exit),
+                ManagedExit::Unconfirmed(request_id) => {
+                    ProcessControllerEvent::UnconfirmedExited { request_id }
+                }
+            };
+            if events.send(event).is_err() {
                 return;
             }
         }
@@ -252,39 +490,46 @@ fn process_worker(
 impl SystemdProcessManager {
     fn spawn(
         &mut self,
+        request_id: ProcessRequestId,
         spec: &ProcessSpec,
         extra_env: &BTreeMap<String, String>,
-    ) -> Result<u32, String> {
+    ) -> Result<ManagedSpawn, String> {
         let child_basename = Path::new(&spec.command)
             .file_name()
             .map(|name| name.as_bytes().to_vec())
-            .filter(|name| !name.is_empty())
-            .ok_or_else(|| {
-                let reason = "requested executable has no non-empty basename";
-                let _ = child_supervisor::emit_compositor_diagnostic(
-                    0,
-                    "unavailable",
-                    "unit_name_invalid",
-                    reason,
-                    &[],
-                );
-                reason.to_string()
-            })?;
-        let encoded_basename = escape_unit_component(&child_basename);
-        let Some(max_slot) = max_slot_for_child(&encoded_basename) else {
-            let reason = "child basename cannot fit a complete systemd unit name";
-            let _ = child_supervisor::emit_compositor_diagnostic(
-                0,
-                "unavailable",
-                "unit_name_invalid",
-                reason,
-                &[],
-            );
-            return Err(reason.to_string());
-        };
+            .filter(|name| !name.is_empty());
 
         let environment = child_supervisor::effective_child_environment(spec, extra_env);
         let secrets = child_supervisor::sensitive_environment_values(&environment);
+        let Some(child_basename) = child_basename else {
+            return self.start_unitless(
+                spec,
+                &environment,
+                &secrets,
+                0,
+                "unavailable",
+                "unit_name_invalid",
+                "requested executable has no non-empty basename",
+            );
+        };
+        let encoded_basename = escape_unit_component(&child_basename);
+        let shortened =
+            encoded_basename.len() + "surface0-".len() + ".service".len() > UNIT_NAME_MAX_BYTES;
+        let max_slot = if shortened {
+            u32::MAX
+        } else if let Some(max_slot) = max_slot_for_child(&encoded_basename) {
+            max_slot
+        } else {
+            return self.start_unitless(
+                spec,
+                &environment,
+                &secrets,
+                0,
+                "unavailable",
+                "unit_name_invalid",
+                "child basename cannot fit a complete systemd unit name",
+            );
+        };
         let main_app = extra_env
             .get("SURF_ACE_COMPOSITOR_MAIN_APP")
             .is_some_and(|value| value == "1");
@@ -307,13 +552,23 @@ impl SystemdProcessManager {
                     "unit_name_exhausted"
                 };
                 let reason = "no valid unused child unit name remains";
-                let _ = child_supervisor::emit_compositor_diagnostic(
-                    0, unit_name, stage, reason, &secrets,
+                return self.start_unitless(
+                    spec,
+                    &environment,
+                    &secrets,
+                    0,
+                    unit_name,
+                    stage,
+                    reason,
                 );
-                return Err(format!("{stage}: {reason}"));
             };
             attempted_slots.insert(slot);
-            let unit_name = format!("surface{slot}-{encoded_basename}.service");
+            let child_component = if shortened {
+                shorten_unit_component(&child_basename, slot)
+            } else {
+                encoded_basename.clone()
+            };
+            let unit_name = format!("surface{slot}-{child_component}.service");
             let request = LaunchRequest {
                 nonce: String::new(),
                 unit_name: unit_name.clone(),
@@ -325,6 +580,7 @@ impl SystemdProcessManager {
             match start_unit(slot, &unit_name, request) {
                 StartAttempt::Started(mut child) => {
                     child.secrets = secrets.clone();
+                    let observation = child.launch_observation;
                     if let Some(previous) = collision_unit {
                         let _ = child_supervisor::emit_compositor_diagnostic(
                             slot,
@@ -334,27 +590,30 @@ impl SystemdProcessManager {
                             &secrets,
                         );
                     }
-                    let pid = child.app_pid;
-                    if self.children.contains_key(&pid) {
-                        let unit_name = child.unit_name.clone();
-                        let _ = systemctl_stop(&unit_name);
-                        let _ = child.child.wait();
-                        if let Some(reader) = child.stderr_reader.take() {
-                            let _ = reader.join();
-                        }
-                        if let Some(reader) = child.event_reader.take() {
-                            let _ = reader.join();
-                        }
-                        let _ = child_supervisor::emit_compositor_diagnostic(
-                            slot,
-                            &unit_name,
-                            "application_pid_collision",
-                            "new_child_pid_is_already_tracked",
+                    if shortened {
+                        let original = String::from_utf8_lossy(&child_basename);
+                        let warning = shortened_unit_warning(&original, &secrets);
+                        emit_warning(slot, &unit_name, &warning, &secrets);
+                    }
+                    let pid = child.app_pid.expect("started child has an application pid");
+                    let child_unit_name = child.unit_name.clone();
+                    if let Some(previous_unit) =
+                        replace_stale_pid_tracking(&mut self.children, pid, child, |old| {
+                            old.unit_name.clone()
+                        })
+                    {
+                        let warning = application_pid_collision_warning(
+                            &previous_unit,
+                            &child_unit_name,
                             &secrets,
                         );
-                        return Err("application_pid_collision".to_string());
+                        emit_warning(slot, &child_unit_name, &warning, &secrets);
+                        return Ok(ManagedSpawn::Started {
+                            pid,
+                            replaced_pid: Some(pid),
+                            observation,
+                        });
                     }
-                    self.children.insert(pid, child);
                     let _ = child_supervisor::emit_compositor_diagnostic(
                         slot,
                         &unit_name,
@@ -362,7 +621,23 @@ impl SystemdProcessManager {
                         &format!("application_pid={pid}"),
                         &secrets,
                     );
-                    return Ok(pid);
+                    return Ok(ManagedSpawn::Started {
+                        pid,
+                        replaced_pid: None,
+                        observation,
+                    });
+                }
+                StartAttempt::Unconfirmed(mut child) => {
+                    child.secrets = secrets.clone();
+                    let unit_name = child.unit_name.clone();
+                    self.unconfirmed_children.insert(request_id, child);
+                    let warning = child_start_unconfirmed_warning(
+                        "child_start_unconfirmed",
+                        "start_report_missing",
+                        &secrets,
+                    );
+                    emit_warning(slot, &unit_name, &warning, &secrets);
+                    return Ok(ManagedSpawn::Unconfirmed);
                 }
                 StartAttempt::Collision => {
                     collision_unit = Some(unit_name);
@@ -376,10 +651,87 @@ impl SystemdProcessManager {
                         &safe_reason,
                         &secrets,
                     );
-                    return Err(format!("{stage}: {safe_reason}"));
+                    if stage == "child_exec_failure" {
+                        return Err(format!("{stage}: {safe_reason}"));
+                    }
+                    return self.start_unitless(
+                        spec,
+                        &environment,
+                        &secrets,
+                        slot,
+                        &unit_name,
+                        stage,
+                        &safe_reason,
+                    );
                 }
             }
         }
+    }
+
+    fn start_unitless(
+        &mut self,
+        spec: &ProcessSpec,
+        environment: &[child_supervisor::EnvironmentEntry],
+        secrets: &[String],
+        slot: u32,
+        unit_name: &str,
+        stage: &'static str,
+        reason: &str,
+    ) -> Result<ManagedSpawn, String> {
+        let mut command = unitless_command(spec, environment);
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let safe_reason = child_supervisor::sanitize_record(
+                    &format!("requested executable failed to start: {error}"),
+                    secrets,
+                );
+                let _ = child_supervisor::emit_compositor_diagnostic(
+                    slot,
+                    unit_name,
+                    "child_exec_failure",
+                    &safe_reason,
+                    secrets,
+                );
+                return Err(format!("child_exec_failure: {safe_reason}"));
+            }
+        };
+        let pid = child.id();
+        let (event_tx, events) = mpsc::channel();
+        drop(event_tx);
+        let previous_unit = replace_stale_pid_tracking(
+            &mut self.children,
+            pid,
+            UnitChild {
+                app_pid: Some(pid),
+                unit_name: unit_name.to_string(),
+                slot,
+                child,
+                stderr_reader: None,
+                events,
+                event_reader: None,
+                final_event: None,
+                app_exit_reported: false,
+                event_stream_closed: true,
+                supervisor_status: None,
+                secrets: secrets.to_vec(),
+                unitless: true,
+                exit_observation_failure_reported: false,
+                launch_observation: None,
+            },
+            |old| old.unit_name.clone(),
+        );
+        let warning = unitless_warning(stage, reason, secrets);
+        emit_warning(slot, unit_name, &warning, secrets);
+        if let Some(previous_unit) = previous_unit.as_ref() {
+            let warning = application_pid_collision_warning(previous_unit, unit_name, secrets);
+            emit_warning(slot, unit_name, &warning, secrets);
+        }
+        Ok(ManagedSpawn::Started {
+            pid,
+            replaced_pid: previous_unit.as_ref().map(|_| pid),
+            observation: None,
+        })
     }
 
     fn terminate(&mut self, pid: u32) -> Result<(), String> {
@@ -396,6 +748,22 @@ impl SystemdProcessManager {
             &format!("application_pid={pid}"),
             &secrets,
         );
+        if child.unitless {
+            if let Some(group) = rustix::process::Pid::from_raw(pid as i32) {
+                let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+            }
+            let _ = child.child.kill();
+            let _ = child.child.wait();
+            self.children.remove(&pid);
+            let _ = child_supervisor::emit_compositor_diagnostic(
+                slot,
+                &unit_name,
+                "child_stop_complete",
+                "unitless_process_group_stopped",
+                &secrets,
+            );
+            return Ok(());
+        }
         if !systemctl_stop(&unit_name) {
             let reason = "systemctl_user_stop_failed";
             let _ = child_supervisor::emit_compositor_diagnostic(
@@ -405,7 +773,8 @@ impl SystemdProcessManager {
                 reason,
                 &secrets,
             );
-            return Err("systemctl_user_stop_failed".to_string());
+            self.children.remove(&pid);
+            return Ok(());
         }
 
         if let Some(child) = self.children.get_mut(&pid) {
@@ -435,7 +804,7 @@ impl SystemdProcessManager {
         Ok(())
     }
 
-    fn reap_exited(&mut self) -> Vec<ProcessExit> {
+    fn reap_exited(&mut self) -> Vec<ManagedExit> {
         let pids: Vec<_> = self.children.keys().copied().collect();
         let mut to_remove = Vec::new();
         let mut exited = Vec::new();
@@ -444,6 +813,39 @@ impl SystemdProcessManager {
             let Some(child) = self.children.get_mut(&pid) else {
                 continue;
             };
+            if child.unitless {
+                match child.child.try_wait() {
+                    Ok(Some(status)) => {
+                        let exit_code = status.code();
+                        let _ = child_supervisor::emit_compositor_diagnostic(
+                            child.slot,
+                            &child.unit_name,
+                            "child_exit_observed",
+                            &format!("application_pid={pid} exit_code={exit_code:?}"),
+                            &child.secrets,
+                        );
+                        exited.push(ManagedExit::Started(ProcessExit {
+                            pid,
+                            exit_code,
+                            observation: None,
+                        }));
+                        to_remove.push(pid);
+                    }
+                    Ok(None) => {}
+                    Err(_) if !child.exit_observation_failure_reported => {
+                        child.exit_observation_failure_reported = true;
+                        let _ = child_supervisor::emit_compositor_diagnostic(
+                            child.slot,
+                            &child.unit_name,
+                            "child_exit_unobserved",
+                            "child_kept_running application_exit_status_unknown",
+                            &child.secrets,
+                        );
+                    }
+                    Err(_) => {}
+                }
+                continue;
+            }
             loop {
                 match child.events.try_recv() {
                     Ok(Ok(SupervisorEvent::SanitizerFailed { reason })) => {
@@ -454,22 +856,6 @@ impl SystemdProcessManager {
                             &reason,
                             &child.secrets,
                         );
-                        if !child.stop_requested {
-                            child.stop_requested = true;
-                            let stopped = systemctl_stop(&child.unit_name);
-                            let (stage, safe_reason) = if stopped {
-                                ("sanitizer_unit_stopped", "fail_closed_stop_requested")
-                            } else {
-                                ("sanitizer_unit_stop_failure", "systemctl_user_stop_failed")
-                            };
-                            let _ = child_supervisor::emit_compositor_diagnostic(
-                                child.slot,
-                                &child.unit_name,
-                                stage,
-                                safe_reason,
-                                &child.secrets,
-                            );
-                        }
                     }
                     Ok(Ok(SupervisorEvent::Finished {
                         exit_code,
@@ -479,7 +865,11 @@ impl SystemdProcessManager {
                     }
                     Ok(Ok(SupervisorEvent::ChildExited { exit_code, .. })) => {
                         if !child.app_exit_reported {
-                            exited.push(ProcessExit { pid, exit_code });
+                            exited.push(ManagedExit::Started(ProcessExit {
+                                pid,
+                                exit_code,
+                                observation: None,
+                            }));
                             child.app_exit_reported = true;
                         }
                     }
@@ -555,7 +945,11 @@ impl SystemdProcessManager {
                         &child.secrets,
                     );
                     if !child.app_exit_reported {
-                        exited.push(ProcessExit { pid, exit_code });
+                        exited.push(ManagedExit::Started(ProcessExit {
+                            pid,
+                            exit_code,
+                            observation: None,
+                        }));
                         child.app_exit_reported = true;
                     }
                 } else {
@@ -567,10 +961,11 @@ impl SystemdProcessManager {
                         &child.secrets,
                     );
                     if !child.app_exit_reported {
-                        exited.push(ProcessExit {
+                        exited.push(ManagedExit::Started(ProcessExit {
                             pid,
                             exit_code: None,
-                        });
+                            observation: child.launch_observation,
+                        }));
                         child.app_exit_reported = true;
                     }
                 }
@@ -603,24 +998,99 @@ impl SystemdProcessManager {
         for pid in to_remove {
             self.children.remove(&pid);
         }
+
+        let request_ids: Vec<_> = self.unconfirmed_children.keys().copied().collect();
+        let mut unconfirmed_to_remove = Vec::new();
+        for request_id in request_ids {
+            let Some(child) = self.unconfirmed_children.get_mut(&request_id) else {
+                continue;
+            };
+            match child.child.try_wait() {
+                Ok(Some(_status)) => {
+                    let _ = child_supervisor::emit_compositor_diagnostic(
+                        child.slot,
+                        &child.unit_name,
+                        "child_exit_unobserved",
+                        "child_start_unconfirmed application_exit_status_unknown",
+                        &child.secrets,
+                    );
+                    if let Some(reader) = child.stderr_reader.take() {
+                        let _ = reader.join();
+                    }
+                    unconfirmed_to_remove.push(request_id);
+                    exited.push(ManagedExit::Unconfirmed(request_id));
+                }
+                Ok(None) => {}
+                Err(_) => {}
+            }
+        }
+        for request_id in unconfirmed_to_remove {
+            self.unconfirmed_children.remove(&request_id);
+        }
         exited
+    }
+
+    fn terminate_unconfirmed(&mut self, request_id: ProcessRequestId) -> Result<(), String> {
+        let Some(child) = self.unconfirmed_children.get_mut(&request_id) else {
+            return Err("unknown unconfirmed child launch".to_string());
+        };
+        let unit_name = child.unit_name.clone();
+        let slot = child.slot;
+        let secrets = child.secrets.clone();
+        if !systemctl_stop(&unit_name) {
+            let _ = child_supervisor::emit_compositor_diagnostic(
+                slot,
+                &unit_name,
+                "child_stop_failure",
+                "systemctl_user_stop_failed child_start_unconfirmed",
+                &secrets,
+            );
+            self.unconfirmed_children.remove(&request_id);
+            return Ok(());
+        }
+        if let Some(child) = self.unconfirmed_children.get_mut(&request_id) {
+            let _ = child.child.wait();
+        }
+        if let Some(mut child) = self.unconfirmed_children.remove(&request_id) {
+            if let Some(reader) = child.stderr_reader.take() {
+                let _ = reader.join();
+            }
+            let collected = wait_for_collection(&unit_name);
+            let (stage, reason) = if collected {
+                ("child_stop_complete", "unit_stopped_and_collected")
+            } else {
+                (
+                    "unit_collection_unobserved",
+                    "unit_remained_or_state_unavailable",
+                )
+            };
+            let _ = child_supervisor::emit_compositor_diagnostic(
+                slot, &unit_name, stage, reason, &secrets,
+            );
+        }
+        Ok(())
     }
 }
 
 impl ProcessManagerOperations for SystemdProcessManager {
     fn spawn(
         &mut self,
+        request_id: ProcessRequestId,
         spec: &ProcessSpec,
         extra_env: &BTreeMap<String, String>,
-    ) -> Result<u32, String> {
-        SystemdProcessManager::spawn(self, spec, extra_env)
+    ) -> Result<ManagedSpawn, String> {
+        SystemdProcessManager::spawn(self, request_id, spec, extra_env)
     }
 
     fn terminate(&mut self, pid: u32) -> Result<(), String> {
         SystemdProcessManager::terminate(self, pid)
     }
 
-    fn reap_exited(&mut self) -> Vec<ProcessExit> {
+    fn terminate_unconfirmed(&mut self, request_id: ProcessRequestId) -> Result<(), String> {
+        SystemdProcessManager::terminate_unconfirmed(self, request_id)
+    }
+
+    fn reap_exited(&mut self) -> Vec<ManagedExit> {
         SystemdProcessManager::reap_exited(self)
     }
 }
@@ -756,26 +1226,48 @@ fn start_unit(slot: u32, unit_name: &str, mut request: LaunchRequest) -> StartAt
             };
         }
     };
-    if hello.nonce != request.nonce || child_supervisor::write_frame(&mut stream, &request).is_err()
-    {
+    if hello.nonce != request.nonce {
         let _ = service_client.kill();
         let _ = service_client.wait();
         let _ = stderr_reader.join();
         return StartAttempt::Failure {
             stage: "supervisor_protocol_failure",
-            reason: "supervisor_launch_request_write_failed".to_string(),
+            reason: "supervisor_nonce_mismatch_before_launch_request".to_string(),
         };
+    }
+    if child_supervisor::write_frame(&mut stream, &request).is_err() {
+        let secrets = child_supervisor::sensitive_environment_values(&request.environment);
+        let warning = child_start_unconfirmed_warning(
+            "supervisor_protocol_failure",
+            "launch_request_write_failed",
+            &secrets,
+        );
+        emit_warning(slot, unit_name, &warning, &secrets);
+        return StartAttempt::Unconfirmed(unconfirmed_unit_child(
+            service_client,
+            stderr_reader,
+            unit_name,
+            slot,
+            child_supervisor::sensitive_environment_values(&request.environment),
+        ));
     }
     let started: SupervisorEvent = match child_supervisor::read_frame(&mut stream) {
         Ok(event) => event,
         Err(_) => {
-            let _ = systemctl_stop(unit_name);
-            let _ = service_client.wait();
-            let _ = stderr_reader.join();
-            return StartAttempt::Failure {
-                stage: "child_exec_failure",
-                reason: "supervisor_start_event_missing".to_string(),
-            };
+            let secrets = child_supervisor::sensitive_environment_values(&request.environment);
+            let warning = child_start_unconfirmed_warning(
+                "child_start_unconfirmed",
+                "supervisor_started_event_missing",
+                &secrets,
+            );
+            emit_warning(slot, unit_name, &warning, &secrets);
+            return StartAttempt::Unconfirmed(unconfirmed_unit_child(
+                service_client,
+                stderr_reader,
+                unit_name,
+                slot,
+                child_supervisor::sensitive_environment_values(&request.environment),
+            ));
         }
     };
     let (pid, supervisor_pid) = match started {
@@ -792,35 +1284,37 @@ fn start_unit(slot: u32, unit_name: &str, mut request: LaunchRequest) -> StartAt
             };
         }
         _ => {
-            let _ = systemctl_stop(unit_name);
-            let _ = service_client.wait();
-            let _ = stderr_reader.join();
-            return StartAttempt::Failure {
-                stage: "supervisor_protocol_failure",
-                reason: "supervisor_started_event_invalid".to_string(),
-            };
+            let secrets = child_supervisor::sensitive_environment_values(&request.environment);
+            let warning = child_start_unconfirmed_warning(
+                "child_start_unconfirmed",
+                "supervisor_started_event_invalid",
+                &secrets,
+            );
+            emit_warning(slot, unit_name, &warning, &secrets);
+            return StartAttempt::Unconfirmed(unconfirmed_unit_child(
+                service_client,
+                stderr_reader,
+                unit_name,
+                slot,
+                child_supervisor::sensitive_environment_values(&request.environment),
+            ));
         }
     };
     let _ = stream.set_read_timeout(None);
 
-    if !unit_is_observed(unit_name, &description, supervisor_pid) {
-        let _ = systemctl_stop(unit_name);
-        let _ = service_client.wait();
-        let _ = stderr_reader.join();
-        return StartAttempt::Failure {
-            stage: "unit_observation_failure",
-            reason: "transient_unit_or_sanitizer_path_not_observed".to_string(),
-        };
-    }
-
-    if child_supervisor::write_frame(&mut stream, &SupervisorCommand::AcceptLaunch).is_err() {
-        let _ = systemctl_stop(unit_name);
-        let _ = service_client.wait();
-        let _ = stderr_reader.join();
-        return StartAttempt::Failure {
-            stage: "supervisor_protocol_failure",
-            reason: "parent_launch_acceptance_write_failed".to_string(),
-        };
+    let unit_observed = unit_is_observed(unit_name, &description, supervisor_pid);
+    if !unit_observed {
+        let warning = child_kept_running_warning(
+            "unit_observation_failure",
+            "transient_unit_or_sanitizer_path_not_observed",
+            &child_supervisor::sensitive_environment_values(&request.environment),
+        );
+        emit_warning(
+            slot,
+            unit_name,
+            &warning,
+            &child_supervisor::sensitive_environment_values(&request.environment),
+        );
     }
 
     let (event_tx, events) = mpsc::channel();
@@ -828,17 +1322,23 @@ fn start_unit(slot: u32, unit_name: &str, mut request: LaunchRequest) -> StartAt
         .name(format!("child-unit-events-{slot}"))
         .spawn(move || read_events(stream, event_tx))
     {
-        Ok(reader) => reader,
+        Ok(reader) => Some(reader),
         Err(_) => {
-            let _ = systemctl_stop(unit_name);
-            let _ = service_client.wait();
-            let _ = stderr_reader.join();
-            return StartAttempt::Failure {
-                stage: "supervisor_protocol_failure",
-                reason: "supervisor_event_reader_start_failure".to_string(),
-            };
+            let warning = child_kept_running_warning(
+                "supervisor_protocol_failure",
+                "supervisor_event_reader_start_failure",
+                &child_supervisor::sensitive_environment_values(&request.environment),
+            );
+            emit_warning(
+                slot,
+                unit_name,
+                &warning,
+                &child_supervisor::sensitive_environment_values(&request.environment),
+            );
+            None
         }
     };
+    let launch_observation = started_child_observation(unit_observed, event_reader.is_some());
 
     let _ = child_supervisor::emit_compositor_diagnostic(
         slot,
@@ -848,19 +1348,21 @@ fn start_unit(slot: u32, unit_name: &str, mut request: LaunchRequest) -> StartAt
         &child_supervisor::sensitive_environment_values(&request.environment),
     );
     StartAttempt::Started(UnitChild {
-        app_pid: pid,
+        app_pid: Some(pid),
         unit_name: unit_name.to_string(),
         slot,
         child: service_client,
         stderr_reader: Some(stderr_reader),
         events,
-        event_reader: Some(event_reader),
+        event_reader,
         final_event: None,
         app_exit_reported: false,
         event_stream_closed: false,
         supervisor_status: None,
-        stop_requested: false,
         secrets: Vec::new(),
+        unitless: false,
+        exit_observation_failure_reported: false,
+        launch_observation,
     })
 }
 
@@ -1056,6 +1558,31 @@ pub fn escape_unit_component(bytes: &[u8]) -> String {
     escaped
 }
 
+fn shorten_unit_component(basename: &[u8], slot: u32) -> String {
+    let mut digest = 0xcbf29ce484222325_u64;
+    for byte in basename {
+        digest ^= u64::from(*byte);
+        digest = digest.wrapping_mul(0x100000001b3);
+    }
+    let suffix = format!("-{digest:016x}");
+    let fixed = format!("surface{slot}-").len() + suffix.len() + ".service".len();
+    let prefix_capacity = UNIT_NAME_MAX_BYTES.saturating_sub(fixed);
+
+    let mut prefix = String::new();
+    for byte in basename {
+        let token = if byte.is_ascii_alphanumeric() || matches!(*byte, b':' | b'_' | b'.') {
+            (*byte as char).to_string()
+        } else {
+            format!("\\x{byte:02x}")
+        };
+        if prefix.len() + token.len() > prefix_capacity {
+            break;
+        }
+        prefix.push_str(&token);
+    }
+    format!("{prefix}{suffix}")
+}
+
 fn max_slot_for_child(encoded_basename: &str) -> Option<u32> {
     let fixed = "surface".len() + 1 + encoded_basename.len() + ".service".len();
     let digits = UNIT_NAME_MAX_BYTES.checked_sub(fixed)?;
@@ -1093,7 +1620,112 @@ fn next_candidate_slot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
     use std::time::Instant;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            static NEXT_DIRECTORY: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "surf-ace-warning-emission-{}-{}",
+                std::process::id(),
+                NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).expect("diagnostic capture directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct RestorePath(Option<OsString>);
+
+    impl Drop for RestorePath {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.as_ref() {
+                    Some(path) => std::env::set_var("PATH", path),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+    }
+
+    fn assert_warning_submitted(
+        slot: u32,
+        unit_name: &str,
+        warning: &DegradationWarning,
+        secrets: &[String],
+    ) {
+        static PATH_LOCK: Mutex<()> = Mutex::new(());
+        let _path_lock = PATH_LOCK.lock().expect("diagnostic test PATH lock");
+        let root = TestDirectory::new();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).expect("test command directory");
+        let capture = root.path().join("record.txt");
+        let capture_path = capture.to_string_lossy();
+        assert!(!capture_path.contains('\''));
+        let systemd_cat = bin.join("systemd-cat");
+        std::fs::write(
+            &systemd_cat,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = \"--identifier=surf-ace-compositor\" ] || exit 31\n[ \"$2\" = \"--level-prefix=false\" ] || exit 32\nexec /bin/cat > '{capture_path}'\n"
+            ),
+        )
+        .expect("test systemd-cat command");
+        std::fs::set_permissions(&systemd_cat, std::fs::Permissions::from_mode(0o755))
+            .expect("test command is executable");
+
+        let old_path = std::env::var_os("PATH");
+        let _restore_path = RestorePath(old_path.clone());
+        let mut path_entries = vec![bin];
+        if let Some(old_path) = old_path.as_ref() {
+            path_entries.extend(std::env::split_paths(old_path));
+        }
+        let test_path = std::env::join_paths(path_entries).expect("test PATH");
+        unsafe { std::env::set_var("PATH", test_path) };
+        let submitted = emit_warning(slot, unit_name, warning, secrets);
+        drop(_restore_path);
+
+        assert!(submitted, "diagnostic emitter accepted the warning");
+        let record = std::fs::read_to_string(&capture).expect("emitted warning record");
+        let timestamp = record
+            .split_whitespace()
+            .next()
+            .and_then(|field| field.strip_prefix("timestamp_ms="))
+            .and_then(|value| value.parse::<u128>().ok());
+        assert!(
+            timestamp.is_some_and(|value| value > 0),
+            "warning has a timestamp"
+        );
+        assert!(
+            record.contains(&format!(
+                "unit={unit_name} slot={slot} stage={} reason={}",
+                warning.stage, warning.reason
+            )),
+            "warning record missing expected fields: {record}"
+        );
+        for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+            assert!(
+                !record.contains(secret),
+                "warning leaked a synthetic secret"
+            );
+        }
+    }
 
     struct GatedProcessManager {
         started: Sender<()>,
@@ -1105,24 +1737,62 @@ mod tests {
         release: Receiver<()>,
     }
 
-    impl ProcessManagerOperations for GatedProcessManager {
+    struct KeptRunningStartManager;
+
+    impl ProcessManagerOperations for KeptRunningStartManager {
         fn spawn(
             &mut self,
+            _request_id: ProcessRequestId,
             _spec: &ProcessSpec,
             _extra_env: &BTreeMap<String, String>,
-        ) -> Result<u32, String> {
-            let _ = self.started.send(());
-            self.release
-                .recv()
-                .map_err(|_| "test worker release was dropped".to_string())?;
-            Ok(77)
+        ) -> Result<ManagedSpawn, String> {
+            Ok(ManagedSpawn::Started {
+                pid: 77,
+                replaced_pid: None,
+                observation: Some(ProcessLaunchObservation::ChildKeptRunning),
+            })
         }
 
         fn terminate(&mut self, _pid: u32) -> Result<(), String> {
             Ok(())
         }
 
-        fn reap_exited(&mut self) -> Vec<ProcessExit> {
+        fn terminate_unconfirmed(&mut self, _request_id: ProcessRequestId) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn reap_exited(&mut self) -> Vec<ManagedExit> {
+            Vec::new()
+        }
+    }
+
+    impl ProcessManagerOperations for GatedProcessManager {
+        fn spawn(
+            &mut self,
+            _request_id: ProcessRequestId,
+            _spec: &ProcessSpec,
+            _extra_env: &BTreeMap<String, String>,
+        ) -> Result<ManagedSpawn, String> {
+            let _ = self.started.send(());
+            self.release
+                .recv()
+                .map_err(|_| "test worker release was dropped".to_string())?;
+            Ok(ManagedSpawn::Started {
+                pid: 77,
+                replaced_pid: None,
+                observation: None,
+            })
+        }
+
+        fn terminate(&mut self, _pid: u32) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn terminate_unconfirmed(&mut self, _request_id: ProcessRequestId) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn reap_exited(&mut self) -> Vec<ManagedExit> {
             Vec::new()
         }
     }
@@ -1130,9 +1800,10 @@ mod tests {
     impl ProcessManagerOperations for GatedStopManager {
         fn spawn(
             &mut self,
+            _request_id: ProcessRequestId,
             _spec: &ProcessSpec,
             _extra_env: &BTreeMap<String, String>,
-        ) -> Result<u32, String> {
+        ) -> Result<ManagedSpawn, String> {
             Err("test stop manager does not spawn".to_string())
         }
 
@@ -1143,7 +1814,11 @@ mod tests {
                 .map_err(|_| "test stop release was dropped".to_string())
         }
 
-        fn reap_exited(&mut self) -> Vec<ProcessExit> {
+        fn terminate_unconfirmed(&mut self, _request_id: ProcessRequestId) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn reap_exited(&mut self) -> Vec<ManagedExit> {
             Vec::new()
         }
     }
@@ -1208,6 +1883,39 @@ mod tests {
     }
 
     #[test]
+    fn process_worker_keeps_known_pid_on_an_unconfirmed_started_event() {
+        let mut controller = LocalProcessController::with_manager(KeptRunningStartManager);
+        let spec = ProcessSpec {
+            command: "/bin/true".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+        };
+        let request_id = controller
+            .spawn(&spec, &BTreeMap::new())
+            .expect("spawn queues");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let event = loop {
+            if let Some(event) = controller.poll_events().into_iter().next() {
+                break event;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker result event was not returned"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(
+            event,
+            ProcessControllerEvent::SpawnStartedUnconfirmed {
+                request_id,
+                pid: 77,
+                observation: ProcessLaunchObservation::ChildKeptRunning,
+            }
+        );
+    }
+
+    #[test]
     fn terminate_request_returns_while_systemd_worker_is_blocked() {
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -1261,6 +1969,37 @@ mod tests {
     }
 
     #[test]
+    fn overlong_unit_component_is_shortened_deterministically_with_a_name_fingerprint() {
+        let basename = vec![b'x'; UNIT_NAME_MAX_BYTES + 8];
+        let shortened = shorten_unit_component(&basename, 0);
+        let unit_name = format!("surface0-{shortened}.service");
+        assert!(unit_name.len() <= UNIT_NAME_MAX_BYTES);
+        assert_eq!(shortened, shorten_unit_component(&basename, 0));
+
+        let mut digest = 0xcbf29ce484222325_u64;
+        for byte in &basename {
+            digest ^= u64::from(*byte);
+            digest = digest.wrapping_mul(0x100000001b3);
+        }
+        let suffix = format!("-{digest:016x}");
+        assert!(shortened.ends_with(&suffix));
+        assert_ne!(
+            shorten_unit_component(&basename, 0),
+            shorten_unit_component(&[basename.as_slice(), b"different"].concat(), 0)
+        );
+
+        let mut escaped_basename = vec![b'x'; UNIT_NAME_MAX_BYTES];
+        escaped_basename.push(0xff);
+        let escaped = shorten_unit_component(&escaped_basename, 3);
+        let hash_suffix_len = 17;
+        let prefix = &escaped[..escaped.len() - hash_suffix_len];
+        assert!(!prefix.ends_with('\\'));
+        assert!(!prefix.ends_with("\\x"));
+        assert!(!prefix.ends_with("\\x0"));
+        assert!(format!("surface3-{escaped}.service").len() <= UNIT_NAME_MAX_BYTES);
+    }
+
+    #[test]
     fn main_slot_is_preferred_then_collision_falls_back_to_unused_positive_slot() {
         let occupied = HashSet::new();
         let attempted = HashSet::new();
@@ -1292,6 +2031,136 @@ mod tests {
         let occupied = HashSet::from([0, 1, 2, 3]);
         let attempted = HashSet::new();
         assert_eq!(next_candidate_slot(true, 3, &occupied, &attempted), None);
+    }
+
+    #[test]
+    fn r6_invalid_and_exhausted_names_warn_and_unitless_launch_discards_all_standard_fds() {
+        let invalid = unitless_warning(
+            "unit_name_invalid",
+            "requested executable has no non-empty basename",
+            &[],
+        );
+        assert_eq!(invalid.stage, "unit_name_invalid");
+        assert_eq!(
+            invalid.reason,
+            "requested executable has no non-empty basename unitless_launch"
+        );
+        assert_warning_submitted(0, "unavailable", &invalid, &[]);
+
+        let unit_creation_failure = unitless_warning(
+            "unit_creation_failure",
+            "systemd_run_unavailable_or_failed_to_start",
+            &[],
+        );
+        assert_eq!(unit_creation_failure.stage, "unit_creation_failure");
+        assert!(unit_creation_failure.reason.contains("unitless_launch"));
+        assert_warning_submitted(0, "surface0-sh.service", &unit_creation_failure, &[]);
+
+        let exhausted = unitless_warning(
+            "unit_name_exhausted",
+            "no valid unused child unit name remains",
+            &[],
+        );
+        assert_eq!(exhausted.stage, "unit_name_exhausted");
+        assert!(exhausted.reason.contains("unitless_launch"));
+        assert_warning_submitted(0, "unavailable", &exhausted, &[]);
+
+        let fd_report =
+            std::env::temp_dir().join(format!("surf-ace-unitless-fds-{}", std::process::id()));
+        let spec = ProcessSpec {
+            command: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "for fd in 0 1 2; do target=$(/usr/bin/readlink \"/proc/$$/fd/$fd\") || exit 91; printf '%s=%s\\n' \"$fd\" \"$target\" >> \"$FD_REPORT\"; done".to_string(),
+            ],
+            cwd: None,
+            env: BTreeMap::from([(
+                "FD_REPORT".to_string(),
+                fd_report.to_string_lossy().into_owned(),
+            )]),
+        };
+        let environment = child_supervisor::effective_child_environment(&spec, &BTreeMap::new());
+        let status = unitless_command(&spec, &environment)
+            .status()
+            .expect("unitless child starts");
+        let observed_fds = std::fs::read_to_string(&fd_report).expect("child reports fd targets");
+        let _ = std::fs::remove_file(&fd_report);
+        assert!(status.success(), "child exits successfully: {observed_fds}");
+        assert_eq!(observed_fds, "0=/dev/null\n1=/dev/null\n2=/dev/null\n");
+    }
+
+    #[test]
+    fn r6_shortened_name_warning_names_original_basename_and_sanitizes_it() {
+        let original = "program-synthetic-name-secret";
+        let secrets = vec!["synthetic-name-secret".to_string()];
+        let warning = shortened_unit_warning(original, &secrets);
+        assert_eq!(warning.stage, "unit_name_shortened");
+        assert_eq!(warning.reason, "original_basename=program-[REDACTED]");
+        assert!(!warning.reason.contains("synthetic-name-secret"));
+        assert_warning_submitted(0, "surface0-program.service", &warning, &secrets);
+    }
+
+    #[test]
+    fn r7_pid_collision_replaces_old_tracking_and_records_both_units() {
+        let mut tracked = HashMap::from([(77_u32, "surface1-old.service")]);
+        let previous =
+            replace_stale_pid_tracking(&mut tracked, 77, "surface0-new.service", |old| {
+                old.to_string()
+            })
+            .expect("prior PID tracking is replaced");
+        assert_eq!(previous, "surface1-old.service");
+        assert_eq!(tracked.get(&77), Some(&"surface0-new.service"));
+
+        let warning = application_pid_collision_warning(&previous, "surface0-new.service", &[]);
+        assert_eq!(warning.stage, "application_pid_collision");
+        assert_eq!(
+            warning.reason,
+            "stale_tracking_replaced previous_unit=surface1-old.service new_unit=surface0-new.service"
+        );
+        assert_warning_submitted(0, "surface0-new.service", &warning, &[]);
+    }
+
+    #[test]
+    fn r9_stage_three_and_four_emit_warnings_and_keep_the_correct_observation() {
+        assert_eq!(
+            started_child_observation(false, true),
+            Some(ProcessLaunchObservation::ChildKeptRunning)
+        );
+        assert_eq!(
+            started_child_observation(true, false),
+            Some(ProcessLaunchObservation::ChildKeptRunning)
+        );
+        assert_eq!(started_child_observation(true, true), None);
+
+        let unit_warning = child_kept_running_warning(
+            "unit_observation_failure",
+            "transient_unit_or_sanitizer_path_not_observed",
+            &[],
+        );
+        assert_eq!(unit_warning.stage, "unit_observation_failure");
+        assert!(unit_warning.reason.contains("child_kept_running"));
+        assert_warning_submitted(1, "surface1-unobserved.service", &unit_warning, &[]);
+
+        let reader_warning = child_kept_running_warning(
+            "supervisor_protocol_failure",
+            "supervisor_event_reader_start_failure",
+            &[],
+        );
+        assert_eq!(reader_warning.stage, "supervisor_protocol_failure");
+        assert_eq!(
+            reader_warning.reason,
+            "child_kept_running supervisor_event_reader_start_failure"
+        );
+        assert_warning_submitted(1, "surface1-reader.service", &reader_warning, &[]);
+
+        let unconfirmed = child_start_unconfirmed_warning(
+            "child_start_unconfirmed",
+            "supervisor_started_event_missing",
+            &[],
+        );
+        assert_eq!(unconfirmed.stage, "child_start_unconfirmed");
+        assert!(unconfirmed.reason.contains("child_start_unconfirmed"));
+        assert_warning_submitted(2, "surface2-unconfirmed.service", &unconfirmed, &[]);
     }
 
     #[test]

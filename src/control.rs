@@ -815,13 +815,14 @@ fn main_app_binding_diagnostics(
         _ => "missing",
     }
     .to_string();
-    let process_lineage_status = match expected.as_ref().map(|expectation| expectation.pid) {
+    let process_lineage_status = match expected.as_ref().and_then(|expectation| expectation.pid) {
         Some(expected_pid)
             if crate::runtime::pid_matches_or_descends_from(evidence.process.pid, expected_pid) =>
         {
             "matched"
         }
         Some(_) => "mismatched",
+        None if launch_token_status == "matched" => "unconfirmed",
         None => "missing",
     }
     .to_string();
@@ -877,7 +878,7 @@ fn main_app_binding_diagnostics(
     .to_string();
     let ready = binding_authority == "trusted"
         && launch_token_status == "matched"
-        && process_lineage_status == "matched";
+        && matches!(process_lineage_status.as_str(), "matched" | "unconfirmed");
     RuntimeAppBindingDiagnostics {
         binding_authority,
         binding_block_reason,
@@ -968,6 +969,15 @@ mod tests {
                 pid,
                 result: Ok(()),
             });
+            Ok(())
+        }
+
+        fn terminate_unconfirmed(&mut self, request_id: ProcessRequestId) -> Result<(), String> {
+            self.events
+                .push(ProcessControllerEvent::TerminatedUnconfirmed {
+                    request_id,
+                    result: Ok(()),
+                });
             Ok(())
         }
 
@@ -2312,7 +2322,10 @@ mod tests {
         assert_eq!(status.panes[0].geometry.x, 10.0);
         assert_eq!(
             status.panes[0].external_native_state,
-            ExternalNativeLifecycleState::Launching { pid: 42 }
+            ExternalNativeLifecycleState::Launching {
+                pid: Some(42),
+                unconfirmed: None
+            }
         );
         assert!(status.overlay_role_policy.active_overlay_pane.is_none());
     }
@@ -2384,7 +2397,10 @@ mod tests {
         let status = bind_response.status.expect("status should be returned");
         assert_eq!(
             status.panes[0].external_native_state,
-            ExternalNativeLifecycleState::Attached { pid: 42 }
+            ExternalNativeLifecycleState::Attached {
+                pid: Some(42),
+                unconfirmed: None
+            }
         );
         assert_eq!(
             status.panes[0].external_native_binding_evidence,
@@ -2461,7 +2477,10 @@ mod tests {
         let status = host_response.status.expect("status should be returned");
         assert_eq!(
             status.panes[0].external_native_state,
-            ExternalNativeLifecycleState::Launching { pid: 42 }
+            ExternalNativeLifecycleState::Launching {
+                pid: Some(42),
+                unconfirmed: None
+            }
         );
 
         let update_response = handle_request(
@@ -2498,7 +2517,10 @@ mod tests {
         assert_eq!(status.panes[0].geometry.x, 30.0);
         assert_eq!(
             status.panes[0].external_native_state,
-            ExternalNativeLifecycleState::Launching { pid: 42 }
+            ExternalNativeLifecycleState::Launching {
+                pid: Some(42),
+                unconfirmed: None
+            }
         );
         let native_host = status.panes[0]
             .native_host

@@ -6330,7 +6330,10 @@ fn embedded_toplevel_decoration_mode() -> XdgDecorationMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SurfaceClassification {
     MainApp,
-    NativePane { pane_id: PaneId, launch_pid: u32 },
+    NativePane {
+        pane_id: PaneId,
+        launch_pid: Option<u32>,
+    },
     OverlayCandidate,
     PendingIdentity,
 }
@@ -8804,7 +8807,7 @@ impl RuntimeWaylandState {
                 return;
             };
             let evidence = self.main_app_binding_evidence_for_surface(&surface);
-            let launch_pid = self.expected_main_app_client_pid().unwrap_or(client_pid);
+            let launch_pid = self.expected_main_app_client_pid();
             self.configure_toplevel_for_role(&surface, RuntimeSurfaceRole::MainApp);
             self.main_toplevel = Some(surface);
             self.bridge_main_app_surface_attached(launch_pid, client_pid, evidence);
@@ -8830,7 +8833,7 @@ impl RuntimeWaylandState {
         &mut self,
         surface: ToplevelSurface,
         pane_id: PaneId,
-        launch_pid: u32,
+        launch_pid: Option<u32>,
     ) {
         let Some(client_pid) = self.client_pid_for_toplevel(&surface) else {
             self.retain_ordinary_toplevel(
@@ -8855,7 +8858,8 @@ impl RuntimeWaylandState {
                 .cloned();
             let identity_matches = group_request.as_ref().is_some_and(|group| {
                 let identity = &group.launch_identity;
-                let process_matches = pid_matches_or_descends_from(client_pid, launch_pid)
+                let process_matches = launch_pid
+                    .is_some_and(|pid| pid_matches_or_descends_from(client_pid, pid))
                     || process_launch_token_matches(client_pid, &identity.launch_token);
                 identity.pane_id == pane_id
                     && identity.launch_token
@@ -9046,7 +9050,7 @@ impl RuntimeWaylandState {
     fn native_pane_binding_evidence_for_surface(
         &self,
         surface: &ToplevelSurface,
-        launch_pid: u32,
+        launch_pid: Option<u32>,
     ) -> Option<SurfaceBindingEvidence> {
         let expected_token = lock_state(&self.shared_state)
             .runtime_expected_native_pane_bindings()
@@ -9068,7 +9072,11 @@ impl RuntimeWaylandState {
     fn classify_toplevel(&self, surface: &ToplevelSurface) -> SurfaceClassification {
         if let Some(expectation) = self.expected_main_app_binding() {
             match self.client_pid_for_toplevel(surface) {
-                Some(client_pid) if pid_matches_or_descends_from(client_pid, expectation.pid) => {
+                Some(client_pid)
+                    if expectation
+                        .pid
+                        .is_some_and(|pid| pid_matches_or_descends_from(client_pid, pid)) =>
+                {
                     return SurfaceClassification::MainApp;
                 }
                 Some(client_pid)
@@ -9116,7 +9124,9 @@ impl RuntimeWaylandState {
         let expectation = self.expected_main_app_binding()?;
         let client_pid = self.client_pid_for_toplevel(surface)?;
         Some(
-            pid_matches_or_descends_from(client_pid, expectation.pid)
+            expectation
+                .pid
+                .is_some_and(|pid| pid_matches_or_descends_from(client_pid, pid))
                 || expectation
                     .launch_token
                     .as_deref()
@@ -9613,7 +9623,7 @@ impl RuntimeWaylandState {
         {
             if let Some(pid) = self.client_pid_for_toplevel(surface) {
                 let evidence = self.main_app_binding_evidence_for_surface(surface);
-                self.bridge_main_app_surface_attached(pid, pid, evidence);
+                self.bridge_main_app_surface_attached(Some(pid), pid, evidence);
             }
         }
         self.enforce_main_app_binding_policy();
@@ -10326,7 +10336,7 @@ impl RuntimeWaylandState {
 
     fn expected_main_app_client_pid(&self) -> Option<u32> {
         self.expected_main_app_binding()
-            .map(|expectation| expectation.pid)
+            .and_then(|expectation| expectation.pid)
     }
 
     fn expected_overlay_client_pid(&self) -> Option<u32> {
@@ -10338,14 +10348,16 @@ impl RuntimeWaylandState {
     fn expected_native_pane_for_toplevel(
         &self,
         surface: &ToplevelSurface,
-    ) -> Option<(PaneId, u32)> {
+    ) -> Option<(PaneId, Option<u32>)> {
         let client_pid = self.client_pid_for_toplevel(surface)?;
         let expectations = lock_state(&self.shared_state).runtime_expected_native_pane_bindings();
         expectations
             .iter()
             .find_map(|expectation| {
-                pid_matches_or_descends_from(client_pid, expectation.pid)
-                    .then_some((expectation.pane_id.clone(), expectation.pid))
+                expectation.pid.and_then(|pid| {
+                    pid_matches_or_descends_from(client_pid, pid)
+                        .then_some((expectation.pane_id.clone(), Some(pid)))
+                })
             })
             .or_else(|| {
                 expectations.into_iter().find_map(|expectation| {
@@ -10373,7 +10385,7 @@ impl RuntimeWaylandState {
 
     fn bridge_main_app_surface_attached(
         &self,
-        launch_pid: u32,
+        launch_pid: Option<u32>,
         client_pid: u32,
         evidence: Option<SurfaceBindingEvidence>,
     ) {
@@ -10385,7 +10397,7 @@ impl RuntimeWaylandState {
 
     fn bridge_native_pane_surface_attached(
         &self,
-        launch_pid: u32,
+        launch_pid: Option<u32>,
         client_pid: u32,
         surface_id: Option<u32>,
         evidence: Option<SurfaceBindingEvidence>,
@@ -13357,6 +13369,15 @@ mod tests {
             Ok(())
         }
 
+        fn terminate_unconfirmed(&mut self, request_id: ProcessRequestId) -> Result<(), String> {
+            self.events
+                .push(ProcessControllerEvent::TerminatedUnconfirmed {
+                    request_id,
+                    result: Ok(()),
+                });
+            Ok(())
+        }
+
         fn poll_events(&mut self) -> Vec<ProcessControllerEvent> {
             std::mem::take(&mut self.events)
         }
@@ -15496,7 +15517,7 @@ mod tests {
             std::thread::yield_now();
         }
         let native = wayland.pending_toplevels.remove(0);
-        wayland.assign_native_pane_role(native, pane_id.clone(), std::process::id());
+        wayland.assign_native_pane_role(native, pane_id.clone(), Some(std::process::id()));
         display.flush_clients().unwrap();
         assert_eq!(
             wayland.staged_root_geometry.as_ref().unwrap().pending_flip,
@@ -16278,7 +16299,7 @@ mod tests {
                 && !wayland.pending_toplevels.is_empty()
             {
                 let native = wayland.pending_toplevels.remove(0);
-                wayland.assign_native_pane_role(native, pane_id.clone(), 1);
+                wayland.assign_native_pane_role(native, pane_id.clone(), Some(1));
             }
             display.flush_clients().unwrap();
             std::thread::yield_now();
@@ -16593,7 +16614,7 @@ mod tests {
                     id != main_surface_id && id != native_surface_id
                 });
                 wayland.assign_main_role(main.clone());
-                wayland.assign_native_pane_role(native, pane_id.clone(), std::process::id());
+                wayland.assign_native_pane_role(native, pane_id.clone(), Some(std::process::id()));
                 break main;
             }
             std::thread::yield_now();
@@ -17373,7 +17394,11 @@ mod tests {
         let (native_primary, commands, thread) =
             take_admission_toplevel(&mut display, &mut wayland_state);
         let native_primary_id = surface_id(native_primary.wl_surface());
-        wayland_state.assign_native_pane_role(native_primary, pane_id.clone(), std::process::id());
+        wayland_state.assign_native_pane_role(
+            native_primary,
+            pane_id.clone(),
+            Some(std::process::id()),
+        );
         display
             .flush_clients()
             .expect("native pane role configure must flush");
@@ -17386,7 +17411,7 @@ mod tests {
         wayland_state.assign_native_pane_role(
             unmatched_native,
             pane_id.clone(),
-            std::process::id(),
+            Some(std::process::id()),
         );
         display
             .flush_clients()
