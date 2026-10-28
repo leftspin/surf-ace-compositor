@@ -8846,6 +8846,7 @@ impl RuntimeWaylandState {
             if same_surface(primary.wl_surface(), surface.wl_surface()) {
                 let evidence = self.native_pane_binding_evidence_for_surface(&surface, launch_pid);
                 self.bridge_native_pane_surface_attached(
+                    &pane_id,
                     launch_pid,
                     client_pid,
                     Some(surface_id(surface.wl_surface())),
@@ -8898,6 +8899,7 @@ impl RuntimeWaylandState {
         let surface_id = surface_id(surface.wl_surface());
         self.native_pane_toplevels.insert(pane_id.clone(), surface);
         self.bridge_native_pane_surface_attached(
+            &pane_id,
             launch_pid,
             client_pid,
             Some(surface_id),
@@ -10397,15 +10399,17 @@ impl RuntimeWaylandState {
 
     fn bridge_native_pane_surface_attached(
         &self,
+        pane_id: &PaneId,
         launch_pid: Option<u32>,
         client_pid: u32,
         surface_id: Option<u32>,
         evidence: Option<SurfaceBindingEvidence>,
     ) {
         let mut state = lock_state(&self.shared_state);
-        let _ = state.runtime_mark_native_pane_surface_attached_for_launch_pid_with_evidence(
-            launch_pid, client_pid, surface_id, evidence,
-        );
+        let _ = state
+            .runtime_mark_native_pane_surface_attached_for_pane_with_launch_pid_and_evidence(
+                pane_id, launch_pid, client_pid, surface_id, evidence,
+            );
     }
 
     fn bridge_native_pane_window_group_observed(
@@ -10422,9 +10426,10 @@ impl RuntimeWaylandState {
         );
     }
 
-    fn bridge_native_pane_surface_detached(&self, client_pid: u32) {
+    fn bridge_native_pane_surface_detached(&self, pane_id: &PaneId, client_pid: u32) {
         let mut state = lock_state(&self.shared_state);
-        let _ = state.runtime_mark_native_pane_surface_detached_for_pid(client_pid);
+        let _ = state
+            .runtime_mark_native_pane_surface_detached_for_pane_id_and_pid(pane_id, client_pid);
     }
 
     fn bridge_overlay_surface_detached(&self, client_pid: u32) {
@@ -11270,7 +11275,7 @@ impl XdgShellHandler for RuntimeWaylandState {
                     .unwrap_or((false, false, 0));
             if let Some(native) = self.native_pane_toplevels.remove(&pane_id) {
                 if let Some(pid) = self.client_pid_for_toplevel(&native) {
-                    self.bridge_native_pane_surface_detached(pid);
+                    self.bridge_native_pane_surface_detached(&pane_id, pid);
                 }
             }
             self.note_native_pane_owner_disappeared(
