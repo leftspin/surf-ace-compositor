@@ -14061,7 +14061,7 @@ mod tests {
 
         assert!(matches!(
             wayland.classify_toplevel(&toplevel),
-            SurfaceClassification::OverlayCandidate
+            super::SurfaceClassification::OverlayCandidate
         ));
         assert!(
             wayland
