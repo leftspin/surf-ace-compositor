@@ -14121,7 +14121,7 @@ mod tests {
             display
                 .flush_clients()
                 .expect("application identity response must flush");
-            if toplevel_identity(&toplevel).0.as_deref() == Some("ordinary-window") {
+            if super::toplevel_identity(&toplevel).0.as_deref() == Some("ordinary-window") {
                 break;
             }
             assert!(
