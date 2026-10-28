@@ -9370,7 +9370,18 @@ impl RuntimeWaylandState {
                     return SurfaceClassification::MainApp;
                 }
                 Some(_) if expectation.pid.is_some() => {
-                    return SurfaceClassification::KnownMainAppPidMismatch;
+                    let (app_id, title) = toplevel_identity(surface);
+                    if expectation
+                        .binding
+                        .match_identity(app_id.as_deref(), title.as_deref())
+                        == crate::model::MainAppSurfaceBindingMatch::Match
+                    {
+                        return SurfaceClassification::KnownMainAppPidMismatch;
+                    }
+                    // A known PID mismatch cannot be overridden by a matching
+                    // launch token. If its app identity is different, keep
+                    // classifying it for another role instead of treating every
+                    // non-main process as a main-app mismatch.
                 }
                 Some(client_pid)
                     if expectation
@@ -13869,7 +13880,7 @@ mod tests {
     #[test]
     fn failed_overlay_spawn_keeps_a_possible_overlay_visible_unresolved_and_open() {
         let mut state = CompositorState::new(
-            true,
+            false,
             Box::new(NoopProcessController {
                 fail_spawn: true,
                 ..Default::default()
@@ -13934,7 +13945,7 @@ mod tests {
     #[test]
     fn failed_but_live_overlay_owner_keeps_and_recovers_last_good_surface() {
         let mut state = CompositorState::new(
-            true,
+            false,
             Box::new(NoopProcessController {
                 fail_spawn: true,
                 ..Default::default()
@@ -14014,7 +14025,7 @@ mod tests {
     fn overlay_exit_with_live_owner_stays_unresolved_without_retargeting_or_close() {
         let owner_pid = std::process::id();
         let mut state = CompositorState::new(
-            true,
+            false,
             Box::new(NoopProcessController {
                 spawn_pid: Some(owner_pid),
                 ..Default::default()
@@ -14100,14 +14111,14 @@ mod tests {
     fn known_main_pid_mismatch_stays_ordinary_without_binding_or_close() {
         let expected_pid = std::process::id().wrapping_add(1).max(1);
         let mut state = CompositorState::new(
-            true,
+            false,
             Box::new(NoopProcessController {
                 spawn_pid: Some(expected_pid),
                 ..Default::default()
             }),
         );
         state.mark_runtime_running(
-            crate::model::RuntimeBackend::HostDrm,
+            crate::model::RuntimeBackend::Winit,
             Some("wayland-main-pid-mismatch".to_string()),
             320,
             200,
@@ -14130,8 +14141,11 @@ mod tests {
         let mut display: Display<RuntimeWaylandState> = Display::new().unwrap();
         let mut wayland =
             RuntimeWaylandState::new(display.handle(), Arc::clone(&shared_state)).unwrap();
-        let (toplevel, commands, client_thread) =
-            take_admission_toplevel(&mut display, &mut wayland);
+        let (toplevel, commands, client_thread) = take_admission_toplevel_with_app_id(
+            &mut display,
+            &mut wayland,
+            Some("fixture-main-app".to_string()),
+        );
         let surface = toplevel.wl_surface().clone();
         let id = surface_key(&surface);
         wayland.assign_toplevel_role(toplevel.clone());
@@ -14164,14 +14178,14 @@ mod tests {
     fn previously_bound_main_surface_with_known_pid_mismatch_is_demoted_without_close() {
         let expected_pid = std::process::id().wrapping_add(1).max(1);
         let mut state = CompositorState::new(
-            true,
+            false,
             Box::new(NoopProcessController {
                 spawn_pid: Some(expected_pid),
                 ..Default::default()
             }),
         );
         state.mark_runtime_running(
-            crate::model::RuntimeBackend::HostDrm,
+            crate::model::RuntimeBackend::Winit,
             Some("wayland-main-pid-demotion".to_string()),
             320,
             200,
@@ -14485,6 +14499,7 @@ mod tests {
 
     fn spawn_admission_toplevel(
         socket: UnixStream,
+        app_id: Option<String>,
     ) -> (
         mpsc::Receiver<u32>,
         mpsc::Sender<AdmissionToplevelCommand>,
@@ -14506,7 +14521,10 @@ mod tests {
             let surface = compositor.create_surface(&qh, ());
             let surface_id = surface.id().protocol_id();
             let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
-            let _toplevel = xdg_surface.get_toplevel(&qh, ());
+            let toplevel = xdg_surface.get_toplevel(&qh, ());
+            if let Some(app_id) = app_id {
+                toplevel.set_app_id(&app_id);
+            }
             surface.commit();
             connection
                 .flush()
@@ -14541,6 +14559,18 @@ mod tests {
         mpsc::Sender<AdmissionToplevelCommand>,
         std::thread::JoinHandle<()>,
     ) {
+        take_admission_toplevel_with_app_id(display, wayland_state, None)
+    }
+
+    fn take_admission_toplevel_with_app_id(
+        display: &mut Display<RuntimeWaylandState>,
+        wayland_state: &mut RuntimeWaylandState,
+        app_id: Option<String>,
+    ) -> (
+        ToplevelSurface,
+        mpsc::Sender<AdmissionToplevelCommand>,
+        std::thread::JoinHandle<()>,
+    ) {
         let (server_socket, client_socket) = UnixStream::pair().expect("socket pair must create");
         let _server_client = display
             .handle()
@@ -14549,7 +14579,7 @@ mod tests {
                 Arc::new(super::RuntimeClientState::default()),
             )
             .expect("test client must insert");
-        let (ready, commands, thread) = spawn_admission_toplevel(client_socket);
+        let (ready, commands, thread) = spawn_admission_toplevel(client_socket, app_id);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut client_surface_id = None;
         loop {
