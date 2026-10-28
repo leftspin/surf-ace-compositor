@@ -130,6 +130,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -370,15 +371,10 @@ fn host_runtime_test_scripted_failure_phase() -> Option<HostRuntimeTestScriptedF
     }
 }
 
-fn host_runtime_test_scripted_phase(
-    shared_state: &Arc<Mutex<CompositorState>>,
-) -> Option<HostRuntimeTestScriptedFailurePhase> {
+fn host_runtime_test_scripted_phase() -> Option<HostRuntimeTestScriptedFailurePhase> {
     if let Ok(phases) = std::env::var("SURF_ACE_HOST_RUNTIME_TEST_SCRIPTED_PHASES") {
-        let attempt = {
-            let state = lock_state(shared_state);
-            state.status_snapshot().runtime.host_start_attempt_count
-        };
-        let attempt_index = usize::try_from(attempt.saturating_sub(1)).ok()?;
+        static SCRIPTED_PHASE_ATTEMPT: AtomicUsize = AtomicUsize::new(0);
+        let attempt_index = SCRIPTED_PHASE_ATTEMPT.fetch_add(1, Ordering::Relaxed);
         let phase = phases
             .split(',')
             .map(str::trim)
@@ -699,7 +695,7 @@ pub fn run_host_with_control(
         state.mark_runtime_starting(RuntimeBackend::HostDrm);
     }
 
-    match host_runtime_test_scripted_phase(&shared_state) {
+    match host_runtime_test_scripted_phase() {
         Some(HostRuntimeTestScriptedFailurePhase::Starting) => {
             maybe_sleep_host_runtime_test_scripted_hold();
             return Err(RuntimeError::HostSession(

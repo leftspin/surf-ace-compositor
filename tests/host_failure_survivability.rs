@@ -305,11 +305,7 @@ fn host_failure_keeps_control_socket_reachable_while_retrying() {
         "host runtime retry with the failure retained",
         |status| {
             status["status"]["runtime"]["phase"] == Value::String("starting".to_string())
-                && status["status"]["runtime"]["host_start_attempt_count"]
-                    .as_u64()
-                    .unwrap_or_default()
-                    >= 2
-                && status["status"]["runtime"]["last_error"]
+                && status["status"]["runtime"]["last_diagnostic"]
                     .as_str()
                     .is_some_and(|error| error.contains("forced host runtime failure"))
         },
@@ -320,15 +316,9 @@ fn host_failure_keeps_control_socket_reachable_while_retrying() {
         Value::String("starting".to_string())
     );
     assert!(
-        status["status"]["runtime"]["host_start_attempt_count"]
-            .as_u64()
-            .unwrap_or_default()
-            >= 2
-    );
-    assert!(
-        status["status"]["runtime"]["last_error"]
+        status["status"]["runtime"]["last_diagnostic"]
             .as_str()
-            .expect("last_error should remain visible during retry")
+            .expect("retry warning should remain visible during retry")
             .contains("forced host runtime failure")
     );
     assert_eq!(status["status"]["runtime"]["wayland_socket"], Value::Null);
@@ -347,9 +337,9 @@ fn host_failure_keeps_control_socket_reachable_while_retrying() {
     let follow_up = send_control(&socket_path, "{\"type\":\"get_status\"}");
     assert_eq!(follow_up["ok"], Value::Bool(true));
     assert!(
-        follow_up["status"]["runtime"]["last_error"]
+        follow_up["status"]["runtime"]["last_diagnostic"]
             .as_str()
-            .expect("last_error should remain visible during retry")
+            .expect("retry warning should remain visible during retry")
             .contains("forced host runtime failure")
     );
     assert!(
@@ -393,11 +383,7 @@ fn auto_host_failure_keeps_retrying_without_downgrading_to_winit() {
             && status["status"]["runtime"]["runtime_selection_mode"]
                 == Value::String("automatic".to_string())
             && status["status"]["runtime"]["phase"] == Value::String("starting".to_string())
-            && status["status"]["runtime"]["host_start_attempt_count"]
-                .as_u64()
-                .unwrap_or_default()
-                >= 2
-            && status["status"]["runtime"]["last_error"]
+            && status["status"]["runtime"]["last_diagnostic"]
                 .as_str()
                 .is_some_and(|error| error.contains("forced host runtime failure"))
     });
@@ -415,9 +401,9 @@ fn auto_host_failure_keeps_retrying_without_downgrading_to_winit() {
         Value::String("automatic".to_string())
     );
     assert!(
-        status["status"]["runtime"]["last_error"]
+        status["status"]["runtime"]["last_diagnostic"]
             .as_str()
-            .expect("last_error should report the unavailable host display")
+            .expect("retry warning should report the unavailable host display")
             .contains("forced host runtime failure")
     );
     assert_eq!(status["status"]["runtime"]["wayland_socket"], Value::Null);
@@ -503,7 +489,7 @@ fn second_server_survives_optional_control_socket_conflict() {
 }
 
 #[test]
-fn host_startup_failure_retries_and_keeps_last_error_visible() {
+fn host_startup_failure_retries_and_keeps_warning_visible() {
     let unique_suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be monotonic enough for test")
@@ -533,11 +519,7 @@ fn host_startup_failure_retries_and_keeps_last_error_visible() {
         "automatic retry entering starting",
         |status| {
             status["status"]["runtime"]["phase"] == Value::String("starting".to_string())
-                && status["status"]["runtime"]["host_start_attempt_count"]
-                    .as_u64()
-                    .unwrap_or_default()
-                    >= 2
-                && status["status"]["runtime"]["last_error"]
+                && status["status"]["runtime"]["last_diagnostic"]
                     .as_str()
                     .is_some_and(|error| {
                         error.contains("scripted host runtime failure after starting")
@@ -545,9 +527,9 @@ fn host_startup_failure_retries_and_keeps_last_error_visible() {
         },
     );
     assert_eq!(
-        starting["status"]["runtime"]["last_error"]
+        starting["status"]["runtime"]["last_diagnostic"]
             .as_str()
-            .expect("last_error should remain visible while startup retries")
+            .expect("retry warning should remain visible while startup retries")
             .contains("scripted host runtime failure after starting"),
         true
     );
@@ -563,7 +545,7 @@ fn host_startup_failure_retries_and_keeps_last_error_visible() {
 }
 
 #[test]
-fn automatic_preflight_retry_keeps_last_error_until_running() {
+fn automatic_preflight_retry_keeps_warning_visible() {
     let unique_suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be monotonic enough for test")
@@ -593,11 +575,7 @@ fn automatic_preflight_retry_keeps_last_error_until_running() {
         "automatic retry entering preflight_ready",
         |status| {
             status["status"]["runtime"]["phase"] == Value::String("preflight_ready".to_string())
-                && status["status"]["runtime"]["host_start_attempt_count"]
-                    .as_u64()
-                    .unwrap_or_default()
-                    >= 2
-                && status["status"]["runtime"]["last_error"]
+                && status["status"]["runtime"]["last_diagnostic"]
                     .as_str()
                     .is_some_and(|error| {
                         error.contains("scripted host runtime failure after preflight_ready")
@@ -605,9 +583,9 @@ fn automatic_preflight_retry_keeps_last_error_until_running() {
         },
     );
     assert_eq!(
-        preflight_ready["status"]["runtime"]["last_error"]
+        preflight_ready["status"]["runtime"]["last_diagnostic"]
             .as_str()
-            .expect("last_error should remain visible while retry is preflight-ready")
+            .expect("retry warning should remain visible while preflight is ready")
             .contains("scripted host runtime failure after preflight_ready"),
         true
     );
@@ -626,7 +604,7 @@ fn automatic_preflight_retry_keeps_last_error_until_running() {
 }
 
 #[test]
-fn automatic_recovery_clears_last_error_only_when_running_and_owned() {
+fn automatic_recovery_reaches_running_after_startup_failure() {
     let unique_suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be monotonic enough for test")
@@ -656,16 +634,18 @@ fn automatic_recovery_clears_last_error_only_when_running_and_owned() {
         "automatic retry entering preflight_ready",
         |status| {
             status["status"]["runtime"]["phase"] == Value::String("preflight_ready".to_string())
-                && status["status"]["runtime"]["host_start_attempt_count"]
-                    == Value::Number(2u64.into())
+                && status["status"]["runtime"]["wayland_socket"]
+                    == Value::String("wayland-test-running".to_string())
+                && status["status"]["runtime"]["last_diagnostic"]
+                    .as_str()
+                    .is_some_and(|warning| {
+                        warning.contains("scripted host runtime failure after starting")
+                    })
         },
     );
     assert_eq!(
-        preflight_ready["status"]["runtime"]["last_error"]
-            .as_str()
-            .expect("last_error should remain visible while restart is preflight-ready")
-            .contains("scripted host runtime failure after starting"),
-        true
+        preflight_ready["status"]["runtime"]["last_error"],
+        Value::Null
     );
     assert_eq!(
         preflight_ready["status"]["runtime"]["wayland_socket"],
@@ -694,8 +674,11 @@ fn automatic_recovery_clears_last_error_only_when_running_and_owned() {
         "last_error must clear only once running host ownership is live"
     );
     assert_eq!(
-        running["status"]["runtime"]["host_start_attempt_count"],
-        Value::Number(2u64.into())
+        running["status"]["runtime"]["last_diagnostic"]
+            .as_str()
+            .expect("the failure warning should remain in status after recovery")
+            .contains("scripted host runtime failure after starting"),
+        true
     );
     assert_eq!(
         running["status"]["runtime"]["wayland_socket"],
