@@ -13807,6 +13807,7 @@ mod tests {
         let (toplevel, surface, commands, client_thread) =
             take_unresolved_real_toplevel(&mut display, &mut wayland, 80, 48);
         let pane_id = PaneId::new("missing-geometry-pane");
+        wayland.remove_surface_from_unresolved_tracking(&toplevel);
         wayland.assign_native_pane_accessory_or_retain_unresolved(toplevel, pane_id);
 
         let id = surface_key(&surface);
