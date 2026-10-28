@@ -12315,6 +12315,7 @@ mod tests {
         ClaimedHostOutput, ClaimedPresentationPipeline, GLES_INTERMEDIATE_RENDER_FORMAT,
         HostBackendState, HostRuntimeLoopData, OpenedHostDevice, OutputIdentity, PlaneSelection,
         RoleSurfaceMapping, Root4ConsumerStage,
+        mark_host_output_reclaim_pending,
         PresentationToken, RuntimeGeometryMutation, RootGeometryStageStore,
         RuntimeGeometryMutationQueue, RuntimeSurfaceRole, RuntimeWaylandState,
         RegisteredDrmEventSource, ShellOverlayToggleShortcut, StartupPresentOwnership,
@@ -17825,7 +17826,7 @@ mod tests {
         let shared_state = Arc::new(Mutex::new(state));
         let mut display: Display<RuntimeWaylandState> =
             Display::new().expect("test Wayland display should initialize");
-        let display_handle = display.handle();
+        let mut display_handle = display.handle();
         let mut wayland = RuntimeWaylandState::new(display_handle.clone(), shared_state.clone())
             .expect("Wayland runtime state must initialize");
         let (server_socket, client_socket) = UnixStream::pair().unwrap();
