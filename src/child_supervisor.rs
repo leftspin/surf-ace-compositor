@@ -1225,7 +1225,7 @@ mod tests {
         let (failure_tx, failure_rx) = mpsc::channel();
         let failed = AtomicBool::new(false);
         let mut output = Vec::new();
-        let mut reader = Cursor::new(b"token=t285-secret\nfinal=visible".to_vec());
+        let mut reader = Cursor::new(b"token=sample-access-token\nfinal=visible".to_vec());
         pump_stream(
             &mut reader,
             &mut output,
@@ -1238,7 +1238,7 @@ mod tests {
         let output = String::from_utf8(output).expect("sanitized output is utf-8");
         assert!(output.contains("token=[REDACTED]"));
         assert!(output.contains("final=visible"));
-        assert!(!output.contains("t285-secret"));
+        assert!(!output.contains("sample-access-token"));
         assert!(failure_rx.try_recv().is_err());
 
         let (failure_tx, failure_rx) = mpsc::channel();
@@ -1252,7 +1252,7 @@ mod tests {
             &mut output,
             "surface1-foot.service",
             StreamKind::Stdout,
-            &["t285-secret".to_string()],
+            &["sample-access-token".to_string()],
             &failure_tx,
             &failed,
         );
