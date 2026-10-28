@@ -17605,8 +17605,7 @@ mod tests {
                 .runtime
                 .last_diagnostic
                 .as_deref()
-                .is_some_and(|diagnostic| diagnostic
-                    .contains("did not match an accepted secondary-window group"))
+                .is_some_and(|diagnostic| diagnostic.contains("surface identity is unresolved"))
         );
         assert_admission_client_not_closed(&mut display, &mut wayland_state, &commands);
         clients.push((commands, thread));
