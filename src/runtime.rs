@@ -14155,9 +14155,7 @@ mod tests {
                 .runtime
                 .last_diagnostic
                 .as_deref(),
-            Some(
-                "surface identity is unresolved; retained visibly without pane binding"
-            )
+            Some("surface identity is unresolved; retained visibly without pane binding")
         );
         assert_eq!(wayland.surface_admission_warning_count, 1);
         assert_eq!(
