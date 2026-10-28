@@ -2850,7 +2850,11 @@ impl CompositorState {
         evidence: Option<SurfaceBindingEvidence>,
     ) -> Option<PaneId> {
         self.runtime_mark_native_pane_surface_attached_with_evidence_in_pane(
-            Some(pane_id), launch_pid, client_pid, surface_id, evidence,
+            Some(pane_id),
+            launch_pid,
+            client_pid,
+            surface_id,
+            evidence,
         )
     }
 
@@ -5452,14 +5456,17 @@ mod tests {
         assert!(bindings.iter().any(|binding| {
             binding.pane_id == right && binding.pid.is_none() && binding.launch_token.is_some()
         }));
-        assert!(state
-            .runtime_mark_native_pane_surface_attached_for_launch_pid_with_evidence(
-                None,
-                303,
-                Some(903),
-                None,
-            )
-            .is_none(), "a PID-only attach cannot choose between unresolved panes");
+        assert!(
+            state
+                .runtime_mark_native_pane_surface_attached_for_launch_pid_with_evidence(
+                    None,
+                    303,
+                    Some(903),
+                    None,
+                )
+                .is_none(),
+            "a PID-only attach cannot choose between unresolved panes"
+        );
 
         assert_eq!(
             state.runtime_mark_native_pane_surface_attached_for_pane_with_launch_pid_and_evidence(
@@ -5510,11 +5517,17 @@ mod tests {
             }
         );
         assert_eq!(
-            left_status.native_host.as_ref().and_then(|host| host.surface_id),
+            left_status
+                .native_host
+                .as_ref()
+                .and_then(|host| host.surface_id),
             Some(901)
         );
         assert_eq!(
-            right_status.native_host.as_ref().and_then(|host| host.surface_id),
+            right_status
+                .native_host
+                .as_ref()
+                .and_then(|host| host.surface_id),
             Some(902)
         );
     }
@@ -5575,7 +5588,10 @@ mod tests {
             }
         );
         assert_eq!(
-            left_status.native_host.as_ref().and_then(|host| host.surface_id),
+            left_status
+                .native_host
+                .as_ref()
+                .and_then(|host| host.surface_id),
             Some(901),
             "detaching the right pane must leave the left surface attached"
         );
@@ -5587,7 +5603,10 @@ mod tests {
             }
         );
         assert_eq!(
-            right_status.native_host.as_ref().and_then(|host| host.surface_id),
+            right_status
+                .native_host
+                .as_ref()
+                .and_then(|host| host.surface_id),
             None
         );
     }

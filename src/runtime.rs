@@ -10406,9 +10406,10 @@ impl RuntimeWaylandState {
         evidence: Option<SurfaceBindingEvidence>,
     ) {
         let mut state = lock_state(&self.shared_state);
-        let _ = state.runtime_mark_native_pane_surface_attached_for_pane_with_launch_pid_and_evidence(
-            pane_id, launch_pid, client_pid, surface_id, evidence,
-        );
+        let _ = state
+            .runtime_mark_native_pane_surface_attached_for_pane_with_launch_pid_and_evidence(
+                pane_id, launch_pid, client_pid, surface_id, evidence,
+            );
     }
 
     fn bridge_native_pane_window_group_observed(
@@ -10427,9 +10428,8 @@ impl RuntimeWaylandState {
 
     fn bridge_native_pane_surface_detached(&self, pane_id: &PaneId, client_pid: u32) {
         let mut state = lock_state(&self.shared_state);
-        let _ = state.runtime_mark_native_pane_surface_detached_for_pane_id_and_pid(
-            pane_id, client_pid,
-        );
+        let _ = state
+            .runtime_mark_native_pane_surface_detached_for_pane_id_and_pid(pane_id, client_pid);
     }
 
     fn bridge_overlay_surface_detached(&self, client_pid: u32) {
