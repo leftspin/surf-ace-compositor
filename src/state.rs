@@ -3238,6 +3238,55 @@ impl CompositorState {
         }
     }
 
+    pub(crate) fn runtime_active_overlay_lifecycle(&self) -> Option<ExternalNativeLifecycleState> {
+        let pane_id = self.active_overlay_pane_id()?;
+        if is_shell_overlay_pane_id(&pane_id) {
+            Some(self.shell_overlay_lifecycle.clone())
+        } else {
+            self.panes
+                .get(&pane_id)
+                .map(|pane| pane.external_native_state.clone())
+        }
+    }
+
+    pub(crate) fn runtime_recover_overlay_binding_for_existing_surface(
+        &mut self,
+        client_pid: u32,
+    ) -> bool {
+        let Some(pane_id) = self.active_overlay_pane_id() else {
+            return false;
+        };
+        if is_shell_overlay_pane_id(&pane_id) {
+            if matches!(
+                self.shell_overlay_lifecycle,
+                ExternalNativeLifecycleState::Failed { .. }
+            ) {
+                self.shell_overlay_lifecycle = ExternalNativeLifecycleState::Attached {
+                    pid: Some(client_pid),
+                    unconfirmed: None,
+                };
+                return true;
+            }
+            return false;
+        }
+
+        let Some(pane) = self.panes.get_mut(&pane_id) else {
+            return false;
+        };
+        if matches!(
+            pane.external_native_state,
+            ExternalNativeLifecycleState::Failed { .. }
+        ) {
+            pane.external_native_state = ExternalNativeLifecycleState::Attached {
+                pid: Some(client_pid),
+                unconfirmed: None,
+            };
+            pane.external_native_binding_evidence = None;
+            return true;
+        }
+        false
+    }
+
     pub fn runtime_overlay_binding_expected(&self) -> bool {
         self.runtime_expected_overlay_binding().is_some()
     }
@@ -8153,6 +8202,44 @@ mod tests {
             .switch_pane_to_surf_ace(&PaneId::new("p-1"))
             .expect("switch back should work");
         assert!(!state.runtime_overlay_binding_expected());
+    }
+
+    #[test]
+    fn failed_overlay_owner_with_existing_surface_can_restore_its_binding() {
+        let process = FakeProcessController::default();
+        let mut state = CompositorState::new(true, Box::new(process));
+        state
+            .apply_provider_snapshot(vec![pane("p-1", 0, 0, 100, 100)])
+            .expect("provider snapshot should apply");
+        state
+            .switch_pane_to_external_native(
+                &PaneId::new("p-1"),
+                NativeTargetClass::Terminal,
+                terminal_process(),
+            )
+            .expect("external switch should work");
+        let pane_id = PaneId::new("p-1");
+        state
+            .panes
+            .get_mut(&pane_id)
+            .expect("pane exists")
+            .external_native_state = ExternalNativeLifecycleState::Failed {
+            reason: "transient control failure".to_string(),
+        };
+
+        assert!(!state.runtime_overlay_binding_expected());
+        assert!(state.runtime_recover_overlay_binding_for_existing_surface(8123));
+        assert!(matches!(
+            state.runtime_active_overlay_lifecycle(),
+            Some(ExternalNativeLifecycleState::Attached {
+                pid: Some(8123),
+                ..
+            })
+        ));
+        assert_eq!(
+            state.runtime_expected_overlay_binding(),
+            Some((pane_id, 8123))
+        );
     }
 
     #[test]

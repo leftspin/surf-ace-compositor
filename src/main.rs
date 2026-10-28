@@ -506,10 +506,6 @@ fn main() {
             overlay_region_debug_borders,
             sun_schedule_node,
         }) => {
-            if presentation_measurements && runtime != "host" {
-                eprintln!("--presentation-measurements requires --runtime host");
-                std::process::exit(2);
-            }
             let presentation_measurement_collector = presentation_measurements
                 .then(|| Arc::new(PresentationMeasurementCollector::from_kernel_boot_id()));
             let launch = serve_launch.as_deref().or(launch.as_deref());
@@ -612,7 +608,7 @@ fn reject_launch_without_serve(launch: Option<&str>) {
 fn run_server(
     socket_path: PathBuf,
     runtime: &str,
-    host_options: HostRuntimeOptions,
+    mut host_options: HostRuntimeOptions,
     config_path: Option<&Path>,
     main_app_launch_intent_json: Option<&str>,
     launch: Option<&str>,
@@ -634,6 +630,17 @@ fn run_server(
         startup_warnings.push(warning);
     }
     let launch_plan = resolve_runtime_launch_plan(runtime, detect_host_runtime_capable());
+    let (measurements_enabled, measurement_warning) = resolve_presentation_measurements(
+        host_options.presentation_measurement_collector.is_some(),
+        &launch_plan.selected_runtime,
+    );
+    if !measurements_enabled {
+        host_options.presentation_measurement_collector = None;
+    }
+    if let Some(warning) = measurement_warning {
+        eprintln!("{warning}");
+        startup_warnings.push(warning);
+    }
     let output_rotation_memory = output_rotation_state_path
         .or_else(OutputRotationMemory::default_path)
         .map(OutputRotationMemory::new);
@@ -1165,6 +1172,22 @@ fn resolve_runtime_launch_plan(runtime: &str, host_runtime_capable: bool) -> Run
     }
 }
 
+fn resolve_presentation_measurements(
+    requested: bool,
+    selected_runtime: &str,
+) -> (bool, Option<String>) {
+    if requested && selected_runtime != "host" {
+        (
+            false,
+            Some(format!(
+                "--presentation-measurements is unavailable for runtime {selected_runtime}; continuing without measurements"
+            )),
+        )
+    } else {
+        (requested, None)
+    }
+}
+
 fn resolve_optional_runtime_mode(runtime: &str) -> (&str, Option<&'static str>) {
     match runtime {
         "auto" | "none" | "winit" | "host" => (runtime, None),
@@ -1572,8 +1595,9 @@ mod tests {
         Cli, Command, apply_appearance_inputs, initialize_optional_control,
         new_state_with_optional_root4_config, parse_main_app_launch_intent,
         parse_main_app_launch_shorthand, read_optional_root4_config,
-        resolve_main_app_launch_intent, resolve_optional_runtime_mode, resolve_root4_config_scale,
-        resolve_runtime_launch_plan, resolve_startup_output_rotation, spawn_root4_config_watcher,
+        resolve_main_app_launch_intent, resolve_optional_runtime_mode,
+        resolve_presentation_measurements, resolve_root4_config_scale, resolve_runtime_launch_plan,
+        resolve_startup_output_rotation, spawn_root4_config_watcher,
     };
     use clap::Parser;
     use std::fs;
@@ -1622,6 +1646,26 @@ mod tests {
         assert_eq!(
             plan.selection_attempt,
             "auto runtime selection attempted backend=host"
+        );
+    }
+
+    #[test]
+    fn incompatible_measurement_runtime_warns_and_disables_only_measurements() {
+        let (enabled, warning) = resolve_presentation_measurements(true, "winit");
+        assert!(!enabled);
+        assert!(
+            warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("continuing without measurements"))
+        );
+
+        assert_eq!(
+            resolve_presentation_measurements(true, "host"),
+            (true, None)
+        );
+        assert_eq!(
+            resolve_presentation_measurements(false, "winit"),
+            (false, None)
         );
     }
 
