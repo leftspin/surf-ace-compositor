@@ -14148,7 +14148,6 @@ mod tests {
         );
         let surface = toplevel.wl_surface().clone();
         let id = surface_key(&surface);
-        wayland.assign_toplevel_role(toplevel.clone());
 
         assert!(wayland.main_toplevel.is_none());
         assert!(wayland.overlay_toplevel.is_none());
@@ -14603,6 +14602,14 @@ mod tests {
                     commands,
                     thread,
                 );
+            }
+            if let Some(client_surface_id_value) = client_surface_id
+                && let Some(surface) = wayland_state
+                    .ordinary_toplevels
+                    .iter()
+                    .find(|surface| surface_id(surface.wl_surface()) == client_surface_id_value)
+            {
+                return (surface.clone(), commands, thread);
             }
             assert!(
                 std::time::Instant::now() < deadline,
