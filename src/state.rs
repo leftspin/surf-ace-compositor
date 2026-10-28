@@ -2836,7 +2836,40 @@ impl CompositorState {
         surface_id: Option<u32>,
         evidence: Option<SurfaceBindingEvidence>,
     ) -> Option<PaneId> {
+        self.runtime_mark_native_pane_surface_attached_with_evidence_in_pane(
+            None, launch_pid, client_pid, surface_id, evidence,
+        )
+    }
+
+    pub fn runtime_mark_native_pane_surface_attached_for_pane_with_launch_pid_and_evidence(
+        &mut self,
+        pane_id: &PaneId,
+        launch_pid: Option<u32>,
+        client_pid: u32,
+        surface_id: Option<u32>,
+        evidence: Option<SurfaceBindingEvidence>,
+    ) -> Option<PaneId> {
+        self.runtime_mark_native_pane_surface_attached_with_evidence_in_pane(
+            Some(pane_id),
+            launch_pid,
+            client_pid,
+            surface_id,
+            evidence,
+        )
+    }
+
+    fn runtime_mark_native_pane_surface_attached_with_evidence_in_pane(
+        &mut self,
+        expected_pane_id: Option<&PaneId>,
+        launch_pid: Option<u32>,
+        client_pid: u32,
+        surface_id: Option<u32>,
+        evidence: Option<SurfaceBindingEvidence>,
+    ) -> Option<PaneId> {
         for (pane_id, pane) in &mut self.panes {
+            if expected_pane_id.is_some_and(|expected| expected != pane_id) {
+                continue;
+            }
             if !matches!(pane.render_mode, PaneRenderMode::ExternalNative { .. }) {
                 continue;
             }
@@ -2857,7 +2890,10 @@ impl CompositorState {
                 ExternalNativeLifecycleState::Launching {
                     pid: None,
                     unconfirmed: Some(reason),
-                } if launch_pid.is_none() && pane.external_native_launch_token.is_some() => {
+                } if launch_pid.is_none()
+                    && expected_pane_id.is_some()
+                    && pane.external_native_launch_token.is_some() =>
+                {
                     pane.external_native_state = ExternalNativeLifecycleState::Attached {
                         pid: None,
                         unconfirmed: Some(reason),
@@ -2885,7 +2921,10 @@ impl CompositorState {
                     pid: None,
                     unconfirmed: Some(reason),
                     ..
-                } if launch_pid.is_none() && pane.external_native_launch_token.is_some() => {
+                } if launch_pid.is_none()
+                    && expected_pane_id.is_some()
+                    && pane.external_native_launch_token.is_some() =>
+                {
                     pane.external_native_state = ExternalNativeLifecycleState::Attached {
                         pid: None,
                         unconfirmed: Some(reason),
@@ -2906,7 +2945,10 @@ impl CompositorState {
                 ExternalNativeLifecycleState::Attached {
                     pid: None,
                     unconfirmed: Some(_),
-                } if launch_pid.is_none() && pane.external_native_launch_token.is_some() => {
+                } if launch_pid.is_none()
+                    && expected_pane_id.is_some()
+                    && pane.external_native_launch_token.is_some() =>
+                {
                     pane.external_native_surface_id = surface_id;
                     pane.external_native_binding_evidence = evidence;
                     pane.native_pane_window_group = None;
@@ -2990,7 +3032,26 @@ impl CompositorState {
     }
 
     pub fn runtime_mark_native_pane_surface_detached_for_pid(&mut self, client_pid: u32) -> bool {
-        for pane in self.panes.values_mut() {
+        self.runtime_mark_native_pane_surface_detached_in_pane(None, client_pid)
+    }
+
+    pub fn runtime_mark_native_pane_surface_detached_for_pane_id_and_pid(
+        &mut self,
+        pane_id: &PaneId,
+        client_pid: u32,
+    ) -> bool {
+        self.runtime_mark_native_pane_surface_detached_in_pane(Some(pane_id), client_pid)
+    }
+
+    fn runtime_mark_native_pane_surface_detached_in_pane(
+        &mut self,
+        pane_id: Option<&PaneId>,
+        client_pid: u32,
+    ) -> bool {
+        for (current_pane_id, pane) in &mut self.panes {
+            if pane_id.is_some_and(|expected| expected != current_pane_id) {
+                continue;
+            }
             match pane.external_native_state {
                 ExternalNativeLifecycleState::Attached {
                     pid: Some(pid),
@@ -3004,6 +3065,20 @@ impl CompositorState {
                             Some(pid)
                         },
                         unconfirmed,
+                    };
+                    pane.external_native_surface_id = None;
+                    pane.external_native_binding_evidence = None;
+                    pane.native_pane_window_group = None;
+                    self.prune_stale_overlay_regions();
+                    return true;
+                }
+                ExternalNativeLifecycleState::Attached {
+                    pid: None,
+                    unconfirmed: Some(unconfirmed),
+                } if pane_id.is_some() && pane.external_native_launch_token.is_some() => {
+                    pane.external_native_state = ExternalNativeLifecycleState::Launching {
+                        pid: None,
+                        unconfirmed: Some(unconfirmed),
                     };
                     pane.external_native_surface_id = None;
                     pane.external_native_binding_evidence = None;
@@ -4291,6 +4366,26 @@ mod tests {
         }
     }
 
+    fn native_pane_host_request(id: &str, x: f64) -> NativePaneHostRequest {
+        NativePaneHostRequest {
+            window_group: None,
+            id: PaneId::new(id),
+            content_id: Some(format!("content-{id}")),
+            binding_id: Some(format!("binding-{id}")),
+            launch_token: None,
+            revision: 1,
+            geometry: PaneGeometry {
+                x,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+                coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+            },
+            target: NativeTargetClass::Terminal,
+            process: terminal_process(),
+        }
+    }
+
     fn temp_rotation_memory() -> OutputRotationMemory {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -5336,6 +5431,183 @@ mod tests {
                 .expect("native host status should be present")
                 .surface_id,
             Some(303)
+        );
+    }
+
+    #[test]
+    fn unconfirmed_native_pane_surfaces_attach_to_the_resolved_pane() {
+        let process = FakeProcessController::default().with_unconfirmed_spawn(true);
+        let mut state = CompositorState::new(true, Box::new(process));
+        let left = PaneId::new("left");
+        let right = PaneId::new("right");
+        state
+            .apply_native_pane_host_plan(vec![
+                native_pane_host_request("left", 0.0),
+                native_pane_host_request("right", 100.0),
+            ])
+            .expect("native pane host plan should apply");
+        state
+            .launch_native_pane_hosts(Vec::new())
+            .expect("both native panes should launch");
+        let bindings = state.runtime_expected_native_pane_bindings();
+        assert!(bindings.iter().any(|binding| {
+            binding.pane_id == left && binding.pid.is_none() && binding.launch_token.is_some()
+        }));
+        assert!(bindings.iter().any(|binding| {
+            binding.pane_id == right && binding.pid.is_none() && binding.launch_token.is_some()
+        }));
+        assert!(
+            state
+                .runtime_mark_native_pane_surface_attached_for_launch_pid_with_evidence(
+                    None,
+                    303,
+                    Some(903),
+                    None,
+                )
+                .is_none(),
+            "a PID-only attach cannot choose between unresolved panes"
+        );
+
+        assert_eq!(
+            state.runtime_mark_native_pane_surface_attached_for_pane_with_launch_pid_and_evidence(
+                &right,
+                None,
+                202,
+                Some(902),
+                None,
+            ),
+            Some(right.clone()),
+            "the right surface must bind to the pane resolved by its launch token"
+        );
+        assert_eq!(
+            state.runtime_mark_native_pane_surface_attached_for_pane_with_launch_pid_and_evidence(
+                &left,
+                None,
+                101,
+                Some(901),
+                None,
+            ),
+            Some(left.clone()),
+            "a second unconfirmed pane must remain independently attachable"
+        );
+
+        let status = state.status_snapshot();
+        let left_status = status
+            .panes
+            .iter()
+            .find(|pane| pane.id == left)
+            .expect("left pane status should exist");
+        let right_status = status
+            .panes
+            .iter()
+            .find(|pane| pane.id == right)
+            .expect("right pane status should exist");
+        assert_eq!(
+            left_status.external_native_state,
+            ExternalNativeLifecycleState::Attached {
+                pid: None,
+                unconfirmed: Some(ProcessLaunchObservation::ChildStartUnconfirmed),
+            }
+        );
+        assert_eq!(
+            right_status.external_native_state,
+            ExternalNativeLifecycleState::Attached {
+                pid: None,
+                unconfirmed: Some(ProcessLaunchObservation::ChildStartUnconfirmed),
+            }
+        );
+        assert_eq!(
+            left_status
+                .native_host
+                .as_ref()
+                .and_then(|host| host.surface_id),
+            Some(901)
+        );
+        assert_eq!(
+            right_status
+                .native_host
+                .as_ref()
+                .and_then(|host| host.surface_id),
+            Some(902)
+        );
+    }
+
+    #[test]
+    fn unconfirmed_native_pane_detach_clears_only_the_resolved_pane_surface() {
+        let process = FakeProcessController::default().with_unconfirmed_spawn(true);
+        let mut state = CompositorState::new(true, Box::new(process));
+        let left = PaneId::new("left");
+        let right = PaneId::new("right");
+        state
+            .apply_native_pane_host_plan(vec![
+                native_pane_host_request("left", 0.0),
+                native_pane_host_request("right", 100.0),
+            ])
+            .expect("native pane host plan should apply");
+        state
+            .launch_native_pane_hosts(Vec::new())
+            .expect("both native panes should launch");
+        assert_eq!(
+            state.runtime_mark_native_pane_surface_attached_for_pane_with_launch_pid_and_evidence(
+                &left,
+                None,
+                101,
+                Some(901),
+                None,
+            ),
+            Some(left.clone())
+        );
+        assert_eq!(
+            state.runtime_mark_native_pane_surface_attached_for_pane_with_launch_pid_and_evidence(
+                &right,
+                None,
+                202,
+                Some(902),
+                None,
+            ),
+            Some(right.clone())
+        );
+
+        assert!(state.runtime_mark_native_pane_surface_detached_for_pane_id_and_pid(&right, 202));
+        let status = state.status_snapshot();
+        let left_status = status
+            .panes
+            .iter()
+            .find(|pane| pane.id == left)
+            .expect("left pane status should exist");
+        let right_status = status
+            .panes
+            .iter()
+            .find(|pane| pane.id == right)
+            .expect("right pane status should exist");
+        assert_eq!(
+            left_status.external_native_state,
+            ExternalNativeLifecycleState::Attached {
+                pid: None,
+                unconfirmed: Some(ProcessLaunchObservation::ChildStartUnconfirmed),
+            }
+        );
+        assert_eq!(
+            left_status
+                .native_host
+                .as_ref()
+                .and_then(|host| host.surface_id),
+            Some(901),
+            "detaching the right pane must leave the left surface attached"
+        );
+        assert_eq!(
+            right_status.external_native_state,
+            ExternalNativeLifecycleState::Launching {
+                pid: None,
+                unconfirmed: Some(ProcessLaunchObservation::ChildStartUnconfirmed),
+            }
+        );
+        assert_eq!(
+            right_status
+                .native_host
+                .as_ref()
+                .and_then(|host| host.surface_id),
+            None
         );
     }
 
