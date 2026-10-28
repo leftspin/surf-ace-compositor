@@ -17555,9 +17555,7 @@ mod tests {
                 .runtime
                 .last_diagnostic
                 .as_deref()
-                .is_some_and(
-                    |diagnostic| diagnostic.contains("different process than the active overlay")
-                )
+                .is_some_and(|diagnostic| diagnostic.contains("surface identity is unresolved"))
         );
         assert_admission_client_not_closed(&mut display, &mut wayland_state, &commands);
         clients.push((commands, thread));
