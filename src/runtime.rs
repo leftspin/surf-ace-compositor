@@ -14063,15 +14063,19 @@ mod tests {
             wayland.classify_toplevel(&toplevel),
             SurfaceClassification::OverlayCandidate
         ));
-        assert!(wayland
-            .pending_toplevels
-            .iter()
-            .any(|pending| same_surface(pending.wl_surface(), &surface)));
+        assert!(
+            wayland
+                .pending_toplevels
+                .iter()
+                .any(|pending| same_surface(pending.wl_surface(), &surface))
+        );
         assert!(wayland.unresolved_toplevels.contains(&id));
-        assert!(wayland
-            .ordinary_toplevels
-            .iter()
-            .any(|ordinary| same_surface(ordinary.wl_surface(), &surface)));
+        assert!(
+            wayland
+                .ordinary_toplevels
+                .iter()
+                .any(|ordinary| same_surface(ordinary.wl_surface(), &surface))
+        );
         assert!(wayland.overlay_toplevel.is_none());
         assert!(
             lock_state(&shared_state)
@@ -14083,43 +14087,62 @@ mod tests {
         );
         assert_eq!(wayland.surface_admission_warning_count, 1);
 
-        assert_eq!(admission_configure_count(&mut display, &mut wayland, &commands), 1);
+        assert_eq!(
+            admission_configure_count(&mut display, &mut wayland, &commands),
+            1
+        );
         let keyboard = wayland.seat.get_keyboard().unwrap();
         keyboard.set_focus(&mut wayland, Some(surface.clone()), 0.into());
-        assert!(keyboard
-            .current_focus()
-            .as_ref()
-            .is_some_and(|focused| same_surface(focused, &surface)));
+        assert!(
+            keyboard
+                .current_focus()
+                .as_ref()
+                .is_some_and(|focused| same_surface(focused, &surface))
+        );
         for _ in 0..4 {
             wayland.promote_pending_toplevels();
         }
 
         assert!(wayland.unresolved_toplevels.contains(&id));
-        assert!(wayland
-            .ordinary_toplevels
-            .iter()
-            .any(|ordinary| same_surface(ordinary.wl_surface(), &surface)));
-        assert!(wayland.ordinary_keyboard_focus.as_ref().is_some_and(
-            |(focused, _)| same_surface(focused, &surface)
-        ));
-        assert!(keyboard
-            .current_focus()
-            .as_ref()
-            .is_some_and(|focused| same_surface(focused, &surface)));
-        assert!(wayland
-            .pending_toplevels
-            .iter()
-            .any(|pending| same_surface(pending.wl_surface(), &surface)));
+        assert!(
+            wayland
+                .ordinary_toplevels
+                .iter()
+                .any(|ordinary| same_surface(ordinary.wl_surface(), &surface))
+        );
+        assert!(
+            wayland
+                .ordinary_keyboard_focus
+                .as_ref()
+                .is_some_and(|(focused, _)| same_surface(focused, &surface))
+        );
+        assert!(
+            keyboard
+                .current_focus()
+                .as_ref()
+                .is_some_and(|focused| same_surface(focused, &surface))
+        );
+        assert!(
+            wayland
+                .pending_toplevels
+                .iter()
+                .any(|pending| same_surface(pending.wl_surface(), &surface))
+        );
         assert_eq!(
             lock_state(&shared_state)
                 .status_snapshot()
                 .runtime
                 .last_diagnostic
                 .as_deref(),
-            Some("overlay window process does not match the expected owner; retained visibly without binding")
+            Some(
+                "overlay window process does not match the expected owner; retained visibly without binding"
+            )
         );
         assert_eq!(wayland.surface_admission_warning_count, 1);
-        assert_eq!(admission_configure_count(&mut display, &mut wayland, &commands), 1);
+        assert_eq!(
+            admission_configure_count(&mut display, &mut wayland, &commands),
+            1
+        );
 
         commands
             .send(AdmissionToplevelCommand::Finish)
