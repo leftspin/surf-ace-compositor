@@ -9008,11 +9008,37 @@ impl RuntimeWaylandState {
             // Resolve overlay ownership before removing an already-visible
             // unresolved surface. If it is still uncertain, retain its current
             // configure and focus and let the admission snapshot defer retries.
+            let was_ordinary = self
+                .ordinary_toplevels
+                .iter()
+                .any(|ordinary| surface_key(ordinary.wl_surface()) == surface_id);
             self.deferred_overlay_admissions.remove(&surface_id);
             self.enforce_main_app_binding_policy();
             self.assign_overlay_role_or_queue(surface.clone());
             if !self.deferred_overlay_admissions.contains_key(&surface_id) {
-                self.remove_surface_from_unresolved_tracking(&surface);
+                if self
+                    .overlay_toplevel
+                    .as_ref()
+                    .is_some_and(|overlay| same_surface(overlay.wl_surface(), surface.wl_surface()))
+                {
+                    self.remove_surface_from_unresolved_tracking(&surface);
+                } else {
+                    // An ordinary window stays in ordinary_toplevels. Removing
+                    // it from all unresolved tracking must not also remove it
+                    // from rendering, hit-testing, or focus state.
+                    self.pending_toplevels
+                        .retain(|pending| surface_key(pending.wl_surface()) != surface_id);
+                    self.unresolved_toplevels.remove(&surface_id);
+                    if was_ordinary {
+                        // retain_ordinary_toplevel returns early for an item
+                        // already in this list, so emit its admission warning
+                        // here in that case.
+                        self.record_surface_admission_warning(
+                            "overlay candidate was not admitted; retained as an ordinary window"
+                                .to_string(),
+                        );
+                    }
+                }
             }
             return;
         }
@@ -13425,6 +13451,10 @@ mod tests {
     }
 
     enum RealShmToplevelCommand {
+        SetAppId {
+            app_id: String,
+            committed: mpsc::Sender<()>,
+        },
         ReplaceBuffer {
             width: i32,
             height: i32,
@@ -13483,7 +13513,7 @@ mod tests {
             let viewport = viewporter.get_viewport(&surface, &qh, ());
             let surface_id = surface.id().protocol_id();
             let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
-            let _toplevel = xdg_surface.get_toplevel(&qh, ());
+            let toplevel = xdg_surface.get_toplevel(&qh, ());
             surface.commit();
             connection
                 .flush()
@@ -13531,6 +13561,16 @@ mod tests {
                 .expect("test must receive the pane surface ID");
             while let Ok(command) = command_rx.recv() {
                 match command {
+                    RealShmToplevelCommand::SetAppId { app_id, committed } => {
+                        toplevel.set_app_id(app_id);
+                        surface.commit();
+                        connection
+                            .flush()
+                            .expect("application identity update must flush");
+                        committed
+                            .send(())
+                            .expect("test must receive identity update acknowledgement");
+                    }
                     RealShmToplevelCommand::ReplaceBuffer {
                         width,
                         height,
@@ -14036,6 +14076,87 @@ mod tests {
             std::thread::yield_now();
         };
         assert!(!close_received);
+
+        commands.send(RealShmToplevelCommand::Finish).unwrap();
+        client_thread.join().unwrap();
+    }
+
+    #[test]
+    fn promoted_ordinary_app_id_window_remains_tracked_and_rendered() {
+        let shared_state = Arc::new(Mutex::new(CompositorState::new(
+            false,
+            Box::new(NoopProcessController::default()),
+        )));
+        let mut display: Display<RuntimeWaylandState> = Display::new().unwrap();
+        let mut wayland =
+            RuntimeWaylandState::new(display.handle(), Arc::clone(&shared_state)).unwrap();
+        let (toplevel, surface, commands, client_thread) =
+            take_unresolved_real_toplevel(&mut display, &mut wayland, 80, 48);
+        let id = surface_key(&surface);
+
+        assert!(wayland.unresolved_toplevels.contains(&id));
+        assert!(wayland.ordinary_toplevels.iter().any(|ordinary| {
+            same_surface(ordinary.wl_surface(), &surface)
+        }));
+
+        let (committed_tx, committed_rx) = mpsc::channel();
+        commands
+            .send(RealShmToplevelCommand::SetAppId {
+                app_id: "ordinary-window".to_string(),
+                committed: committed_tx,
+            })
+            .unwrap();
+        committed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("real client must commit its application identity");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            display
+                .dispatch_clients(&mut wayland)
+                .expect("application identity update must dispatch");
+            display
+                .flush_clients()
+                .expect("application identity response must flush");
+            if toplevel_identity(&toplevel).0.as_deref() == Some("ordinary-window") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "server must observe the real client's application identity"
+            );
+            std::thread::yield_now();
+        }
+
+        assert!(matches!(
+            wayland.classify_toplevel(&toplevel),
+            super::SurfaceClassification::OverlayCandidate
+        ));
+        assert!(wayland.overlay_toplevel.is_none());
+        assert!(wayland.role_for_surface(&surface).is_none());
+        assert!(!wayland.unresolved_toplevels.contains(&id));
+        assert!(!wayland
+            .pending_toplevels
+            .iter()
+            .any(|pending| same_surface(pending.wl_surface(), &surface)));
+        assert!(wayland.ordinary_toplevels.iter().any(|ordinary| {
+            same_surface(ordinary.wl_surface(), &surface)
+        }));
+        assert_eq!(wayland.surface_admission_warning_count, 2);
+        assert!(lock_state(&shared_state)
+            .status_snapshot()
+            .runtime
+            .last_diagnostic
+            .as_deref()
+            .is_some_and(|warning| {
+                warning.contains("no overlay process is expected")
+                    && warning.contains("retained as an ordinary window")
+            }));
+
+        let mut renderer = surfaceless_test_renderer();
+        let rendered = wayland.collect_render_elements(&mut renderer, 320, 200);
+        assert!(rendered.failure.is_none());
+        assert!(rendered.counts.ordinary_toplevels > 0);
 
         commands.send(RealShmToplevelCommand::Finish).unwrap();
         client_thread.join().unwrap();
