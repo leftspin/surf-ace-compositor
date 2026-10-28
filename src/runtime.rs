@@ -12989,7 +12989,6 @@ mod tests {
             requested: mpsc::Sender<()>,
             completed: mpsc::Sender<u32>,
         },
-        ReadConfigure(mpsc::Sender<Option<(i32, i32)>>),
         CheckClose(mpsc::Sender<bool>),
         Finish,
     }
@@ -13202,14 +13201,6 @@ mod tests {
                             .send(client_state.close_received)
                             .expect("test must receive close-event result");
                     }
-                    RealShmToplevelCommand::ReadConfigure(result) => {
-                        queue
-                            .blocking_dispatch(&mut client_state)
-                            .expect("surface fixture must receive configure events");
-                        result
-                            .send(client_state.toplevel_size)
-                            .expect("test must receive configure readback");
-                    }
                     RealShmToplevelCommand::Finish => break,
                 }
             }
@@ -13251,12 +13242,14 @@ mod tests {
                 .expect("fixture requests must dispatch");
             if !assigned && !wayland_state.pending_toplevels.is_empty() {
                 let surface = wayland_state.pending_toplevels.remove(0);
-                if ordinary {
-                    surface.with_pending_state(|pending| {
-                        pending.size = Some((width, height).into());
-                    });
+                if !ordinary {
+                    let id = super::surface_key(surface.wl_surface());
+                    wayland_state.unresolved_toplevels.remove(&id);
+                    wayland_state
+                        .ordinary_toplevels
+                        .retain(|candidate| super::surface_key(candidate.wl_surface()) != id);
+                    wayland_state.assign_main_role(surface);
                 }
-                wayland_state.assign_main_role(surface);
                 assigned = true;
             }
             display
@@ -13451,6 +13444,7 @@ mod tests {
     #[derive(Default)]
     struct NoopProcessController {
         next_request_id: ProcessRequestId,
+        spawn_pid: Option<u32>,
         events: Vec<ProcessControllerEvent>,
     }
 
@@ -13463,7 +13457,7 @@ mod tests {
             self.next_request_id += 1;
             self.events.push(ProcessControllerEvent::SpawnStarted {
                 request_id: self.next_request_id,
-                pid: 1,
+                pid: self.spawn_pid.unwrap_or(1),
             });
             Ok(self.next_request_id)
         }
@@ -15586,7 +15580,13 @@ mod tests {
 
     #[test]
     fn dynamically_attached_native_pane_is_reconciled_at_pinned_root_commit() {
-        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
+        let mut state = CompositorState::new(
+            true,
+            Box::new(NoopProcessController {
+                spawn_pid: Some(std::process::id()),
+                ..Default::default()
+            }),
+        );
         state.mark_runtime_resize(200, 100);
         let staged = state
             .prepare_root4_rotation(crate::model::OutputRotation::Deg180)
@@ -15602,6 +15602,34 @@ mod tests {
             });
         let staged_consumers = stage_runtime_root_geometry_consumers(&state, staged, None).unwrap();
         assert!(staged_consumers.topology.panes.is_empty());
+        let pane_id = PaneId::new("surface:diagnostic-pane");
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
+                id: pane_id.clone(),
+                content_id: Some("diagnostic-content".to_string()),
+                binding_id: Some("diagnostic-binding".to_string()),
+                launch_token: None,
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 10.0,
+                    y: 5.0,
+                    width: 20.0,
+                    height: 10.0,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+                target: NativeTargetClass::Terminal,
+                process: ProcessSpec {
+                    command: "diagnostic-pane-fixture".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: Default::default(),
+                },
+            }])
+            .expect("dynamic native pane request must be accepted");
+        state
+            .launch_native_pane_hosts(vec![pane_id.clone()])
+            .expect("the fixture must publish a process identity for the pane");
         let shared_state = Arc::new(Mutex::new(state));
         let mut display: Display<RuntimeWaylandState> = Display::new().unwrap();
         let mut display_handle = display.handle();
@@ -15633,32 +15661,6 @@ mod tests {
             "the root geometry snapshot starts before the dynamic pane exists"
         );
 
-        let pane_id = PaneId::new("surface:diagnostic-pane");
-        lock_state(&shared_state)
-            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
-                window_group: None,
-                id: pane_id.clone(),
-                content_id: Some("diagnostic-content".to_string()),
-                binding_id: Some("diagnostic-binding".to_string()),
-                launch_token: None,
-                revision: 1,
-                geometry: PaneGeometry {
-                    x: 10.0,
-                    y: 5.0,
-                    width: 20.0,
-                    height: 10.0,
-                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
-                },
-                target: NativeTargetClass::Terminal,
-                process: ProcessSpec {
-                    command: "diagnostic-pane-fixture".to_string(),
-                    args: Vec::new(),
-                    cwd: None,
-                    env: Default::default(),
-                },
-            }])
-            .expect("dynamic native pane request must be accepted");
-
         let (server_socket, client_socket) = UnixStream::pair().unwrap();
         let server_client = display_handle
             .insert_client(
@@ -15669,7 +15671,7 @@ mod tests {
         let (buffer_ready, client_commands, client_thread) =
             spawn_real_shm_toplevel(client_socket, 20, 10, RealShmPattern::Coordinates);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while wayland.pending_toplevels.is_empty() {
+        while !wayland.native_pane_toplevels.contains_key(&pane_id) {
             assert!(
                 std::time::Instant::now() < deadline,
                 "real client must offer its dynamic native pane toplevel"
@@ -15678,9 +15680,6 @@ mod tests {
             display.flush_clients().unwrap();
             std::thread::yield_now();
         }
-        let native = wayland.pending_toplevels.remove(0);
-        wayland.assign_native_pane_role(native, pane_id.clone(), Some(std::process::id()));
-        display.flush_clients().unwrap();
         assert_eq!(
             wayland.staged_root_geometry.as_ref().unwrap().pending_flip,
             Some(matching_flip),
@@ -15693,25 +15692,16 @@ mod tests {
         let (surface_id, configured_size) = buffer_ready
             .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
             .expect("real client must submit and report its first buffer");
-        assert!(
-            configured_size.is_none_or(|size| size == (0, 0)),
-            "identity-unresolved surface receives no role-specific size hint"
-        );
-        let (configured_tx, configured_rx) = mpsc::channel();
-        client_commands
-            .send(RealShmToplevelCommand::ReadConfigure(configured_tx))
-            .expect("client must read the configure after pane identity is resolved");
         assert_eq!(
-            configured_rx
-                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-                .expect("resolved native pane must receive its role size"),
+            configured_size,
             Some((20, 10)),
-            "the scale-1 Wayland client receives pane logical dimensions after binding"
+            "the surface is classified from its observed client PID before role configure"
         );
         let pane_surface: WlSurface = server_client
             .object_from_protocol_id(&display_handle, surface_id)
             .expect("server must recover the real native pane surface");
         let pane_surface_key = super::surface_key(&pane_surface);
+        assert!(!wayland.unresolved_toplevels.contains(&pane_surface_key));
         assert!(!wayland.host_surface_buffers.contains_key(&pane_surface_key));
 
         // Dispatch the first buffer while the transaction is still pinned.
