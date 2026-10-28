@@ -170,6 +170,14 @@ impl MainAppLaunchIntent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProcessLaunchObservation {
+    #[serde(rename = "child_start_unconfirmed")]
+    ChildStartUnconfirmed,
+    #[serde(rename = "child_kept_running")]
+    ChildKeptRunning,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum MainAppLaunchState {
@@ -177,17 +185,26 @@ pub enum MainAppLaunchState {
     NotRequested,
     WaitingForRuntime,
     Launching {
-        pid: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unconfirmed: Option<ProcessLaunchObservation>,
     },
     Attached {
-        pid: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unconfirmed: Option<ProcessLaunchObservation>,
     },
     Failed {
         reason: String,
     },
     Exited {
-        pid: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
         exit_code: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unconfirmed: Option<ProcessLaunchObservation>,
     },
 }
 
@@ -205,10 +222,28 @@ pub enum PaneRenderMode {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ExternalNativeLifecycleState {
     Absent,
-    Launching { pid: u32 },
-    Attached { pid: u32 },
-    Failed { reason: String },
-    Exited { pid: u32, exit_code: Option<i32> },
+    Launching {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unconfirmed: Option<ProcessLaunchObservation>,
+    },
+    Attached {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unconfirmed: Option<ProcessLaunchObservation>,
+    },
+    Failed {
+        reason: String,
+    },
+    Exited {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
+        exit_code: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unconfirmed: Option<ProcessLaunchObservation>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,7 +1,7 @@
 use crate::model::ProcessSpec;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -37,12 +37,6 @@ pub struct HelperHello {
     pub nonce: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case")]
-pub enum SupervisorCommand {
-    AcceptLaunch,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum SupervisorEvent {
@@ -66,7 +60,7 @@ pub enum SupervisorEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum StreamKind {
     Stdout,
     Stderr,
@@ -89,12 +83,24 @@ enum PumpFailure {
     JournalWriteFailure,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PumpOutcome {
+    EndOfStream,
+    ReadFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainOutcome {
+    EndOfStream,
+    ReadFailure,
+}
+
 impl PumpFailure {
     fn label(self) -> &'static str {
         match self {
             Self::InvalidUtf8 => "invalid_utf8",
             Self::RecordTooLong => "record_too_long",
-            Self::ReadFailure => "stream_read_failure",
+            Self::ReadFailure => "pipe_read_failure",
             Self::JournalWriteFailure => "journal_write_failure",
         }
     }
@@ -229,38 +235,14 @@ fn run_supervisor_session(
     )
     .is_err()
     {
-        terminate_process_group(child.pid, &mut child.child);
-        let outcome = finish_child(&mut child, &secrets, &mut stream);
         emit_unit_record(
             &request.unit_name,
             request.slot,
-            "child_launch_aborted",
-            &format!(
-                "app_pid={} reason=supervisor_started_event_write_failure",
-                outcome.pid
-            ),
+            "child_kept_running",
+            &format!("app_pid={} reason=started_event_unobserved", child.pid),
             &secrets,
             StreamKind::Stderr,
         );
-        return Ok(125);
-    }
-
-    let accepted = matches!(
-        read_frame::<_, SupervisorCommand>(&mut stream),
-        Ok(SupervisorCommand::AcceptLaunch)
-    );
-    if !accepted {
-        terminate_process_group(child.pid, &mut child.child);
-        let outcome = finish_child(&mut child, &secrets, &mut stream);
-        emit_unit_record(
-            &request.unit_name,
-            request.slot,
-            "child_launch_aborted",
-            &format!("app_pid={} reason=parent_observation_failed", outcome.pid),
-            &secrets,
-            StreamKind::Stderr,
-        );
-        return Ok(125);
     }
 
     let outcome = finish_child(&mut child, &secrets, &mut stream);
@@ -290,11 +272,7 @@ fn run_supervisor_session(
 }
 
 fn supervisor_exit_code(outcome: ChildOutcome) -> i32 {
-    if outcome.sanitizer_failed {
-        125
-    } else {
-        outcome.exit_code.unwrap_or(1)
-    }
+    outcome.exit_code.unwrap_or(1)
 }
 
 fn start_child(request: &LaunchRequest, secrets: Vec<String>) -> Result<RunningChild, String> {
@@ -322,69 +300,75 @@ fn start_child(request: &LaunchRequest, secrets: Vec<String>) -> Result<RunningC
         )
     })?;
     let pid = child.id();
-    let Some(stdout) = child.stdout.take() else {
-        terminate_process_group(pid, &mut child);
-        let _ = child.wait();
-        return Err("sanitizer_stdout_pipe_unavailable".to_string());
-    };
-    let Some(stderr) = child.stderr.take() else {
-        terminate_process_group(pid, &mut child);
-        let _ = child.wait();
-        return Err("sanitizer_stderr_pipe_unavailable".to_string());
-    };
     let failed = Arc::new(AtomicBool::new(false));
     let (failure_tx, failure_rx) = mpsc::channel();
-    let stdout_failed = failed.clone();
-    let stdout_tx = failure_tx.clone();
-    let unit_for_stdout = request.unit_name.clone();
-    let secrets_for_stdout = secrets.clone();
-    let stdout_thread = match thread::Builder::new()
-        .name("child-stdout-sanitizer".to_string())
-        .spawn(move || {
-            pump_stream(
-                stdout,
-                io::stdout(),
-                &unit_for_stdout,
-                StreamKind::Stdout,
-                &secrets_for_stdout,
-                &stdout_tx,
-                &stdout_failed,
-            );
-        }) {
-        Ok(thread) => thread,
-        Err(_) => {
-            terminate_process_group(pid, &mut child);
-            let _ = child.wait();
-            return Err("sanitizer_stdout_start_failure".to_string());
+    let stdout_thread = if let Some(stdout) = child.stdout.take() {
+        match spawn_stream_pump(
+            stdout,
+            io::stdout(),
+            request.unit_name.clone(),
+            StreamKind::Stdout,
+            secrets.clone(),
+            failure_tx.clone(),
+            failed.clone(),
+            "child-stdout-sanitizer",
+        ) {
+            Ok(thread) => Some(thread),
+            Err(reader) => {
+                std::mem::forget(reader);
+                report_unreadable_stream(
+                    &request.unit_name,
+                    StreamKind::Stdout,
+                    &secrets,
+                    &failure_tx,
+                    &failed,
+                );
+                None
+            }
         }
+    } else {
+        report_unreadable_stream(
+            &request.unit_name,
+            StreamKind::Stdout,
+            &secrets,
+            &failure_tx,
+            &failed,
+        );
+        None
     };
-    let stderr_failed = failed.clone();
-    let unit_for_stderr = request.unit_name.clone();
-    let stderr_thread = match thread::Builder::new()
-        .name("child-stderr-sanitizer".to_string())
-        .spawn(move || {
-            pump_stream(
-                stderr,
-                io::stderr(),
-                &unit_for_stderr,
-                StreamKind::Stderr,
-                &secrets,
-                &failure_tx,
-                &stderr_failed,
-            );
-        }) {
-        Ok(thread) => thread,
-        Err(_) => {
-            let _ = rustix::process::kill_process_group(
-                rustix::process::Pid::from_raw(pid as i32)
-                    .expect("a spawned child pid is positive"),
-                rustix::process::Signal::KILL,
-            );
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_thread.join();
-            return Err("sanitizer_stderr_start_failure".to_string());
+    let stderr_thread = if let Some(stderr) = child.stderr.take() {
+        match spawn_stream_pump(
+            stderr,
+            io::stderr(),
+            request.unit_name.clone(),
+            StreamKind::Stderr,
+            secrets.clone(),
+            failure_tx.clone(),
+            failed.clone(),
+            "child-stderr-sanitizer",
+        ) {
+            Ok(thread) => Some(thread),
+            Err(reader) => {
+                std::mem::forget(reader);
+                report_unreadable_stream(
+                    &request.unit_name,
+                    StreamKind::Stderr,
+                    &secrets,
+                    &failure_tx,
+                    &failed,
+                );
+                None
+            }
         }
+    } else {
+        report_unreadable_stream(
+            &request.unit_name,
+            StreamKind::Stderr,
+            &secrets,
+            &failure_tx,
+            &failed,
+        );
+        None
     };
 
     Ok(RunningChild {
@@ -394,9 +378,122 @@ fn start_child(request: &LaunchRequest, secrets: Vec<String>) -> Result<RunningC
         slot: request.slot,
         failed,
         failure_rx,
-        stdout_thread: Some(stdout_thread),
-        stderr_thread: Some(stderr_thread),
+        stdout_thread,
+        stderr_thread,
     })
+}
+
+fn spawn_stream_pump<R, W>(
+    reader: R,
+    writer: W,
+    unit_name: String,
+    stream: StreamKind,
+    secrets: Vec<String>,
+    failure_tx: Sender<(StreamKind, PumpFailure)>,
+    failed: Arc<AtomicBool>,
+    thread_name: &str,
+) -> Result<JoinHandle<()>, R>
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    let (reader_tx, reader_rx) = mpsc::channel();
+    let thread = match thread::Builder::new()
+        .name(thread_name.to_string())
+        .spawn(move || {
+            let Ok(mut reader) = reader_rx.recv() else {
+                return;
+            };
+            let mut writer = writer;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pump_stream(
+                    &mut reader,
+                    &mut writer,
+                    &unit_name,
+                    stream,
+                    &secrets,
+                    &failure_tx,
+                    &failed,
+                )
+            }));
+            match result {
+                Ok(PumpOutcome::EndOfStream) => {}
+                Ok(PumpOutcome::ReadFailure) => {
+                    // Keep the owned read end open after an unreadable pipe. Dropping
+                    // it would make the child's next write raise SIGPIPE.
+                    std::mem::forget(reader);
+                }
+                Err(_) => {
+                    let drain = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        drain_discarded_stream(&mut reader)
+                    }));
+                    if !matches!(drain, Ok(DrainOutcome::EndOfStream)) {
+                        // The read end cannot be drained safely, so retain the owned
+                        // descriptor rather than exposing the child to SIGPIPE.
+                        std::mem::forget(reader);
+                    }
+                    report_pump_failure(
+                        &mut writer,
+                        &unit_name,
+                        stream,
+                        PumpFailure::ReadFailure,
+                        &secrets,
+                        &failure_tx,
+                        &failed,
+                        &mut false,
+                    );
+                }
+            }
+        }) {
+        Ok(thread) => thread,
+        Err(_) => return Err(reader),
+    };
+    reader_tx.send(reader).map_err(|error| error.0)?;
+    Ok(thread)
+}
+
+fn drain_discarded_stream(reader: &mut impl Read) -> DrainOutcome {
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return DrainOutcome::EndOfStream,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return DrainOutcome::ReadFailure,
+        }
+    }
+}
+
+fn report_unreadable_stream(
+    unit_name: &str,
+    stream: StreamKind,
+    secrets: &[String],
+    failure_tx: &Sender<(StreamKind, PumpFailure)>,
+    failed: &AtomicBool,
+) {
+    let mut reported = false;
+    match stream {
+        StreamKind::Stdout => report_pump_failure(
+            &mut io::stdout(),
+            unit_name,
+            stream,
+            PumpFailure::ReadFailure,
+            secrets,
+            failure_tx,
+            failed,
+            &mut reported,
+        ),
+        StreamKind::Stderr => report_pump_failure(
+            &mut io::stderr(),
+            unit_name,
+            stream,
+            PumpFailure::ReadFailure,
+            secrets,
+            failure_tx,
+            failed,
+            &mut reported,
+        ),
+    }
 }
 
 fn finish_child(
@@ -407,37 +504,25 @@ fn finish_child(
     let mut exit_code = None;
     let mut child_reaped = false;
     let mut sanitizer_failed = false;
-    let mut failure_reported = false;
+    let mut reported_failures = HashSet::new();
     let mut child_exit_reported = false;
 
     while !child_reaped || !pump_threads_finished(child) {
-        if !sanitizer_failed {
-            if let Ok((stream_kind, failure)) = child.failure_rx.try_recv() {
-                sanitizer_failed = true;
-                child.failed.store(true, Ordering::Release);
-                if !failure_reported {
-                    let reason =
-                        format!("stream={} reason={}", stream_kind.label(), failure.label());
-                    emit_unit_record(
-                        &child.unit_name,
-                        child.slot,
-                        "sanitizer_failure",
-                        &reason,
-                        secrets,
-                        StreamKind::Stderr,
-                    );
-                    let _ = write_frame(
-                        stream,
-                        &SupervisorEvent::SanitizerFailed {
-                            reason: reason.clone(),
-                        },
-                    );
-                    failure_reported = true;
-                }
-                terminate_process_group(child.pid, &mut child.child);
+        while let Ok((stream_kind, failure)) = child.failure_rx.try_recv() {
+            sanitizer_failed = true;
+            child.failed.store(true, Ordering::Release);
+            if reported_failures.insert(stream_kind) {
+                let reason = format!("stream={} reason={}", stream_kind.label(), failure.label());
+                emit_unit_record(
+                    &child.unit_name,
+                    child.slot,
+                    "sanitizer_failure",
+                    &reason,
+                    secrets,
+                    StreamKind::Stderr,
+                );
+                let _ = write_frame(stream, &SupervisorEvent::SanitizerFailed { reason });
             }
-        } else {
-            while child.failure_rx.try_recv().is_ok() {}
         }
 
         if !child_reaped {
@@ -456,9 +541,8 @@ fn finish_child(
                 }
                 Ok(None) => thread::sleep(Duration::from_millis(10)),
                 Err(_) => {
-                    sanitizer_failed = true;
-                    terminate_process_group(child.pid, &mut child.child);
-                    let _ = child.child.wait();
+                    // Observation failure is not permission to signal a running app.
+                    exit_code = child.child.wait().ok().and_then(|status| status.code());
                     child_reaped = true;
                 }
             }
@@ -475,10 +559,9 @@ fn finish_child(
         .stderr_thread
         .take()
         .is_some_and(|thread| thread.join().is_ok());
-    if let Ok((stream_kind, failure)) = child.failure_rx.try_recv() {
+    while let Ok((stream_kind, failure)) = child.failure_rx.try_recv() {
         sanitizer_failed = true;
-        terminate_process_group(child.pid, &mut child.child);
-        if !failure_reported {
+        if reported_failures.insert(stream_kind) {
             let reason = format!("stream={} reason={}", stream_kind.label(), failure.label());
             emit_unit_record(
                 &child.unit_name,
@@ -493,22 +576,22 @@ fn finish_child(
     }
     if !stdout_joined || !stderr_joined {
         sanitizer_failed = true;
-        terminate_process_group(child.pid, &mut child.child);
-        if !failure_reported {
-            emit_unit_record(
-                &child.unit_name,
-                child.slot,
-                "sanitizer_failure",
-                "reason=sanitizer_thread_failure",
-                secrets,
-                StreamKind::Stderr,
-            );
-            let _ = write_frame(
-                stream,
-                &SupervisorEvent::SanitizerFailed {
-                    reason: "reason=sanitizer_thread_failure".to_string(),
-                },
-            );
+        for (stream_kind, joined) in [
+            (StreamKind::Stdout, stdout_joined),
+            (StreamKind::Stderr, stderr_joined),
+        ] {
+            if !joined && reported_failures.insert(stream_kind) {
+                let reason = format!("stream={} reason=pipe_read_failure", stream_kind.label());
+                emit_unit_record(
+                    &child.unit_name,
+                    child.slot,
+                    "sanitizer_failure",
+                    &reason,
+                    secrets,
+                    StreamKind::Stderr,
+                );
+                let _ = write_frame(stream, &SupervisorEvent::SanitizerFailed { reason });
+            }
         }
     }
     if child_reaped && !child_exit_reported {
@@ -541,22 +624,15 @@ fn pump_threads_finished(child: &RunningChild) -> bool {
             .unwrap_or(true)
 }
 
-fn terminate_process_group(pid: u32, child: &mut Child) {
-    if let Some(group) = rustix::process::Pid::from_raw(pid as i32) {
-        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
-    }
-    let _ = child.kill();
-}
-
 fn pump_stream<R: Read, W: Write>(
-    mut reader: R,
+    reader: &mut R,
     mut writer: W,
     unit_name: &str,
     stream: StreamKind,
     secrets: &[String],
     failure_tx: &Sender<(StreamKind, PumpFailure)>,
     failed: &AtomicBool,
-) {
+) -> PumpOutcome {
     let mut record = Vec::with_capacity(4096);
     let mut chunk = [0_u8; 4096];
     let mut discarding = false;
@@ -577,7 +653,7 @@ fn pump_stream<R: Read, W: Write>(
                     failed,
                     &mut reported,
                 );
-                break;
+                return PumpOutcome::ReadFailure;
             }
         };
 
@@ -649,6 +725,7 @@ fn pump_stream<R: Read, W: Write>(
             );
         }
     }
+    PumpOutcome::EndOfStream
 }
 
 fn emit_record<W: Write>(
@@ -834,10 +911,7 @@ fn sensitive_value_replacement(bytes: &[u8], start: usize, key: &str) -> (usize,
     }
     const REDACTION_MARKER: &[u8] = b"[REDACTED]";
     if bytes[start..].starts_with(REDACTION_MARKER) {
-        return (
-            start + REDACTION_MARKER.len(),
-            "[REDACTED]".to_string(),
-        );
+        return (start + REDACTION_MARKER.len(), "[REDACTED]".to_string());
     }
     if bytes[start] == b'\'' || bytes[start] == b'"' {
         let quote = bytes[start];
@@ -1119,9 +1193,10 @@ mod tests {
         let (failure_tx, failure_rx) = mpsc::channel();
         let failed = AtomicBool::new(false);
         let mut output = Vec::new();
+        let mut reader = Cursor::new(input.into_bytes());
 
         pump_stream(
-            Cursor::new(input.into_bytes()),
+            &mut reader,
             &mut output,
             "surface0-redaction-test.service",
             StreamKind::Stdout,
@@ -1150,8 +1225,9 @@ mod tests {
         let (failure_tx, failure_rx) = mpsc::channel();
         let failed = AtomicBool::new(false);
         let mut output = Vec::new();
+        let mut reader = Cursor::new(b"token=t285-secret\nfinal=visible".to_vec());
         pump_stream(
-            Cursor::new(b"token=t285-secret\nfinal=visible".to_vec()),
+            &mut reader,
             &mut output,
             "surface1-foot.service",
             StreamKind::Stderr,
@@ -1170,8 +1246,9 @@ mod tests {
         let mut output = Vec::new();
         let mut oversized = vec![b'x'; MAX_RECORD_BYTES + 1];
         oversized.extend_from_slice(b"\nnext=visible\n");
+        let mut reader = Cursor::new(oversized);
         pump_stream(
-            Cursor::new(oversized),
+            &mut reader,
             &mut output,
             "surface1-foot.service",
             StreamKind::Stdout,
@@ -1192,8 +1269,9 @@ mod tests {
         let (failure_tx, failure_rx) = mpsc::channel();
         let failed = AtomicBool::new(false);
         let mut output = Vec::new();
+        let mut reader = Cursor::new(invalid);
         pump_stream(
-            Cursor::new(invalid),
+            &mut reader,
             &mut output,
             "surface1-foot.service",
             StreamKind::Stderr,
@@ -1250,6 +1328,223 @@ mod tests {
         assert!(read_frame::<_, SupervisorEvent>(&mut parent).is_err());
     }
 
+    struct BrokenWriter;
+
+    impl Write for BrokenWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "synthetic journal delivery failure",
+            ))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "synthetic journal delivery failure",
+            ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct UnreadableSocketReader {
+        _read_end: UnixStream,
+        dropped: Arc<AtomicBool>,
+        panic_on_read: bool,
+    }
+
+    impl Read for UnreadableSocketReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            if self.panic_on_read {
+                panic!("synthetic pipe reader panic");
+            }
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "synthetic unreadable pipe",
+            ))
+        }
+    }
+
+    impl Drop for UnreadableSocketReader {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    struct SharedWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("captured output lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn unreadable_pipe_keeps_the_owned_read_end_open_after_error_or_panic() {
+        for panic_on_read in [false, true] {
+            let (read_end, mut write_end) = UnixStream::pair().expect("socket pair");
+            let dropped = Arc::new(AtomicBool::new(false));
+            let reader = UnreadableSocketReader {
+                _read_end: read_end,
+                dropped: dropped.clone(),
+                panic_on_read,
+            };
+            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (failure_tx, failure_rx) = mpsc::channel();
+            let failed = Arc::new(AtomicBool::new(false));
+            let pump = spawn_stream_pump(
+                reader,
+                SharedWriter(captured.clone()),
+                "surface1-unreadable-pipe.service".to_string(),
+                StreamKind::Stdout,
+                Vec::new(),
+                failure_tx,
+                failed.clone(),
+                "test-unreadable-pipe",
+            )
+            .expect("pump thread starts");
+
+            pump.join().expect("pump completes with a warning");
+            write_end
+                .write_all(b"child write remains connected")
+                .expect("retained read end prevents SIGPIPE");
+            assert!(!dropped.load(Ordering::Acquire));
+            assert!(failed.load(Ordering::Acquire));
+            assert_eq!(
+                failure_rx.try_recv().expect("failure is reported"),
+                (StreamKind::Stdout, PumpFailure::ReadFailure)
+            );
+            let warning = String::from_utf8(captured.lock().expect("captured output lock").clone())
+                .expect("warning is utf-8");
+            assert!(warning.contains("stage=sanitizer_failure reason=pipe_read_failure"));
+        }
+    }
+
+    #[test]
+    fn output_delivery_failure_discards_output_but_keeps_child_until_its_exit() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "printf 'before\\n'; sleep 0.1; printf 'after\\n'; exit 23",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("synthetic child starts");
+        let pid = child.id();
+        let stdout = child.stdout.take().expect("stdout pipe is present");
+        let stderr = child.stderr.take().expect("stderr pipe is present");
+        let failed = Arc::new(AtomicBool::new(false));
+        let (failure_tx, failure_rx) = mpsc::channel();
+        let stdout_failed = failed.clone();
+        let stdout_tx = failure_tx.clone();
+        let stdout_thread = thread::spawn(move || {
+            let mut reader = stdout;
+            pump_stream(
+                &mut reader,
+                &mut BrokenWriter,
+                "surface1-delivery-failure.service",
+                StreamKind::Stdout,
+                &[],
+                &stdout_tx,
+                &stdout_failed,
+            );
+        });
+        let stderr_failed = failed.clone();
+        let stderr_thread = thread::spawn(move || {
+            let mut reader = stderr;
+            pump_stream(
+                &mut reader,
+                &mut BrokenWriter,
+                "surface1-delivery-failure.service",
+                StreamKind::Stderr,
+                &[],
+                &failure_tx,
+                &stderr_failed,
+            );
+        });
+        let mut running = RunningChild {
+            child,
+            pid,
+            unit_name: "surface1-delivery-failure.service".to_string(),
+            slot: 1,
+            failed,
+            failure_rx,
+            stdout_thread: Some(stdout_thread),
+            stderr_thread: Some(stderr_thread),
+        };
+        let (mut supervisor, _parent) = UnixStream::pair().expect("socket pair");
+
+        let outcome = finish_child(&mut running, &[], &mut supervisor);
+
+        assert_eq!(outcome.exit_code, Some(23));
+        assert!(outcome.sanitizer_failed);
+    }
+
+    #[test]
+    fn started_event_delivery_failure_keeps_the_started_child_running() {
+        use std::os::unix::net::UnixListener;
+
+        let socket_path = std::env::temp_dir().join(format!(
+            "surf-ace-child-supervisor-{}-{}.sock",
+            std::process::id(),
+            unix_millis()
+        ));
+        let marker_path = socket_path.with_extension("marker");
+        let listener = UnixListener::bind(&socket_path).expect("listener binds");
+        let socket_arg = socket_path.to_string_lossy().into_owned();
+        let server = thread::spawn(move || {
+            run_supervisor_session(
+                &socket_arg,
+                "synthetic-nonce",
+                "surface1-launch-keep.service",
+                1,
+            )
+        });
+
+        let (mut parent, _) = listener.accept().expect("supervisor connects");
+        let hello: HelperHello = read_frame(&mut parent).expect("helper hello is readable");
+        assert_eq!(hello.nonce, "synthetic-nonce");
+        let marker = marker_path.to_string_lossy().into_owned();
+        let spec = ProcessSpec {
+            command: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "printf 'still-running' > \"$MARKER\"; /bin/sleep 0.1; exit 23".to_string(),
+            ],
+            cwd: None,
+            env: BTreeMap::new(),
+        };
+        let request = LaunchRequest {
+            nonce: hello.nonce,
+            unit_name: "surface1-launch-keep.service".to_string(),
+            slot: 1,
+            spec,
+            environment: vec![EnvironmentEntry {
+                key: b"MARKER".to_vec(),
+                value: marker.as_bytes().to_vec(),
+            }],
+        };
+        write_frame(&mut parent, &request).expect("launch request is sent");
+        drop(parent);
+
+        assert_eq!(server.join().expect("supervisor thread exits").unwrap(), 23);
+        assert_eq!(
+            std::fs::read_to_string(&marker_path).expect("child wrote its completion marker"),
+            "still-running"
+        );
+        let _ = std::fs::remove_file(marker_path);
+        let _ = std::fs::remove_file(socket_path);
+    }
+
     #[test]
     fn frame_protocol_rejects_zero_and_oversized_lengths() {
         let mut zero = Cursor::new(0_u32.to_be_bytes().to_vec());
@@ -1259,7 +1554,7 @@ mod tests {
     }
 
     #[test]
-    fn sanitizer_failure_keeps_child_status_and_fails_the_unit() {
+    fn sanitizer_failure_does_not_replace_the_child_exit_status() {
         assert_eq!(
             supervisor_exit_code(ChildOutcome {
                 pid: 12,
@@ -1274,7 +1569,7 @@ mod tests {
                 exit_code: Some(0),
                 sanitizer_failed: true,
             }),
-            125
+            0
         );
         assert_eq!(
             supervisor_exit_code(ChildOutcome {
