@@ -14523,7 +14523,7 @@ mod tests {
             let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
             let toplevel = xdg_surface.get_toplevel(&qh, ());
             if let Some(app_id) = app_id {
-                toplevel.set_app_id(&app_id);
+                toplevel.set_app_id(app_id);
             }
             surface.commit();
             connection
