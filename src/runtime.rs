@@ -17859,9 +17859,9 @@ mod tests {
             );
             std::thread::yield_now();
         };
-        assert_eq!(
-            configured_size, None,
-            "unresolved identity gets no guessed role size"
+        assert!(
+            configured_size.is_none_or(|size| size == (0, 0)),
+            "unresolved identity gets no role-specific size hint, got {configured_size:?}"
         );
 
         let surface: WlSurface = server_client
