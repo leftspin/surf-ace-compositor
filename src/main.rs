@@ -28,8 +28,8 @@ use surf_ace_compositor::presentation_measurement::PresentationMeasurementCollec
 use surf_ace_compositor::process_manager::LocalProcessController;
 use surf_ace_compositor::runtime::{
     HostRuntimeOptions, RUNTIME_RECOVERY_RETRY_DELAY, RuntimeSelectionReport,
-    parse_shell_overlay_toggle_shortcut, record_recovery_warning_if_changed,
-    retry_runtime_until_stopped, run_host_with_control, run_winit,
+    parse_shell_overlay_toggle_shortcut, retry_runtime_until_stopped, run_host_with_control,
+    run_winit,
 };
 use surf_ace_compositor::screen_capture::ScreenCaptureStore;
 use surf_ace_compositor::state::CompositorState;
@@ -786,6 +786,7 @@ fn run_server(
                 });
             }
 
+            let mut last_winit_warning = None;
             retry_runtime_until_stopped(
                 RUNTIME_RECOVERY_RETRY_DELAY,
                 || run_winit(shared_state.clone()),
@@ -793,7 +794,12 @@ fn run_server(
                     let warning = format!(
                         "winit runtime unavailable; keeping the compositor process alive and retrying: {err}"
                     );
-                    record_recovery_warning_if_changed(&shared_state, warning);
+                    if last_winit_warning.as_deref() == Some(warning.as_str()) {
+                        return;
+                    }
+                    last_winit_warning = Some(warning.clone());
+                    eprintln!("{warning}");
+                    lock_shared_state(&shared_state).record_runtime_diagnostic(warning);
                 },
             );
             appearance_scheduler
@@ -856,6 +862,7 @@ fn run_server(
             // Keep the sender alive for the compositor lifetime. If the optional
             // control listener fails, its sender clone drops, but that must not
             // make the host loop treat the control channel as a shutdown signal.
+            let mut last_host_warning = None;
             loop {
                 let command = {
                     let receiver = match runtime_control_rx.lock() {
@@ -881,11 +888,16 @@ fn run_server(
                                 let warning = format!(
                                     "host runtime unavailable; retaining the compositor process and retrying: {err}"
                                 );
-                                record_recovery_warning_if_changed(&shared_state, warning.clone());
+                                if last_host_warning.as_deref() == Some(warning.as_str()) {
+                                    return;
+                                }
+                                last_host_warning = Some(warning.clone());
+                                eprintln!("{warning}");
                                 let mut state = match shared_state.lock() {
                                     Ok(guard) => guard,
                                     Err(poisoned) => poisoned.into_inner(),
                                 };
+                                state.record_runtime_diagnostic(warning.clone());
                                 if auto_selected_host {
                                     state.set_runtime_selection_status(
                                         surf_ace_compositor::model::RuntimeSelectionMode::Automatic,

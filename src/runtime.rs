@@ -155,6 +155,25 @@ pub fn retry_runtime_until_stopped<E>(
     }
 }
 
+fn retry_runtime_with_data_until_stopped<T, E>(
+    retry_delay: Duration,
+    data: &mut T,
+    mut run_attempt: impl FnMut(&mut T) -> Result<(), E>,
+    mut on_failure: impl FnMut(&mut T, &E),
+) {
+    loop {
+        match run_attempt(data) {
+            Ok(()) => return,
+            Err(error) => {
+                on_failure(data, &error);
+                if !retry_delay.is_zero() {
+                    std::thread::sleep(retry_delay);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct HostRuntimeOptions {
     pub forced_drm_path: Option<PathBuf>,
@@ -391,10 +410,7 @@ fn maybe_sleep_host_runtime_test_scripted_hold() {
     }
 }
 
-pub(crate) fn record_recovery_warning_if_changed(
-    shared_state: &Arc<Mutex<CompositorState>>,
-    warning: String,
-) {
+fn record_recovery_warning_if_changed(shared_state: &Arc<Mutex<CompositorState>>, warning: String) {
     let mut state = lock_state(shared_state);
     if state.status_snapshot().runtime.last_diagnostic.as_deref() != Some(warning.as_str()) {
         eprintln!("{warning}");
@@ -633,16 +649,17 @@ pub fn run_winit(shared_state: Arc<Mutex<CompositorState>>) -> Result<(), Runtim
         );
     }
 
-    retry_runtime_until_stopped(
+    retry_runtime_with_data_until_stopped(
         RUNTIME_RECOVERY_RETRY_DELAY,
-        || {
+        &mut runtime_data,
+        |data| {
             event_loop
-                .run(None, &mut runtime_data, |_| {})
+                .run(None, data, |_| {})
                 .map_err(|err| err.to_string())
         },
-        |err| {
+        |data, err| {
             record_recovery_warning_if_changed(
-                &runtime_data.shared_state,
+                &data.shared_state,
                 format!(
                     "winit event loop failed; retaining clients and the last displayed frame while retrying: {err}"
                 ),
@@ -1163,21 +1180,22 @@ pub fn run_host_with_control(
         overlay_capable,
     );
 
-    retry_runtime_until_stopped(
+    retry_runtime_with_data_until_stopped(
         RUNTIME_RECOVERY_RETRY_DELAY,
-        || {
+        &mut runtime_data,
+        |data| {
             event_loop
-                .run(None, &mut runtime_data, |_| {})
+                .run(None, data, |_| {})
                 .map_err(|err| err.to_string())
         },
-        |err| {
+        |data, err| {
             let old_token = drm_events_source_token.borrow_mut().token.take();
             drm_events_source_token.borrow_mut().device_id = None;
             if let Some(old_token) = old_token {
                 loop_handle.remove(old_token);
             }
             mark_host_output_lost_for_recovery(
-                &mut runtime_data,
+                data,
                 format!("calloop host runtime loop failed: {err}"),
             );
         },
@@ -12488,7 +12506,7 @@ mod tests {
         render_output_size_before_transform, scene_texture_transform, screen_capture_src_flipped,
         render_elements_to_texture,
         same_surface,
-        retry_runtime_until_stopped,
+        retry_runtime_with_data_until_stopped,
         surface_id,
         surface_key,
         composite_scene_texture_to_physical_scanout,
@@ -14223,14 +14241,15 @@ mod tests {
             Ok(()),
         ]);
         let mut warnings = Vec::new();
-        retry_runtime_until_stopped(
+        retry_runtime_with_data_until_stopped(
             Duration::ZERO,
-            || {
+            &mut attempts,
+            |attempts| {
                 attempts
                     .pop_front()
                     .expect("test supplies a terminal success")
             },
-            |error| warnings.push(*error),
+            |_, error| warnings.push(*error),
         );
         assert_eq!(
             warnings,
