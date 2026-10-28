@@ -13204,7 +13204,7 @@ mod tests {
                     }
                     RealShmToplevelCommand::ReadConfigure(result) => {
                         queue
-                            .roundtrip(&mut client_state)
+                            .blocking_dispatch(&mut client_state)
                             .expect("surface fixture must receive configure events");
                         result
                             .send(client_state.toplevel_size)
