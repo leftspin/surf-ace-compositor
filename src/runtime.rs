@@ -14095,9 +14095,12 @@ mod tests {
         let id = surface_key(&surface);
 
         assert!(wayland.unresolved_toplevels.contains(&id));
-        assert!(wayland.ordinary_toplevels.iter().any(|ordinary| {
-            same_surface(ordinary.wl_surface(), &surface)
-        }));
+        assert!(
+            wayland
+                .ordinary_toplevels
+                .iter()
+                .any(|ordinary| { same_surface(ordinary.wl_surface(), &surface) })
+        );
 
         let (committed_tx, committed_rx) = mpsc::channel();
         commands
@@ -14135,23 +14138,30 @@ mod tests {
         assert!(wayland.overlay_toplevel.is_none());
         assert!(wayland.role_for_surface(&surface).is_none());
         assert!(!wayland.unresolved_toplevels.contains(&id));
-        assert!(!wayland
-            .pending_toplevels
-            .iter()
-            .any(|pending| same_surface(pending.wl_surface(), &surface)));
-        assert!(wayland.ordinary_toplevels.iter().any(|ordinary| {
-            same_surface(ordinary.wl_surface(), &surface)
-        }));
+        assert!(
+            !wayland
+                .pending_toplevels
+                .iter()
+                .any(|pending| same_surface(pending.wl_surface(), &surface))
+        );
+        assert!(
+            wayland
+                .ordinary_toplevels
+                .iter()
+                .any(|ordinary| { same_surface(ordinary.wl_surface(), &surface) })
+        );
         assert_eq!(wayland.surface_admission_warning_count, 2);
-        assert!(lock_state(&shared_state)
-            .status_snapshot()
-            .runtime
-            .last_diagnostic
-            .as_deref()
-            .is_some_and(|warning| {
-                warning.contains("no overlay process is expected")
-                    && warning.contains("retained as an ordinary window")
-            }));
+        assert!(
+            lock_state(&shared_state)
+                .status_snapshot()
+                .runtime
+                .last_diagnostic
+                .as_deref()
+                .is_some_and(|warning| {
+                    warning.contains("no overlay process is expected")
+                        && warning.contains("retained as an ordinary window")
+                })
+        );
 
         let mut renderer = surfaceless_test_renderer();
         let rendered = wayland.collect_render_elements(&mut renderer, 320, 200);
