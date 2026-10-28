@@ -6466,6 +6466,13 @@ enum ProcessOwnerState {
     Unknown,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct OverlayAdmissionObservation {
+    expected_pid: Option<u32>,
+    client_pid: Option<u32>,
+    lifecycle: Option<crate::model::ExternalNativeLifecycleState>,
+}
+
 fn process_owner_state(pid: Option<u32>) -> ProcessOwnerState {
     let Some(pid) = pid else {
         return ProcessOwnerState::Unknown;
@@ -6550,6 +6557,9 @@ struct RuntimeWaylandState {
     pending_toplevels: Vec<ToplevelSurface>,
     ordinary_toplevels: Vec<ToplevelSurface>,
     unresolved_toplevels: HashSet<ObjectId>,
+    deferred_overlay_admissions: HashMap<ObjectId, OverlayAdmissionObservation>,
+    #[cfg(test)]
+    surface_admission_warning_count: usize,
     pending_native_pane_accessory_geometry: HashMap<ObjectId, PaneId>,
     ordinary_keyboard_focus: Option<(WlSurface, Option<RuntimeFocusTarget>)>,
     popups: Vec<ManagedPopup>,
@@ -8062,6 +8072,9 @@ impl RuntimeWaylandState {
             pending_toplevels: Vec::new(),
             ordinary_toplevels: Vec::new(),
             unresolved_toplevels: HashSet::new(),
+            deferred_overlay_admissions: HashMap::new(),
+            #[cfg(test)]
+            surface_admission_warning_count: 0,
             pending_native_pane_accessory_geometry: HashMap::new(),
             ordinary_keyboard_focus: None,
             popups: Vec::new(),
@@ -8982,6 +8995,7 @@ impl RuntimeWaylandState {
 
     fn assign_toplevel_role(&mut self, surface: ToplevelSurface) {
         let surface_id = surface_key(surface.wl_surface());
+        self.deferred_overlay_admissions.remove(&surface_id);
         let classification = self.classify_toplevel(&surface);
         self.pending_toplevels
             .retain(|pending| surface_key(pending.wl_surface()) != surface_id);
@@ -9171,18 +9185,26 @@ impl RuntimeWaylandState {
                 state.runtime_active_overlay_lifecycle(),
             )
         };
-        let Some(client_pid) = self.client_pid_for_toplevel(&surface) else {
-            self.retain_unresolved_toplevel_with_reason(
+        let client_pid = self.client_pid_for_toplevel(&surface);
+        let observation = OverlayAdmissionObservation {
+            expected_pid,
+            client_pid,
+            lifecycle: lifecycle.clone(),
+        };
+        let Some(client_pid) = client_pid else {
+            self.retain_unresolved_overlay_toplevel_with_observation(
                 surface,
                 "overlay process identity is unavailable; retained visibly without binding",
+                observation,
             );
             return;
         };
         let Some(expected_pid) = expected_pid else {
             if overlay_lifecycle_is_unconfirmed(lifecycle.as_ref()) {
-                self.retain_unresolved_toplevel_with_reason(
+                self.retain_unresolved_overlay_toplevel_with_observation(
                     surface,
                     "overlay owner state is unconfirmed; retained visibly without binding",
+                    observation,
                 );
             } else {
                 self.retain_ordinary_toplevel(
@@ -9193,9 +9215,10 @@ impl RuntimeWaylandState {
             return;
         };
         if client_pid != expected_pid {
-            self.retain_unresolved_toplevel_with_reason(
+            self.retain_unresolved_overlay_toplevel_with_observation(
                 surface,
                 "overlay window process does not match the expected owner; retained visibly without binding",
+                observation,
             );
             return;
         }
@@ -9213,6 +9236,36 @@ impl RuntimeWaylandState {
         }
     }
 
+    fn overlay_admission_observation(
+        &self,
+        surface: &ToplevelSurface,
+    ) -> OverlayAdmissionObservation {
+        let client_pid = self.client_pid_for_toplevel(surface);
+        let (expected_pid, lifecycle) = {
+            let state = lock_state(&self.shared_state);
+            (
+                state.runtime_expected_overlay_binding().map(|(_, pid)| pid),
+                state.runtime_active_overlay_lifecycle(),
+            )
+        };
+        OverlayAdmissionObservation {
+            expected_pid,
+            client_pid,
+            lifecycle,
+        }
+    }
+
+    fn retain_unresolved_overlay_toplevel_with_observation(
+        &mut self,
+        surface: ToplevelSurface,
+        reason: &str,
+        observation: OverlayAdmissionObservation,
+    ) {
+        let id = surface_key(surface.wl_surface());
+        self.retain_unresolved_toplevel_with_reason(surface, reason);
+        self.deferred_overlay_admissions.insert(id, observation);
+    }
+
     fn retain_ordinary_toplevel(&mut self, surface: ToplevelSurface, reason: &str) {
         let id = surface_key(surface.wl_surface());
         if self
@@ -9228,8 +9281,7 @@ impl RuntimeWaylandState {
         self.configure_toplevel_with_current_role(&surface);
 
         let diagnostic = format!("{reason}; retained as an ordinary window");
-        eprintln!("surface admission warning: {diagnostic}");
-        lock_state(&self.shared_state).record_runtime_diagnostic(diagnostic);
+        self.record_surface_admission_warning(diagnostic);
     }
 
     fn retain_unresolved_toplevel(&mut self, surface: ToplevelSurface) {
@@ -9258,9 +9310,17 @@ impl RuntimeWaylandState {
         if self.unresolved_toplevels.insert(id) {
             self.configure_toplevel_with_current_role(&surface);
             let diagnostic = reason.to_string();
-            eprintln!("surface admission warning: {diagnostic}");
-            lock_state(&self.shared_state).record_runtime_diagnostic(diagnostic);
+            self.record_surface_admission_warning(diagnostic);
         }
+    }
+
+    fn record_surface_admission_warning(&mut self, diagnostic: String) {
+        #[cfg(test)]
+        {
+            self.surface_admission_warning_count += 1;
+        }
+        eprintln!("surface admission warning: {diagnostic}");
+        lock_state(&self.shared_state).record_runtime_diagnostic(diagnostic);
     }
 
     fn remove_surface_from_unresolved_tracking(&mut self, surface: &ToplevelSurface) {
@@ -9270,6 +9330,7 @@ impl RuntimeWaylandState {
         self.ordinary_toplevels
             .retain(|ordinary| surface_key(ordinary.wl_surface()) != id);
         self.unresolved_toplevels.remove(&id);
+        self.deferred_overlay_admissions.remove(&id);
         self.pending_native_pane_accessory_geometry.remove(&id);
         if self
             .ordinary_keyboard_focus
@@ -9304,7 +9365,19 @@ impl RuntimeWaylandState {
                 self.pending_native_pane_accessory_geometry
                     .remove(&surface_id);
             }
-            match self.classify_toplevel(&surface) {
+            let classification = self.classify_toplevel(&surface);
+            if matches!(&classification, SurfaceClassification::OverlayCandidate)
+                && self.deferred_overlay_admissions.get(&surface_id)
+                    == Some(&self.overlay_admission_observation(&surface))
+            {
+                // Overlay classification can remain stable while the process
+                // binding is unresolved. Do not repeatedly remove/re-add the
+                // visible window, configure it, warn, or disturb keyboard focus
+                // until the owner, client, or lifecycle observation changes.
+                self.pending_toplevels.push(surface);
+                continue;
+            }
+            match classification {
                 SurfaceClassification::MainApp
                 | SurfaceClassification::KnownMainAppPidMismatch
                 | SurfaceClassification::NativePane { .. }
@@ -10840,7 +10913,18 @@ impl RuntimeWaylandState {
             return;
         };
         let client_pid = self.client_pid_for_toplevel(&overlay);
-        let lifecycle = lock_state(&self.shared_state).runtime_active_overlay_lifecycle();
+        let (expected_pid, lifecycle) = {
+            let state = lock_state(&self.shared_state);
+            (
+                state.runtime_expected_overlay_binding().map(|(_, pid)| pid),
+                state.runtime_active_overlay_lifecycle(),
+            )
+        };
+        let observation = OverlayAdmissionObservation {
+            expected_pid,
+            client_pid,
+            lifecycle: lifecycle.clone(),
+        };
         let owner_state = process_owner_state(client_pid);
 
         match overlay_surface_disposition(lifecycle.as_ref(), client_pid, owner_state) {
@@ -10875,9 +10959,10 @@ impl RuntimeWaylandState {
             OverlaySurfaceDisposition::RetainUnresolved => {
                 self.overlay_toplevel = None;
                 self.remove_surface_from_unresolved_tracking(&overlay);
-                self.retain_unresolved_toplevel_with_reason(
+                self.retain_unresolved_overlay_toplevel_with_observation(
                     overlay,
                     "overlay owner identity is uncertain; retained visibly unresolved without binding or input retarget",
+                    observation,
                 );
                 self.sync_runtime_status_with_roles();
             }
@@ -13943,6 +14028,106 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_overlay_candidate_repromotion_configures_warns_and_focuses_once() {
+        let expected_pid = std::process::id().wrapping_add(1).max(1);
+        let mut state = CompositorState::new(
+            false,
+            Box::new(NoopProcessController {
+                spawn_pid: Some(expected_pid),
+                ..Default::default()
+            }),
+        );
+        state.configure_shell_overlay_process(Some(ProcessSpec {
+            command: "overlay-fixture".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            env: Default::default(),
+        }));
+        state
+            .toggle_shell_overlay()
+            .expect("overlay launch intent must be recorded");
+
+        let shared_state = Arc::new(Mutex::new(state));
+        let mut display: Display<RuntimeWaylandState> = Display::new().unwrap();
+        let mut wayland =
+            RuntimeWaylandState::new(display.handle(), Arc::clone(&shared_state)).unwrap();
+        let (toplevel, commands, client_thread) = take_admission_toplevel_with_app_id(
+            &mut display,
+            &mut wayland,
+            Some("unrelated-window".to_string()),
+        );
+        let surface = toplevel.wl_surface().clone();
+        let id = surface_key(&surface);
+
+        assert!(matches!(
+            wayland.classify_toplevel(&toplevel),
+            SurfaceClassification::OverlayCandidate
+        ));
+        assert!(wayland
+            .pending_toplevels
+            .iter()
+            .any(|pending| same_surface(pending.wl_surface(), &surface)));
+        assert!(wayland.unresolved_toplevels.contains(&id));
+        assert!(wayland
+            .ordinary_toplevels
+            .iter()
+            .any(|ordinary| same_surface(ordinary.wl_surface(), &surface)));
+        assert!(wayland.overlay_toplevel.is_none());
+        assert!(
+            lock_state(&shared_state)
+                .status_snapshot()
+                .runtime
+                .last_diagnostic
+                .as_deref()
+                .is_some_and(|warning| warning.contains("does not match the expected owner"))
+        );
+        assert_eq!(wayland.surface_admission_warning_count, 1);
+
+        assert_eq!(admission_configure_count(&mut display, &mut wayland, &commands), 1);
+        let keyboard = wayland.seat.get_keyboard().unwrap();
+        keyboard.set_focus(&mut wayland, Some(surface.clone()), 0.into());
+        assert!(keyboard
+            .current_focus()
+            .as_ref()
+            .is_some_and(|focused| same_surface(focused, &surface)));
+        for _ in 0..4 {
+            wayland.promote_pending_toplevels();
+        }
+
+        assert!(wayland.unresolved_toplevels.contains(&id));
+        assert!(wayland
+            .ordinary_toplevels
+            .iter()
+            .any(|ordinary| same_surface(ordinary.wl_surface(), &surface)));
+        assert!(wayland.ordinary_keyboard_focus.as_ref().is_some_and(
+            |(focused, _)| same_surface(focused, &surface)
+        ));
+        assert!(keyboard
+            .current_focus()
+            .as_ref()
+            .is_some_and(|focused| same_surface(focused, &surface)));
+        assert!(wayland
+            .pending_toplevels
+            .iter()
+            .any(|pending| same_surface(pending.wl_surface(), &surface)));
+        assert_eq!(
+            lock_state(&shared_state)
+                .status_snapshot()
+                .runtime
+                .last_diagnostic
+                .as_deref(),
+            Some("overlay window process does not match the expected owner; retained visibly without binding")
+        );
+        assert_eq!(wayland.surface_admission_warning_count, 1);
+        assert_eq!(admission_configure_count(&mut display, &mut wayland, &commands), 1);
+
+        commands
+            .send(AdmissionToplevelCommand::Finish)
+            .expect("admission client must finish");
+        client_thread.join().unwrap();
+    }
+
+    #[test]
     fn failed_but_live_overlay_owner_keeps_and_recovers_last_good_surface() {
         let mut state = CompositorState::new(
             false,
@@ -14493,6 +14678,7 @@ mod tests {
 
     enum AdmissionToplevelCommand {
         CheckClose(mpsc::Sender<bool>),
+        ConfigureCount(mpsc::Sender<u32>),
         Finish,
     }
 
@@ -14542,6 +14728,14 @@ mod tests {
                         result
                             .send(state.close_received)
                             .expect("test must receive close-event result");
+                    }
+                    AdmissionToplevelCommand::ConfigureCount(result) => {
+                        queue
+                            .roundtrip(&mut state)
+                            .expect("configure-count probe must receive server events");
+                        result
+                            .send(state.configure_count)
+                            .expect("test must receive configure count");
                     }
                     AdmissionToplevelCommand::Finish => break,
                 }
@@ -14644,6 +14838,31 @@ mod tests {
                 std::time::Instant::now() < deadline,
                 "admission client must report close probe"
             );
+            std::thread::yield_now();
+        }
+    }
+
+    fn admission_configure_count(
+        display: &mut Display<RuntimeWaylandState>,
+        wayland_state: &mut RuntimeWaylandState,
+        commands: &mpsc::Sender<AdmissionToplevelCommand>,
+    ) -> u32 {
+        let (count_tx, count_rx) = mpsc::channel();
+        commands
+            .send(AdmissionToplevelCommand::ConfigureCount(count_tx))
+            .expect("admission client must accept configure-count probe");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            display
+                .dispatch_clients(wayland_state)
+                .expect("configure-count probe must dispatch");
+            display
+                .flush_clients()
+                .expect("configure-count response must flush");
+            if let Ok(count) = count_rx.try_recv() {
+                return count;
+            }
+            assert!(std::time::Instant::now() < deadline);
             std::thread::yield_now();
         }
     }
