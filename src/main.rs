@@ -862,7 +862,6 @@ fn run_server(
             // Keep the sender alive for the compositor lifetime. If the optional
             // control listener fails, its sender clone drops, but that must not
             // make the host loop treat the control channel as a shutdown signal.
-            let mut last_host_warning = None;
             loop {
                 let command = {
                     let receiver = match runtime_control_rx.lock() {
@@ -874,6 +873,7 @@ fn run_server(
                 let Ok(command) = command else { break };
                 match command {
                     RuntimeControlCommand::StartHostRuntime => {
+                        let mut last_host_warning = None;
                         retry_runtime_until_stopped(
                             RUNTIME_RECOVERY_RETRY_DELAY,
                             || {
