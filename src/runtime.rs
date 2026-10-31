@@ -859,7 +859,7 @@ pub fn run_host_with_control(
                 let dispatch_result =
                     unsafe { display.get_mut().dispatch_clients(&mut data.wayland_state) };
                 match dispatch_result {
-                    Ok(()) => queue_presentation_after_event(data),
+                    Ok(_) => queue_presentation_after_event(data),
                     Err(err) => {
                         record_recovery_warning_if_changed(
                             &data.shared_state,
@@ -15280,11 +15280,11 @@ mod tests {
             !runtime.wayland_state.presentation_needed(),
             "presentation bookkeeping must not schedule another frame"
         );
-        let _ = runtime.queue_presentation_if_needed().unwrap();
+        assert!(runtime.queue_presentation_if_needed().is_ok());
         assert_eq!(runtime.presentation_attempt_count, 0);
 
         runtime.wayland_state.request_presentation();
-        let _ = runtime.queue_presentation_if_needed().unwrap();
+        assert!(runtime.queue_presentation_if_needed().is_ok());
         assert_eq!(runtime.presentation_attempt_count, 1);
         assert!(
             runtime.wayland_state.presentation_needed(),
@@ -15300,7 +15300,7 @@ mod tests {
             runtime.wayland_state.presentation_needed(),
             "visible compositor state changes must schedule a frame"
         );
-        let _ = runtime.queue_presentation_if_needed().unwrap();
+        assert!(runtime.queue_presentation_if_needed().is_ok());
         assert_eq!(runtime.presentation_attempt_count, 2);
     }
 
