@@ -15252,7 +15252,7 @@ mod tests {
         Display<RuntimeWaylandState>,
     ) {
         let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
-        state.mark_runtime_resize(3840, 2160);
+        state.mark_runtime_resize(320, 200);
         let shared_state = Arc::new(Mutex::new(state));
         let display: Display<RuntimeWaylandState> = Display::new().unwrap();
         let display_handle = display.handle();
