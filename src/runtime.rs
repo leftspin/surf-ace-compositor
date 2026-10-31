@@ -15512,9 +15512,10 @@ mod tests {
             std::thread::yield_now();
         }
 
-        runtime
-            .queue_presentation_if_needed()
-            .expect("the host loop must queue after client buffer damage");
+        assert!(
+            runtime.queue_presentation_if_needed().is_ok(),
+            "the host loop must queue after client buffer damage"
+        );
         assert_eq!(
             runtime.presentation_attempt_count, 1,
             "a real client commit must trigger one host presentation attempt"
@@ -15551,9 +15552,10 @@ mod tests {
             runtime.wayland_state.presentation_needed(),
             "the production input handler must request a frame after pointer movement"
         );
-        runtime
-            .queue_presentation_if_needed()
-            .expect("the host loop must queue after pointer movement");
+        assert!(
+            runtime.queue_presentation_if_needed().is_ok(),
+            "the host loop must queue after pointer movement"
+        );
         assert_eq!(
             runtime.presentation_attempt_count, 1,
             "pointer movement must trigger one host presentation attempt"
