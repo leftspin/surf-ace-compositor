@@ -15312,7 +15312,7 @@ mod tests {
             Some(test_claimed_output(device_id, "/dev/dri/card-test"));
         let mut pipeline = test_pipeline(false);
         pipeline.flip_pending = true;
-        pipeline.pending_flip_source = Some(QueuedFlipSource::Dumb);
+        pipeline.pending_flip_source = Some(super::QueuedFlipSource::Dumb);
         pipeline.pending_presentation_token = Some(PresentationToken(7));
         runtime.host_backend.opened_devices.insert(
             device_id,
