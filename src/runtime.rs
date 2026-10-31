@@ -137,6 +137,8 @@ use std::time::Duration;
 use thiserror::Error;
 
 pub const RUNTIME_RECOVERY_RETRY_DELAY: Duration = Duration::from_millis(250);
+const HOST_RUNTIME_HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(250);
+const HOST_PRESENTATION_RETRY_INTERVAL: Duration = Duration::from_millis(16);
 
 pub fn retry_runtime_until_stopped<E>(
     retry_delay: Duration,
@@ -856,13 +858,16 @@ pub fn run_host_with_control(
                 // Safety: display is pinned in this event source for the runtime lifetime.
                 let dispatch_result =
                     unsafe { display.get_mut().dispatch_clients(&mut data.wayland_state) };
-                if let Err(err) = dispatch_result {
-                    record_recovery_warning_if_changed(
-                        &data.shared_state,
-                        format!(
-                            "Wayland client dispatch failed; retaining the compositor and retrying: {err}"
-                        ),
-                    );
+                match dispatch_result {
+                    Ok(()) => queue_presentation_after_event(data),
+                    Err(err) => {
+                        record_recovery_warning_if_changed(
+                            &data.shared_state,
+                            format!(
+                                "Wayland client dispatch failed; retaining the compositor and retrying: {err}"
+                            ),
+                        );
+                    }
                 }
                 Ok(PostAction::Continue)
             },
@@ -914,6 +919,8 @@ pub fn run_host_with_control(
             data.wayland_state.forward_input_event(event);
             let mut state = lock_state(&data.shared_state);
             state.mark_runtime_input_event();
+            drop(state);
+            queue_presentation_after_event(data);
         })
         .map_err(|err| RuntimeError::RegisterSource(err.to_string()))?;
 
@@ -922,15 +929,16 @@ pub fn run_host_with_control(
     loop_handle
         .insert_source(Timer::immediate(), move |_, _, data| {
             if !data.session_active {
-                return TimeoutAction::ToDuration(Duration::from_millis(250));
+                return TimeoutAction::ToDuration(HOST_RUNTIME_HOUSEKEEPING_INTERVAL);
             }
+            lock_state(&data.shared_state).poll_processes();
             data.wayland_state.prune_dead_surfaces();
             if data.host_backend.needs_output_reclaim() {
                 if data.host_backend.opened_count() == 0 {
                     // A device-added udev event is the only useful retry source
                     // while no DRM node is open. Keep Wayland clients alive and
                     // avoid polling an impossible claim at frame rate.
-                    return TimeoutAction::ToDuration(Duration::from_millis(250));
+                    return TimeoutAction::ToDuration(HOST_RUNTIME_HOUSEKEEPING_INTERVAL);
                 }
                 sync_runtime_host_present_capabilities(&data.shared_state, &data.host_backend);
                 data.wayland_state.sync_dmabuf_protocol_formats(None);
@@ -944,9 +952,9 @@ pub fn run_host_with_control(
                         data,
                         format!("host backend has no claimed output and reclaim failed: {err}"),
                     );
-                    return TimeoutAction::ToDuration(Duration::from_millis(250));
+                    return TimeoutAction::ToDuration(HOST_RUNTIME_HOUSEKEEPING_INTERVAL);
                 }
-                return TimeoutAction::ToDuration(Duration::from_millis(16));
+                return TimeoutAction::ToDuration(HOST_PRESENTATION_RETRY_INTERVAL);
             }
             if let Some(device_id) = data.host_backend.presentation_device_id() {
                 let source_matches = {
@@ -968,7 +976,7 @@ pub fn run_host_with_control(
                             "claimed output has no DRM event fd for its presentation device"
                                 .to_string(),
                         );
-                        return TimeoutAction::ToDuration(Duration::from_millis(250));
+                        return TimeoutAction::ToDuration(HOST_RUNTIME_HOUSEKEEPING_INTERVAL);
                     };
                     if let Err(err) = bind_claimed_drm_event_source(
                         &loop_handle_for_timer,
@@ -982,15 +990,22 @@ pub fn run_host_with_control(
                                 "failed to bind DRM events for the active presentation device: {err}"
                             ),
                         );
-                        return TimeoutAction::ToDuration(Duration::from_millis(250));
+                        return TimeoutAction::ToDuration(HOST_RUNTIME_HOUSEKEEPING_INTERVAL);
                     }
                 }
             }
             data.stage_next_root_geometry_mutation();
-            if !data.wayland_state.staged_native_materializations_ready() {
-                return TimeoutAction::ToDuration(Duration::from_millis(16));
+            if data.host_backend.has_pending_presentation_flip() {
+                // The DRM fd is the completion wakeup. Polling while that flip
+                // is pending cannot make another frame queue successfully.
+                return TimeoutAction::ToDuration(HOST_RUNTIME_HOUSEKEEPING_INTERVAL);
             }
-            let presentation = data.queue_pinned_presentation_tick();
+            if !data.wayland_state.staged_native_materializations_ready() {
+                // A native client commit wakes the Wayland source, so waiting
+                // for its correctly sized buffer does not need frame-rate polling.
+                return TimeoutAction::ToDuration(HOST_RUNTIME_HOUSEKEEPING_INTERVAL);
+            }
+            let presentation = data.queue_presentation_if_needed();
             match presentation {
                 Ok(Some(_)) => {}
                 Ok(None) => {}
@@ -1000,11 +1015,11 @@ pub fn run_host_with_control(
                     );
                     if failure.is_transaction() {
                         eprintln!("root4 geometry transaction rejected: {}", failure.error_ref());
-                        return TimeoutAction::ToDuration(Duration::from_millis(16));
+                        return TimeoutAction::ToDuration(HOST_PRESENTATION_RETRY_INTERVAL);
                     }
                     if failure.is_reclaimable() {
                         if restored_previous {
-                            return TimeoutAction::ToDuration(Duration::from_millis(16));
+                            return TimeoutAction::ToDuration(HOST_PRESENTATION_RETRY_INTERVAL);
                         }
                         data.host_backend.mark_claim_lost();
                         sync_runtime_host_present_capabilities(&data.shared_state, &data.host_backend);
@@ -1022,9 +1037,10 @@ pub fn run_host_with_control(
                                 failure.error_ref()
                                 ),
                             );
-                            return TimeoutAction::ToDuration(Duration::from_millis(250));
+                            return TimeoutAction::ToDuration(HOST_RUNTIME_HOUSEKEEPING_INTERVAL);
                         }
-                        return TimeoutAction::ToDuration(Duration::from_millis(16));
+                        data.wayland_state.request_presentation();
+                        return TimeoutAction::ToDuration(HOST_PRESENTATION_RETRY_INTERVAL);
                     }
                     let error = failure.into_error();
                     mark_host_output_lost_for_recovery(
@@ -1034,7 +1050,7 @@ pub fn run_host_with_control(
                     return TimeoutAction::ToDuration(RUNTIME_RECOVERY_RETRY_DELAY);
                 }
             }
-            TimeoutAction::ToDuration(Duration::from_millis(16))
+            TimeoutAction::ToDuration(HOST_RUNTIME_HOUSEKEEPING_INTERVAL)
         })
         .map_err(|err| RuntimeError::RegisterSource(err.to_string()))?;
 
@@ -1053,6 +1069,7 @@ pub fn run_host_with_control(
             }
             SessionSignal::ActivateSession => {
                 data.session_active = true;
+                data.wayland_state.request_presentation();
                 let mut state = lock_state(&data.shared_state);
                 state.set_runtime_host_backend_snapshot(
                     Some(data.host_backend.seat_name.clone()),
@@ -1150,6 +1167,8 @@ pub fn run_host_with_control(
         pending_reclaim_publication: None,
         #[cfg(test)]
         root_geometry_stage_failure: None,
+        #[cfg(test)]
+        presentation_attempt_count: 0,
     };
 
     let (active_connector_name, active_connector_id) =
@@ -1224,6 +1243,8 @@ struct HostRuntimeLoopData {
     pending_reclaim_publication: Option<PendingReclaimPublication>,
     #[cfg(test)]
     root_geometry_stage_failure: Option<Root4ConsumerStage>,
+    #[cfg(test)]
+    presentation_attempt_count: usize,
 }
 
 struct PendingReclaimPublication {
@@ -1398,6 +1419,10 @@ impl HostRuntimeLoopData {
     fn queue_pinned_presentation_tick(
         &mut self,
     ) -> Result<Option<PresentationToken>, HostPresentFailure> {
+        #[cfg(test)]
+        {
+            self.presentation_attempt_count = self.presentation_attempt_count.saturating_add(1);
+        }
         let material_identity = self.wayland_state.accepted_material_identity();
         let identity_accepted =
             self.wayland_state
@@ -1421,11 +1446,16 @@ impl HostRuntimeLoopData {
         // dispatched between pinning this identity and queuing its frame.
         self.wayland_state.presentation_root_geometry =
             self.wayland_state.staged_root_geometry.clone();
+        let presentation_identity = self.wayland_state.presentation_identity();
         let flip_device_id = self.host_backend.presentation_device_id();
         let queued = self
             .host_backend
             .queue_claimed_presentation_tick(&mut self.wayland_state);
         self.wayland_state.presentation_root_geometry = None;
+        if matches!(queued, Ok(Some(_))) {
+            self.wayland_state
+                .note_presentation_queued(presentation_identity);
+        }
         if let Ok(Some(token)) = queued
             && self.wayland_state.staged_root_geometry.is_some()
         {
@@ -1439,6 +1469,19 @@ impl HostRuntimeLoopData {
                 );
         }
         queued
+    }
+
+    fn queue_presentation_if_needed(
+        &mut self,
+    ) -> Result<Option<PresentationToken>, HostPresentFailure> {
+        if !self.session_active
+            || !self.wayland_state.presentation_needed()
+            || !self.wayland_state.staged_native_materializations_ready()
+            || self.host_backend.has_pending_presentation_flip()
+        {
+            return Ok(None);
+        }
+        self.queue_pinned_presentation_tick()
     }
 
     fn material_identity_changed_failure(&self) -> HostPresentFailure {
@@ -1892,9 +1935,24 @@ fn process_claimed_drm_event_source(
         state.poll_processes();
         drop(state);
         data.wayland_state.promote_pending_toplevels();
-        data.queue_pinned_presentation_tick()?;
+        data.stage_next_root_geometry_mutation();
+        let _ = data.queue_presentation_if_needed()?;
     }
     Ok(())
+}
+
+fn queue_presentation_after_event(data: &mut HostRuntimeLoopData) {
+    if let Err(failure) = data.queue_presentation_if_needed() {
+        if failure.is_transaction() {
+            let _ = handle_drm_event_transaction_failure(data, &failure);
+        } else {
+            let error = failure.into_error();
+            mark_host_output_lost_for_recovery(
+                data,
+                format!("failed while queuing host presentation frame: {error}"),
+            );
+        }
+    }
 }
 
 fn sync_runtime_host_present_capabilities(
@@ -1995,6 +2053,7 @@ fn reclaim_host_output_in_process(
         data.host_backend
             .reclaim_publication_for(&claimed_output, rotation),
     );
+    data.wayland_state.request_presentation();
     Ok(())
 }
 
@@ -2020,6 +2079,7 @@ fn mark_host_output_reclaim_pending(data: &mut HostRuntimeLoopData, error: Strin
 
 fn mark_host_output_lost_for_recovery(data: &mut HostRuntimeLoopData, error: String) {
     data.host_backend.mark_claim_lost();
+    data.wayland_state.request_presentation();
     sync_runtime_host_present_capabilities(&data.shared_state, &data.host_backend);
     data.wayland_state.sync_dmabuf_protocol_formats(None);
     mark_host_output_reclaim_pending(data, error);
@@ -3089,6 +3149,11 @@ impl HostBackendState {
             .as_ref()
             .or(self.prepared_reclaim_output.as_ref())
             .map(|output| output.device_id)
+    }
+
+    fn has_pending_presentation_flip(&self) -> bool {
+        self.presentation_device_id()
+            .is_some_and(|device_id| self.device_has_pending_presentation_flip(device_id))
     }
 
     fn needs_output_reclaim(&self) -> bool {
@@ -6575,6 +6640,8 @@ struct RuntimeWaylandState {
     active_root_geometry_consumers: Option<HostPresentationTransaction>,
     native_clip_program: Option<GlesTexProgram>,
     shell_overlay_toggle_shortcut: ShellOverlayToggleShortcut,
+    presentation_requested: bool,
+    last_queued_presentation_identity: Option<PresentationIdentity>,
 }
 
 #[derive(Clone)]
@@ -6620,6 +6687,12 @@ struct AcceptedPopupMaterial {
 struct AcceptedMaterialIdentity {
     surfaces: Vec<AcceptedSurfaceMaterial>,
     popups: Vec<AcceptedPopupMaterial>,
+}
+
+#[derive(Clone, PartialEq)]
+struct PresentationIdentity {
+    material: AcceptedMaterialIdentity,
+    status: crate::model::StatusSnapshot,
 }
 
 #[derive(Clone, Copy)]
@@ -7737,6 +7810,50 @@ impl RoleSurfaceMapping {
 }
 
 impl RuntimeWaylandState {
+    fn request_presentation(&mut self) {
+        self.presentation_requested = true;
+    }
+
+    fn presentation_identity(&self) -> PresentationIdentity {
+        let mut status = self
+            .presentation_root_geometry
+            .as_ref()
+            .or(self.staged_root_geometry.as_ref())
+            .map(|geometry| geometry.topology.clone())
+            .unwrap_or_else(|| lock_state(&self.shared_state).status_snapshot());
+
+        // These counters and last-queue fields describe compositor bookkeeping,
+        // not visible output. Leaving them in the identity would make each
+        // successful presentation request another presentation.
+        status.runtime.redraw_count = 0;
+        status.runtime.input_event_count = 0;
+        status.runtime.host_last_queued_present_source = RuntimeHostQueuedPresentSource::None;
+        status.runtime.host_last_queued_atomic_commit = false;
+        status.runtime.host_last_queued_overlay_plane = false;
+        status.runtime.host_last_queued_primary_dmabuf_format = None;
+        status.runtime.host_last_queued_overlay_dmabuf_format = None;
+
+        PresentationIdentity {
+            material: self.accepted_material_identity(),
+            status,
+        }
+    }
+
+    fn presentation_needed(&self) -> bool {
+        self.presentation_requested
+            || self.last_queued_presentation_identity.as_ref()
+                != Some(&self.presentation_identity())
+            || self
+                .staged_root_geometry
+                .as_ref()
+                .is_some_and(|transaction| transaction.pending_flip.is_none())
+    }
+
+    fn note_presentation_queued(&mut self, identity: PresentationIdentity) {
+        self.last_queued_presentation_identity = Some(identity.clone());
+        self.presentation_requested = self.presentation_identity() != identity;
+    }
+
     fn has_dmabuf_surface_material(&self) -> bool {
         self.host_surface_buffers
             .values()
@@ -8090,6 +8207,8 @@ impl RuntimeWaylandState {
             active_root_geometry_consumers,
             native_clip_program: None,
             shell_overlay_toggle_shortcut,
+            presentation_requested: true,
+            last_queued_presentation_identity: None,
         };
         state.sync_output_state();
         state.sync_runtime_dmabuf_protocol_status();
@@ -8332,6 +8451,7 @@ impl RuntimeWaylandState {
     }
 
     fn forward_input_event<B: InputBackend>(&mut self, event: InputEvent<B>) {
+        self.request_presentation();
         self.process_input_event(&event);
     }
 
@@ -10249,6 +10369,7 @@ impl RuntimeWaylandState {
     }
 
     fn reconfigure_roles(&mut self, width: i32, height: i32) {
+        self.request_presentation();
         self.backend_output_size = Size::<i32, Physical>::from((width.max(1), height.max(1)));
         {
             let mut state = lock_state(&self.shared_state);
@@ -11006,6 +11127,7 @@ impl RuntimeWaylandState {
     }
 
     fn capture_surface_buffer_commit(&mut self, surface: &WlSurface) {
+        self.request_presentation();
         let (assignment, buffer_scale, buffer_transform, damage) =
             smithay::wayland::compositor::with_states(surface, |states| {
                 let mut guard = states.cached_state.get::<SurfaceAttributes>();
@@ -15111,6 +15233,7 @@ mod tests {
                 pending_geometry_mutation: None,
                 pending_reclaim_publication: None,
                 root_geometry_stage_failure: None,
+                presentation_attempt_count: 0,
             },
             event_loop,
             capture,
@@ -15135,6 +15258,50 @@ mod tests {
                 staged.committed.snapshot,
                 &staged.captures,
             );
+    }
+
+    #[test]
+    fn host_presentation_gate_ignores_presenter_counters_and_keeps_real_work_pending() {
+        let (mut runtime, _event_loop, _capture) = test_host_runtime_loop();
+        assert!(runtime.wayland_state.presentation_needed());
+
+        let initial_identity = runtime.wayland_state.presentation_identity();
+        runtime
+            .wayland_state
+            .note_presentation_queued(initial_identity);
+        assert!(!runtime.wayland_state.presentation_needed());
+
+        {
+            let mut state = lock_state(&runtime.shared_state);
+            state.mark_runtime_redraw();
+            state.mark_runtime_input_event();
+        }
+        assert!(
+            !runtime.wayland_state.presentation_needed(),
+            "presentation bookkeeping must not schedule another frame"
+        );
+        let _ = runtime.queue_presentation_if_needed().unwrap();
+        assert_eq!(runtime.presentation_attempt_count, 0);
+
+        runtime.wayland_state.request_presentation();
+        let _ = runtime.queue_presentation_if_needed().unwrap();
+        assert_eq!(runtime.presentation_attempt_count, 1);
+        assert!(
+            runtime.wayland_state.presentation_needed(),
+            "a request remains pending until a frame is actually queued"
+        );
+
+        let queued_identity = runtime.wayland_state.presentation_identity();
+        runtime
+            .wayland_state
+            .note_presentation_queued(queued_identity);
+        lock_state(&runtime.shared_state).mark_runtime_resize(1280, 720);
+        assert!(
+            runtime.wayland_state.presentation_needed(),
+            "visible compositor state changes must schedule a frame"
+        );
+        let _ = runtime.queue_presentation_if_needed().unwrap();
+        assert_eq!(runtime.presentation_attempt_count, 2);
     }
 
     #[test]
