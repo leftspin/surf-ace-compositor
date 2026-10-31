@@ -15308,10 +15308,8 @@ mod tests {
     fn host_presentation_gate_waits_for_in_flight_flip_before_retrying() {
         let (mut runtime, _event_loop, _capture) = test_host_runtime_loop();
         let device_id = 1;
-        runtime.host_backend.claimed_output = Some(test_claimed_output(
-            device_id,
-            "/dev/dri/card-test",
-        ));
+        runtime.host_backend.claimed_output =
+            Some(test_claimed_output(device_id, "/dev/dri/card-test"));
         let mut pipeline = test_pipeline(false);
         pipeline.flip_pending = true;
         pipeline.pending_flip_source = Some(QueuedFlipSource::Dumb);
