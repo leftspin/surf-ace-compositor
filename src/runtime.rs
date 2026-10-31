@@ -12941,7 +12941,7 @@ mod tests {
         activate_root_geometry_stage, install_root_geometry_stage, lock_state, ButtonState,
         select_output_candidate_index, ToplevelSurface,
         overlay_lifecycle_is_unconfirmed, overlay_surface_disposition,
-        OverlaySurfaceDisposition, ProcessOwnerState,
+        InputEvent as RuntimeInputEvent, OverlaySurfaceDisposition, ProcessOwnerState,
     };
     use crate::output_rotation_model::OutputRotationModel;
     use crate::model::{
@@ -12961,6 +12961,11 @@ mod tests {
     };
     use smithay::input::keyboard::{Keysym, ModifiersState, keysyms};
     use smithay::backend::drm::DrmNode;
+    use smithay::backend::input::{
+        Device as InputDevice, DeviceCapability, Event as TestInputEventTrait,
+        InputBackend as TestInputBackendTrait, PointerMotionEvent as TestPointerMotionEventTrait,
+        UnusedEvent,
+    };
     use smithay::backend::renderer::utils::DamageSet;
     use smithay::backend::renderer::{
         Bind, Color32F, ExportMem, Frame, ImportDma, ImportMem, Offscreen, Renderer,
@@ -15240,6 +15245,132 @@ mod tests {
         )
     }
 
+    fn test_host_runtime_loop_with_display() -> (
+        HostRuntimeLoopData,
+        EventLoop<'static, HostRuntimeLoopData>,
+        ScreenCaptureStore,
+        Display<RuntimeWaylandState>,
+    ) {
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
+        state.mark_runtime_resize(3840, 2160);
+        let shared_state = Arc::new(Mutex::new(state));
+        let display: Display<RuntimeWaylandState> = Display::new().unwrap();
+        let display_handle = display.handle();
+        let wayland_state =
+            RuntimeWaylandState::new(display_handle.clone(), Arc::clone(&shared_state)).unwrap();
+        let capture = ScreenCaptureStore::default();
+        let host_backend = HostBackendState::for_root_geometry_test(capture.clone());
+        let event_loop = EventLoop::<HostRuntimeLoopData>::try_new().unwrap();
+        (
+            HostRuntimeLoopData {
+                shared_state,
+                display_handle,
+                wayland_state,
+                host_backend,
+                session_active: true,
+                runtime_control: None,
+                pending_rotation_response: None,
+                root_geometry_queue: RuntimeGeometryMutationQueue::default(),
+                pending_geometry_mutation: None,
+                pending_reclaim_publication: None,
+                root_geometry_stage_failure: None,
+                presentation_attempt_count: 0,
+            },
+            event_loop,
+            capture,
+            display,
+        )
+    }
+
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct TestInputDevice;
+
+    impl InputDevice for TestInputDevice {
+        fn id(&self) -> String {
+            "test-pointer".to_string()
+        }
+
+        fn name(&self) -> String {
+            "test pointer".to_string()
+        }
+
+        fn has_capability(&self, _capability: DeviceCapability) -> bool {
+            true
+        }
+
+        fn usb_id(&self) -> Option<(u32, u32)> {
+            None
+        }
+
+        fn syspath(&self) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    struct TestInputBackend;
+
+    impl TestInputBackendTrait for TestInputBackend {
+        type Device = TestInputDevice;
+        type KeyboardKeyEvent = UnusedEvent;
+        type PointerAxisEvent = UnusedEvent;
+        type PointerButtonEvent = UnusedEvent;
+        type PointerMotionEvent = TestPointerMotion;
+        type PointerMotionAbsoluteEvent = UnusedEvent;
+        type GestureSwipeBeginEvent = UnusedEvent;
+        type GestureSwipeUpdateEvent = UnusedEvent;
+        type GestureSwipeEndEvent = UnusedEvent;
+        type GesturePinchBeginEvent = UnusedEvent;
+        type GesturePinchUpdateEvent = UnusedEvent;
+        type GesturePinchEndEvent = UnusedEvent;
+        type GestureHoldBeginEvent = UnusedEvent;
+        type GestureHoldEndEvent = UnusedEvent;
+        type TouchDownEvent = UnusedEvent;
+        type TouchUpEvent = UnusedEvent;
+        type TouchMotionEvent = UnusedEvent;
+        type TouchCancelEvent = UnusedEvent;
+        type TouchFrameEvent = UnusedEvent;
+        type TabletToolAxisEvent = UnusedEvent;
+        type TabletToolProximityEvent = UnusedEvent;
+        type TabletToolTipEvent = UnusedEvent;
+        type TabletToolButtonEvent = UnusedEvent;
+        type SwitchToggleEvent = UnusedEvent;
+        type SpecialEvent = ();
+    }
+
+    struct TestPointerMotion {
+        delta_x: f64,
+        delta_y: f64,
+        time: u64,
+    }
+
+    impl TestInputEventTrait<TestInputBackend> for TestPointerMotion {
+        fn time(&self) -> u64 {
+            self.time
+        }
+
+        fn device(&self) -> TestInputDevice {
+            TestInputDevice
+        }
+    }
+
+    impl TestPointerMotionEventTrait<TestInputBackend> for TestPointerMotion {
+        fn delta_x(&self) -> f64 {
+            self.delta_x
+        }
+
+        fn delta_y(&self) -> f64 {
+            self.delta_y
+        }
+
+        fn delta_x_unaccel(&self) -> f64 {
+            self.delta_x
+        }
+
+        fn delta_y_unaccel(&self) -> f64 {
+            self.delta_y
+        }
+    }
+
     fn stage_capture_for_pending_geometry(runtime: &HostRuntimeLoopData) {
         let staged = runtime
             .wayland_state
@@ -15335,6 +15466,97 @@ mod tests {
         assert!(
             runtime.wayland_state.presentation_needed(),
             "the request must remain pending for the DRM completion event"
+        );
+    }
+
+    #[test]
+    fn host_presentation_gate_queues_after_real_client_surface_commit() {
+        let (mut runtime, _event_loop, _capture, mut display) =
+            test_host_runtime_loop_with_display();
+        let (_surface, commands, client_thread) = take_renderable_main_or_ordinary_toplevel(
+            &mut display,
+            &mut runtime.wayland_state,
+            160,
+            100,
+            RealShmPattern::Solid([0x00, 0x00, 0xff, 0xff]),
+            false,
+        );
+
+        let initial_identity = runtime.wayland_state.presentation_identity();
+        runtime
+            .wayland_state
+            .note_presentation_queued(initial_identity);
+        assert!(!runtime.wayland_state.presentation_needed());
+
+        commands
+            .send(RealShmToplevelCommand::ReplaceBuffer {
+                width: 160,
+                height: 100,
+                pattern: RealShmPattern::Solid([0x00, 0xff, 0x00, 0xff]),
+                buffer_scale: 1,
+                wait_for_configure: false,
+            })
+            .expect("the real SHM client must send a replacement buffer commit");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !runtime.wayland_state.presentation_needed() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the production Wayland commit handler must request a frame"
+            );
+            display
+                .dispatch_clients(&mut runtime.wayland_state)
+                .expect("the replacement surface commit must dispatch");
+            display
+                .flush_clients()
+                .expect("the replacement surface commit must flush");
+            std::thread::yield_now();
+        }
+
+        runtime
+            .queue_presentation_if_needed()
+            .expect("the host loop must queue after client buffer damage");
+        assert_eq!(
+            runtime.presentation_attempt_count, 1,
+            "a real client commit must trigger one host presentation attempt"
+        );
+
+        commands
+            .send(RealShmToplevelCommand::Finish)
+            .expect("the real SHM client must finish");
+        client_thread
+            .join()
+            .expect("the real SHM client must exit cleanly");
+    }
+
+    #[test]
+    fn host_presentation_gate_queues_after_pointer_motion_event() {
+        let (mut runtime, _event_loop, _capture) = test_host_runtime_loop();
+        let initial_identity = runtime.wayland_state.presentation_identity();
+        runtime
+            .wayland_state
+            .note_presentation_queued(initial_identity);
+        assert!(!runtime.wayland_state.presentation_needed());
+
+        runtime.wayland_state.forward_input_event(
+            RuntimeInputEvent::<TestInputBackend>::PointerMotion {
+                event: TestPointerMotion {
+                    delta_x: 12.0,
+                    delta_y: 4.0,
+                    time: 1_000,
+                },
+            },
+        );
+
+        assert!(
+            runtime.wayland_state.presentation_needed(),
+            "the production input handler must request a frame after pointer movement"
+        );
+        runtime
+            .queue_presentation_if_needed()
+            .expect("the host loop must queue after pointer movement");
+        assert_eq!(
+            runtime.presentation_attempt_count, 1,
+            "pointer movement must trigger one host presentation attempt"
         );
     }
 
