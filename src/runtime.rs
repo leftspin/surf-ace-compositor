@@ -15305,6 +15305,42 @@ mod tests {
     }
 
     #[test]
+    fn host_presentation_gate_waits_for_in_flight_flip_before_retrying() {
+        let (mut runtime, _event_loop, _capture) = test_host_runtime_loop();
+        let device_id = 1;
+        runtime.host_backend.claimed_output = Some(test_claimed_output(
+            device_id,
+            "/dev/dri/card-test",
+        ));
+        let mut pipeline = test_pipeline(false);
+        pipeline.flip_pending = true;
+        pipeline.pending_flip_source = Some(QueuedFlipSource::Dumb);
+        pipeline.pending_presentation_token = Some(PresentationToken(7));
+        runtime.host_backend.opened_devices.insert(
+            device_id,
+            test_opened_device("/dev/dri/card-test", Some(pipeline), None),
+        );
+
+        let queued_identity = runtime.wayland_state.presentation_identity();
+        runtime
+            .wayland_state
+            .note_presentation_queued(queued_identity);
+        runtime.wayland_state.request_presentation();
+
+        assert!(runtime.wayland_state.presentation_needed());
+        assert!(runtime.host_backend.has_pending_presentation_flip());
+        assert!(matches!(runtime.queue_presentation_if_needed(), Ok(None)));
+        assert_eq!(
+            runtime.presentation_attempt_count, 0,
+            "a requested frame must not attempt another queue while its flip is in flight"
+        );
+        assert!(
+            runtime.wayland_state.presentation_needed(),
+            "the request must remain pending for the DRM completion event"
+        );
+    }
+
+    #[test]
     fn unavailable_host_display_keeps_runtime_clients_and_last_good_geometry_for_reclaim() {
         let (mut runtime, _event_loop, _capture) = test_host_runtime_loop();
         {
