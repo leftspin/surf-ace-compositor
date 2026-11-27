@@ -8291,6 +8291,11 @@ impl RuntimeWaylandState {
                     })
             });
             if let Some(surface) = focus_target.as_ref() {
+                if let Some(RuntimeFocusTarget::NativePane { pane_id }) =
+                    status.runtime.active_focus_target.as_ref()
+                {
+                    self.raise_native_pane_accessory(pane_id, surface);
+                }
                 self.note_native_pane_surface_focus(surface, true);
             }
             if let Some(keyboard) = self.seat.get_keyboard() {
@@ -8631,6 +8636,21 @@ impl RuntimeWaylandState {
 
     fn native_pane_surface_is_visible(&self, pane_id: &PaneId, mapped: bool) -> bool {
         mapped && self.native_pane_is_keyboard_focused(pane_id)
+    }
+
+    // The stack is stored bottom-to-top. GLES and hit testing both consume
+    // it top-to-bottom; the software compositor paints in storage order.
+    fn native_pane_accessories_top_first(&self) -> impl Iterator<Item = &ManagedNativePaneToplevel> {
+        self.native_pane_accessories.iter().rev()
+    }
+
+    fn raise_native_pane_accessory(&mut self, pane_id: &PaneId, surface: &WlSurface) {
+        if let Some(index) = self.native_pane_accessories.iter().position(|accessory| {
+            &accessory.pane_id == pane_id && same_surface(accessory.surface.wl_surface(), surface)
+        }) {
+            let accessory = self.native_pane_accessories.remove(index);
+            self.native_pane_accessories.push(accessory);
+        }
     }
 
     fn native_pane_accessory_rect(
@@ -9729,7 +9749,7 @@ impl RuntimeWaylandState {
             }
         }
 
-        for accessory in self.native_pane_accessories.iter().rev() {
+        for accessory in self.native_pane_accessories_top_first() {
             if !self.native_pane_surface_is_visible(&accessory.pane_id, accessory.mapped) {
                 continue;
             }
@@ -10582,7 +10602,7 @@ impl RuntimeWaylandState {
             }
         }
 
-        for accessory in &self.native_pane_accessories {
+        for accessory in self.native_pane_accessories_top_first() {
             if !self.native_pane_surface_is_visible(&accessory.pane_id, accessory.mapped) {
                 continue;
             }
@@ -11269,13 +11289,7 @@ impl RuntimeWaylandState {
             return;
         };
         if just_mapped {
-            if let Some(index) = self.native_pane_accessories.iter().position(|accessory| {
-                accessory.pane_id == pane_id
-                    && same_surface(accessory.surface.wl_surface(), surface)
-            }) {
-                let accessory = self.native_pane_accessories.remove(index);
-                self.native_pane_accessories.push(accessory);
-            }
+            self.raise_native_pane_accessory(&pane_id, surface);
             if let Some(index) = self.popups.iter().position(|popup| {
                 popup.owner_role == RuntimeSurfaceRole::NativePane(pane_id.clone())
                     && same_surface(popup.surface.wl_surface(), surface)
@@ -13486,6 +13500,20 @@ mod tests {
         mpsc::Sender<RealShmToplevelCommand>,
         std::thread::JoinHandle<()>,
     ) {
+        spawn_real_shm_toplevel_with_object_offset(socket, width, height, pattern, 0)
+    }
+
+    fn spawn_real_shm_toplevel_with_object_offset(
+        socket: UnixStream,
+        width: i32,
+        height: i32,
+        pattern: RealShmPattern,
+        object_offset: usize,
+    ) -> (
+        mpsc::Receiver<(u32, Option<(i32, i32)>)>,
+        mpsc::Sender<RealShmToplevelCommand>,
+        std::thread::JoinHandle<()>,
+    ) {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (command_tx, command_rx) = mpsc::channel();
         let client_thread = std::thread::spawn(move || {
@@ -13505,6 +13533,9 @@ mod tests {
             let wm_base = globals
                 .bind::<xdg_wm_base::XdgWmBase, _, _>(&qh, 1..=6, ())
                 .expect("xdg_wm_base must exist");
+            let _reserved_objects: Vec<_> = (0..object_offset)
+                .map(|_| compositor.create_region(&qh, ()))
+                .collect();
             let surface = compositor.create_surface(&qh, ());
             let viewport = viewporter.get_viewport(&surface, &qh, ());
             let surface_id = surface.id().protocol_id();
@@ -13797,6 +13828,21 @@ mod tests {
         mpsc::Sender<RealShmToplevelCommand>,
         std::thread::JoinHandle<()>,
     ) {
+        take_unresolved_real_toplevel_with_object_offset(display, wayland, width, height, 0)
+    }
+
+    fn take_unresolved_real_toplevel_with_object_offset(
+        display: &mut Display<RuntimeWaylandState>,
+        wayland: &mut RuntimeWaylandState,
+        width: i32,
+        height: i32,
+        object_offset: usize,
+    ) -> (
+        ToplevelSurface,
+        WlSurface,
+        mpsc::Sender<RealShmToplevelCommand>,
+        std::thread::JoinHandle<()>,
+    ) {
         let (server_socket, client_socket) = UnixStream::pair().expect("socket pair must create");
         let server_client = display
             .handle()
@@ -13805,11 +13851,12 @@ mod tests {
                 Arc::new(super::RuntimeClientState::default()),
             )
             .expect("fixture client must insert");
-        let (ready, commands, thread) = spawn_real_shm_toplevel(
+        let (ready, commands, thread) = spawn_real_shm_toplevel_with_object_offset(
             client_socket,
             width,
             height,
             RealShmPattern::Solid([0x30, 0x50, 0x70, 0xff]),
+            object_offset,
         );
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut retained = None;
@@ -13822,10 +13869,17 @@ mod tests {
             display
                 .dispatch_clients(wayland)
                 .expect("fixture requests must dispatch");
-            if retained.is_none() && !wayland.pending_toplevels.is_empty() {
-                let surface = wayland.pending_toplevels[0].clone();
-                wayland.assign_toplevel_role(surface.clone());
-                retained = Some(surface);
+            if retained.is_none() {
+                retained = wayland
+                    .pending_toplevels
+                    .iter()
+                    .find(|toplevel| {
+                        toplevel
+                            .wl_surface()
+                            .client()
+                            .is_some_and(|client| client.id() == server_client.id())
+                    })
+                    .cloned();
             }
             display
                 .flush_clients()
@@ -13854,7 +13908,10 @@ mod tests {
                         .unresolved_toplevels
                         .contains(&surface_key(&surface))
                 );
-                return (toplevel.clone(), surface, commands, thread);
+                if wayland.host_surface_buffers.contains_key(&surface_key(&surface)) {
+                    assert!(same_surface(toplevel.wl_surface(), &surface));
+                    return (toplevel.clone(), surface, commands, thread);
+                }
             }
             std::thread::yield_now();
         }
@@ -18082,6 +18139,172 @@ mod tests {
         client_thread
             .join()
             .expect("native pane client fixture must exit cleanly");
+    }
+
+    #[test]
+    fn native_pane_accessory_press_raises_overlap_for_rendering_and_input() {
+        use smithay::backend::renderer::element::Id;
+
+        let mut state = CompositorState::new(true, Box::new(NoopProcessController::default()));
+        state.mark_runtime_resize(320, 200);
+        state.set_root4_display_scale(1.0).unwrap();
+        let pane_id = PaneId::new("dialog-pane");
+        state
+            .apply_native_pane_host_plan(vec![NativePaneHostRequest {
+                window_group: None,
+                id: pane_id.clone(),
+                content_id: Some("dialog-content".to_string()),
+                binding_id: Some("dialog-binding".to_string()),
+                launch_token: None,
+                revision: 1,
+                geometry: PaneGeometry {
+                    x: 100.0,
+                    y: 50.0,
+                    width: 100.0,
+                    height: 80.0,
+                    coordinate_space: PaneGeometryCoordinateSpace::CompositorLogical,
+                },
+                target: NativeTargetClass::Terminal,
+                process: ProcessSpec {
+                    command: "dialog-fixture".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: Default::default(),
+                },
+            }])
+            .unwrap();
+        let shared_state = Arc::new(Mutex::new(state));
+        let mut display: Display<RuntimeWaylandState> = Display::new().unwrap();
+        let mut wayland =
+            RuntimeWaylandState::new(display.handle(), Arc::clone(&shared_state)).unwrap();
+        let (primary, _, primary_commands, primary_thread) =
+            take_unresolved_real_toplevel(&mut display, &mut wayland, 100, 80);
+
+        let mut clients = Vec::new();
+        let mut toplevels = Vec::new();
+        let mut surfaces = Vec::new();
+        // Configure different widths so the lower window has an exposed band.
+        for (width, offset) in [(160, 1), (80, 2)] {
+            let (toplevel, surface, commands, thread) =
+                take_unresolved_real_toplevel_with_object_offset(
+                    &mut display,
+                    &mut wayland,
+                    width,
+                    100,
+                    offset,
+                );
+            // Seed the committed fixture sizes so the press test is independent
+            // of configure timing. The attached SHM buffers have those sizes.
+            smithay::wayland::compositor::with_states(&surface, |states| {
+                states
+                    .data_map
+                    .get::<super::XdgToplevelSurfaceData>()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .current
+                    .size = Some((width, 100).into());
+            });
+            toplevels.push(toplevel);
+            surfaces.push(surface);
+            clients.push((commands, thread));
+        }
+        lock_state(&shared_state)
+            .launch_native_pane_hosts(vec![pane_id.clone()])
+            .unwrap();
+        wayland.remove_surface_from_unresolved_tracking(&primary);
+        wayland.assign_native_pane_role(primary, pane_id.clone(), Some(1));
+        for (toplevel, surface) in toplevels.into_iter().zip(&surfaces) {
+            wayland.remove_surface_from_unresolved_tracking(&toplevel);
+            wayland
+                .native_pane_accessories
+                .push(super::ManagedNativePaneToplevel {
+                    surface: toplevel,
+                    pane_id: pane_id.clone(),
+                    mapped: false,
+                });
+            wayland.update_native_pane_member_map_state(surface);
+            assert!(wayland.native_pane_accessories.last().unwrap().mapped);
+        }
+        let [lower, upper] = surfaces.as_slice() else {
+            unreachable!()
+        };
+        assert_ne!(surface_id(lower), surface_id(upper));
+        let pane_focus = RuntimeFocusTarget::NativePane {
+            pane_id: pane_id.clone(),
+        };
+        lock_state(&shared_state).set_runtime_focus_target(Some(pane_focus.clone()));
+        wayland.apply_focus_route();
+
+        let overlap = (150.0, 90.0).into();
+        let exposed = (75.0, 90.0).into();
+        let hit = |wayland: &RuntimeWaylandState, point| {
+            let (_, status) = wayland.input_operation_snapshot();
+            wayland.surface_under_point_for_capture(
+                point,
+                OverlayCaptureCapability::PointerButton,
+                &status,
+            )
+        };
+        let mut renderer = surfaceless_test_renderer();
+        let mut draw_order = |wayland: &mut RuntimeWaylandState| {
+            let capture = wayland.collect_render_elements(&mut renderer, 320, 200);
+            assert!(capture.failure.is_none(), "{:?}", capture.failure);
+            capture
+                .elements
+                .iter()
+                .zip(&capture.sources)
+                .filter(|(_, source)| **source == super::RenderElementSource::NativePaneAccessory)
+                .map(|(element, _)| element.id().clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(same_surface(&hit(&wayland, overlap).unwrap().0, upper));
+        assert_eq!(draw_order(&mut wayland), vec![Id::from(upper), Id::from(lower)]);
+        assert!(same_surface(&hit(&wayland, exposed).unwrap().0, lower));
+
+        wayland.forward_pointer_motion(exposed, 10);
+        wayland.forward_pointer_button(0x110, ButtonState::Pressed, 11);
+        wayland.forward_pointer_button(0x110, ButtonState::Released, 12);
+        let keyboard = wayland.seat.get_keyboard().unwrap();
+        assert!(same_surface(&keyboard.current_focus().unwrap(), lower));
+        assert!(same_surface(&hit(&wayland, overlap).unwrap().0, lower));
+        assert_eq!(draw_order(&mut wayland), vec![Id::from(lower), Id::from(upper)]);
+
+        let status = lock_state(&shared_state).status_snapshot();
+        assert_eq!(status.runtime.active_focus_target, Some(pane_focus.clone()));
+        let group = status
+            .native_pane_window_groups
+            .iter()
+            .find(|group| group.pane_id == pane_id)
+            .unwrap();
+        assert_eq!(group.focused_window_id, Some(surface_id(lower).to_string()));
+        assert!(
+            wayland
+                .native_pane_accessories
+                .iter()
+                .all(|member| member.pane_id == pane_id)
+        );
+
+        lock_state(&shared_state).set_runtime_focus_target(Some(RuntimeFocusTarget::MainApp));
+        wayland.apply_focus_route();
+        assert!(draw_order(&mut wayland).is_empty());
+        assert!(!hit(&wayland, overlap).is_some_and(|(surface, _)| {
+            same_surface(&surface, lower) || same_surface(&surface, upper)
+        }));
+        lock_state(&shared_state).set_runtime_focus_target(Some(pane_focus));
+        wayland.apply_focus_route();
+        assert!(same_surface(&keyboard.current_focus().unwrap(), lower));
+        assert_eq!(draw_order(&mut wayland), vec![Id::from(lower), Id::from(upper)]);
+
+        for (commands, thread) in clients {
+            commands.send(RealShmToplevelCommand::Finish).unwrap();
+            thread.join().unwrap();
+        }
+        primary_commands
+            .send(RealShmToplevelCommand::Finish)
+            .unwrap();
+        primary_thread.join().unwrap();
     }
 
     #[test]
